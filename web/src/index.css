@@ -1,0 +1,220 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --bg-deep: #050a12;
+    --bg-surface: #0a1122;
+    --bg-elevated: #0f1a33;
+    --border-dim: rgba(251, 191, 36, 0.06);
+    --border-subtle: rgba(251, 191, 36, 0.1);
+    --border-glow: rgba(251, 191, 36, 0.25);
+    --text-primary: #f1f5f9;
+    --text-muted: #64748b;
+    --accent-amber: #fbbf24;
+    --accent-cyan: #22d3ee;
+  }
+
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: rgba(251,191,36,0.15) transparent;
+  }
+  *::-webkit-scrollbar { width: 5px; height: 5px; }
+  *::-webkit-scrollbar-track { background: transparent; }
+  *::-webkit-scrollbar-thumb { background: rgba(251,191,36,0.15); border-radius: 10px; }
+  *::-webkit-scrollbar-thumb:hover { background: rgba(251,191,36,0.3); }
+
+  ::selection {
+    background: rgba(251, 191, 36, 0.25);
+    color: #fff;
+  }
+
+  body {
+    font-feature-settings: "ss01", "ss02", "cv01";
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    background: var(--bg-deep);
+  }
+
+  input, textarea, select {
+    @apply bg-navy-900/80 border border-amber-500/10 text-zinc-100 placeholder-zinc-600;
+  }
+  input:focus, textarea:focus, select:focus {
+    @apply outline-none ring-1 ring-amber-400/30 border-amber-400/30;
+  }
+}
+
+@layer components {
+  /* ── Glass Panels ──────────────────────────── */
+  .glass {
+    background: linear-gradient(
+      135deg,
+      rgba(10, 17, 34, 0.85),
+      rgba(15, 26, 51, 0.75)
+    );
+    backdrop-filter: blur(24px) saturate(150%);
+    border: 1px solid rgba(251, 191, 36, 0.06);
+    box-shadow:
+      0 8px 32px rgba(0, 0, 0, 0.3),
+      inset 0 1px 0 rgba(255, 255, 255, 0.03);
+  }
+
+  .glass-hover {
+    @apply transition-all duration-300;
+  }
+  .glass-hover:hover {
+    background: linear-gradient(
+      135deg,
+      rgba(15, 26, 51, 0.9),
+      rgba(20, 34, 68, 0.8)
+    );
+    border-color: rgba(251, 191, 36, 0.12);
+    box-shadow:
+      0 12px 40px rgba(0, 0, 0, 0.4),
+      inset 0 1px 0 rgba(255, 255, 255, 0.05),
+      0 0 30px rgba(251, 191, 36, 0.04);
+  }
+
+  /* ── Glow Effects ──────────────────────────── */
+  .glow-line {
+    position: relative;
+  }
+  .glow-line::after {
+    content: '';
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    right: 0;
+    height: 1px;
+    background: linear-gradient(90deg, transparent, rgba(251,191,36,0.3), transparent);
+  }
+
+  .glow-dot {
+    position: relative;
+  }
+  .glow-dot::before {
+    content: '';
+    position: absolute;
+    inset: -3px;
+    border-radius: 50%;
+    background: currentColor;
+    opacity: 0.3;
+    filter: blur(4px);
+  }
+
+  /* ── Atmospheric Background ────────────────── */
+  .atmosphere {
+    position: relative;
+    overflow: hidden;
+  }
+  .atmosphere::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background:
+      radial-gradient(ellipse 80% 50% at 20% 20%, rgba(251,191,36,0.03), transparent),
+      radial-gradient(ellipse 60% 40% at 80% 80%, rgba(34,211,238,0.02), transparent),
+      radial-gradient(ellipse 50% 50% at 50% 0%, rgba(139,92,246,0.02), transparent);
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  /* ── Dot Grid ──────────────────────────────── */
+  .dot-grid {
+    background-image: radial-gradient(circle, rgba(251,191,36,0.05) 1px, transparent 1px);
+    background-size: 20px 20px;
+  }
+
+  /* ── Scan Line (subtle CRT effect) ─────────── */
+  .scanline {
+    position: relative;
+    overflow: hidden;
+  }
+  .scanline::after {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 200%;
+    background: linear-gradient(
+      to bottom,
+      transparent 0%,
+      rgba(251, 191, 36, 0.01) 50%,
+      transparent 100%
+    );
+    animation: scan 8s linear infinite;
+    pointer-events: none;
+    z-index: 1;
+  }
+
+  /* ── Instrument Readout Style ──────────────── */
+  .readout {
+    font-variant-numeric: tabular-nums;
+    letter-spacing: 0.05em;
+  }
+
+  /* ── Border Glow ───────────────────────────── */
+  .border-glow-amber {
+    border: 1px solid rgba(251, 191, 36, 0.1);
+    box-shadow: 0 0 0 1px rgba(251, 191, 36, 0.03);
+  }
+  .border-glow-amber:hover {
+    border-color: rgba(251, 191, 36, 0.2);
+    box-shadow: 0 0 15px rgba(251, 191, 36, 0.06);
+  }
+
+  .border-glow-cyan {
+    border: 1px solid rgba(34, 211, 238, 0.1);
+    box-shadow: 0 0 0 1px rgba(34, 211, 238, 0.03);
+  }
+
+  /* ── Noise texture ─────────────────────────── */
+  .noise {
+    position: relative;
+  }
+  .noise::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    opacity: 0.02;
+    background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 256 256' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='noise'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23noise)'/%3E%3C/svg%3E");
+    pointer-events: none;
+    z-index: 0;
+    mix-blend-mode: overlay;
+  }
+}
+
+/* ── Monaco Editor Theme ─────────────────────── */
+.monaco-editor .margin {
+  background: #0a1122 !important;
+}
+.monaco-editor,
+.monaco-editor-background,
+.monaco-editor .inputarea.ime-input {
+  background: #0a1122 !important;
+}
+
+/* ── Staggered animations for lists ──────────── */
+.stagger > * {
+  animation: slideUp 0.5s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+.stagger > *:nth-child(1) { animation-delay: 0.02s; }
+.stagger > *:nth-child(2) { animation-delay: 0.06s; }
+.stagger > *:nth-child(3) { animation-delay: 0.10s; }
+.stagger > *:nth-child(4) { animation-delay: 0.14s; }
+.stagger > *:nth-child(5) { animation-delay: 0.18s; }
+.stagger > *:nth-child(6) { animation-delay: 0.22s; }
+.stagger > *:nth-child(7) { animation-delay: 0.26s; }
+.stagger > *:nth-child(8) { animation-delay: 0.30s; }
+
+@keyframes slideUp {
+  0% { opacity: 0; transform: translateY(12px); }
+  100% { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes scan {
+  0% { transform: translateY(-100%); }
+  100% { transform: translateY(100%); }
+}

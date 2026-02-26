@@ -2,5 +2,6 @@
 benchmarks/
 target/
 feedback.jsonl
-web/
 sample-data/
+
+web/node_modules

@@ -1,0 +1,105 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: rustlake-worker
+  namespace: rustlake
+  labels:
+    app.kubernetes.io/name: rustlake
+    app.kubernetes.io/component: worker
+spec:
+  serviceName: rustlake-worker-headless
+  replicas: 3
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rustlake
+      app.kubernetes.io/component: worker
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: rustlake
+        app.kubernetes.io/component: worker
+    spec:
+      serviceAccountName: rustlake-worker
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: worker
+          image: rustlake/rustlake:latest
+          command: ["rustlake-api"]
+          ports:
+            - name: http
+              containerPort: 3000
+              protocol: TCP
+            - name: flight
+              containerPort: 50051
+              protocol: TCP
+          env:
+            - name: RUSTLAKE_CLUSTER__NODE_ROLE
+              value: "worker"
+            - name: RUSTLAKE_CLUSTER__COORDINATOR_ADDR
+              value: "http://rustlake-coordinator.rustlake.svc.cluster.local:50051"
+            - name: RUSTLAKE_FLIGHT__ENABLED
+              value: "true"
+            - name: RUSTLAKE_FLIGHT__HOST
+              value: "0.0.0.0"
+            - name: RUSTLAKE_FLIGHT__PORT
+              value: "50051"
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          resources:
+            requests:
+              cpu: "1"
+              memory: "2Gi"
+            limits:
+              cpu: "4"
+              memory: "8Gi"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          volumeMounts:
+            - name: spill
+              mountPath: /tmp/rustlake-spill
+      volumes:
+        - name: spill
+          emptyDir:
+            sizeLimit: 10Gi
+---
+# Headless service for DNS-based worker discovery.
+# The coordinator resolves rustlake-worker-headless.rustlake.svc.cluster.local
+# to get all worker pod IPs.
+apiVersion: v1
+kind: Service
+metadata:
+  name: rustlake-worker-headless
+  namespace: rustlake
+  labels:
+    app.kubernetes.io/name: rustlake
+    app.kubernetes.io/component: worker
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: rustlake
+    app.kubernetes.io/component: worker
+  ports:
+    - name: http
+      port: 3000
+      targetPort: http
+    - name: flight
+      port: 50051
+      targetPort: flight

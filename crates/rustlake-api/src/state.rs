@@ -241,6 +241,10 @@ pub struct S3Config {
 pub struct AppState {
     /// The query engine context shared across all requests.
     pub ctx: RwLock<RustLakeContext>,
+    /// Live metrics from the Arrow Flight gRPC server (None if Flight is disabled).
+    pub flight_metrics: Option<rustlake_flight::server::FlightMetrics>,
+    /// Coordinator handle for cluster management (None if not a coordinator).
+    pub coordinator: Option<std::sync::Arc<rustlake_flight::coordinator::Coordinator>>,
     /// In-memory log of recent query executions.
     pub query_history: RwLock<Vec<QueryHistoryEntry>>,
     /// Server startup time (for uptime calculation).
@@ -277,6 +281,10 @@ pub struct AppState {
     pub table_descriptions: RwLock<std::collections::HashMap<String, String>>,
     /// User-defined column descriptions (table_name.column_name → description).
     pub column_descriptions: RwLock<std::collections::HashMap<String, String>>,
+    /// Data quality alert rules.
+    pub quality_rules: RwLock<Vec<crate::routes::QualityRule>>,
+    /// Uploaded dbt project (at most one at a time).
+    pub dbt_project: RwLock<Option<crate::routes::DbtProject>>,
 }
 
 impl AppState {
@@ -286,6 +294,8 @@ impl AppState {
         let embedding_generator = SimpleEmbeddingGenerator::new(128);
         Self {
             ctx: RwLock::new(ctx),
+            flight_metrics: None,
+            coordinator: None,
             query_history: RwLock::new(Vec::new()),
             start_time: Instant::now(),
             query_count: AtomicU64::new(0),
@@ -304,6 +314,8 @@ impl AppState {
             job_clusters: RwLock::new(default_job_clusters()),
             table_descriptions: RwLock::new(std::collections::HashMap::new()),
             column_descriptions: RwLock::new(std::collections::HashMap::new()),
+            quality_rules: RwLock::new(Vec::new()),
+            dbt_project: RwLock::new(None),
         }
     }
 
@@ -313,6 +325,8 @@ impl AppState {
         let embedding_generator = SimpleEmbeddingGenerator::new(dimensions);
         Self {
             ctx: RwLock::new(ctx),
+            flight_metrics: None,
+            coordinator: None,
             query_history: RwLock::new(Vec::new()),
             start_time: Instant::now(),
             query_count: AtomicU64::new(0),
@@ -331,6 +345,8 @@ impl AppState {
             job_clusters: RwLock::new(default_job_clusters()),
             table_descriptions: RwLock::new(std::collections::HashMap::new()),
             column_descriptions: RwLock::new(std::collections::HashMap::new()),
+            quality_rules: RwLock::new(Vec::new()),
+            dbt_project: RwLock::new(None),
         }
     }
 

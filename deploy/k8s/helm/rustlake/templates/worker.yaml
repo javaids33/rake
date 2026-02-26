@@ -1,0 +1,149 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ .Release.Name }}-worker
+  labels:
+    app.kubernetes.io/name: rustlake
+    app.kubernetes.io/component: worker
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  serviceName: {{ .Values.k8s.serviceName }}
+  replicas: {{ .Values.worker.replicas }}
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rustlake
+      app.kubernetes.io/component: worker
+      app.kubernetes.io/instance: {{ .Release.Name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: rustlake
+        app.kubernetes.io/component: worker
+        app.kubernetes.io/instance: {{ .Release.Name }}
+    spec:
+      {{- if .Values.serviceAccount.create }}
+      serviceAccountName: {{ .Release.Name }}-worker
+      {{- end }}
+      terminationGracePeriodSeconds: 30
+      containers:
+        - name: worker
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          command: ["rustlake-api"]
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.httpPort }}
+            - name: flight
+              containerPort: {{ .Values.flight.port }}
+          env:
+            - name: RUSTLAKE_CLUSTER__NODE_ROLE
+              value: "worker"
+            - name: RUSTLAKE_CLUSTER__COORDINATOR_ADDR
+              value: "http://{{ .Release.Name }}-coordinator.{{ .Release.Namespace }}.svc.cluster.local:{{ .Values.flight.port }}"
+            - name: RUSTLAKE_FLIGHT__ENABLED
+              value: {{ .Values.flight.enabled | quote }}
+            - name: RUSTLAKE_FLIGHT__HOST
+              value: "0.0.0.0"
+            - name: RUSTLAKE_FLIGHT__PORT
+              value: {{ .Values.flight.port | quote }}
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_IP
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+          resources:
+            {{- toYaml .Values.worker.resources | nindent 12 }}
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          {{- if .Values.worker.spillVolume.enabled }}
+          volumeMounts:
+            - name: spill
+              mountPath: /tmp/rustlake-spill
+          {{- end }}
+      {{- if .Values.worker.spillVolume.enabled }}
+      volumes:
+        - name: spill
+          emptyDir:
+            sizeLimit: {{ .Values.worker.spillVolume.sizeLimit }}
+      {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Values.k8s.serviceName }}
+  labels:
+    app.kubernetes.io/name: rustlake
+    app.kubernetes.io/component: worker
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: rustlake
+    app.kubernetes.io/component: worker
+    app.kubernetes.io/instance: {{ .Release.Name }}
+  ports:
+    - name: http
+      port: {{ .Values.service.httpPort }}
+      targetPort: http
+    - name: flight
+      port: {{ .Values.service.flightPort }}
+      targetPort: flight
+---
+{{- if .Values.worker.autoscaling.enabled }}
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ .Release.Name }}-worker
+  labels:
+    app.kubernetes.io/name: rustlake
+    app.kubernetes.io/component: worker
+    app.kubernetes.io/instance: {{ .Release.Name }}
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: StatefulSet
+    name: {{ .Release.Name }}-worker
+  minReplicas: {{ .Values.worker.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.worker.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.worker.autoscaling.targetCPUUtilization }}
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: {{ .Values.worker.autoscaling.targetMemoryUtilization }}
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120
+{{- end }}

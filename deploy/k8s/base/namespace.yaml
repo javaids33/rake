@@ -1,0 +1,7 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: rustlake
+  labels:
+    app.kubernetes.io/name: rustlake
+    app.kubernetes.io/part-of: rustlake

@@ -2,40 +2,26 @@
 //!
 //! Enables distributed query execution via Arrow Flight protocol and
 //! provides JDBC/ODBC compatibility via Flight SQL.
+//!
+//! ## Modules
+//!
+//! - `server` — Flight RPC service (do_get, do_action, do_exchange, etc.)
+//! - `client` — Flight RPC client + connection pool for persistent channels
+//! - `coordinator` — Coordinator node: worker registry, query distribution
+//! - `worker` — Worker node: registration, heartbeats, partition execution
+//! - `planner` — Distributed query planner: partition-aware SQL planning
+//! - `exchange` — DataFusion ExecutionPlan nodes for Flight-based data exchange
+//! - `discovery` — Worker discovery (static, self-register, Kubernetes DNS)
+//! - `sql` — Flight SQL protocol for JDBC/ODBC client compatibility
 
 pub mod client;
+pub mod coordinator;
+pub mod discovery;
+pub mod exchange;
+pub mod planner;
 pub mod server;
+pub mod sql;
+pub mod worker;
 
-/// Configuration for the Flight server.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct FlightConfig {
-    /// Host to bind the Flight server to.
-    #[serde(default = "default_flight_host")]
-    pub host: String,
-    /// Port for the Flight server.
-    #[serde(default = "default_flight_port")]
-    pub port: u16,
-    /// Maximum message size in bytes.
-    #[serde(default = "default_max_message_size")]
-    pub max_message_size: usize,
-}
-
-impl Default for FlightConfig {
-    fn default() -> Self {
-        Self {
-            host: default_flight_host(),
-            port: default_flight_port(),
-            max_message_size: default_max_message_size(),
-        }
-    }
-}
-
-fn default_flight_host() -> String {
-    "127.0.0.1".to_string()
-}
-fn default_flight_port() -> u16 {
-    50051
-}
-fn default_max_message_size() -> usize {
-    64 * 1024 * 1024
-} // 64MB
+// Re-export FlightConfig from core (single source of truth).
+pub use rustlake_core::config::FlightConfig;

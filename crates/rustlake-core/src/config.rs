@@ -26,6 +26,12 @@ pub struct RustLakeConfig {
     /// Arrow Flight RPC server settings.
     #[serde(default)]
     pub flight: FlightConfig,
+    /// Distributed cluster topology and scaling settings.
+    #[serde(default)]
+    pub cluster: ClusterConfig,
+    /// Kubernetes-specific discovery settings (only used when `cluster.discovery` is `Kubernetes`).
+    #[serde(default)]
+    pub k8s: K8sDiscoveryConfig,
 }
 
 impl RustLakeConfig {
@@ -225,6 +231,9 @@ pub struct FlightConfig {
     /// Port for the Flight gRPC server. Defaults to 50051.
     #[serde(default = "default_flight_port")]
     pub port: u16,
+    /// Maximum gRPC message size in bytes. Defaults to 64 MB.
+    #[serde(default = "default_flight_max_message_size")]
+    pub max_message_size: usize,
 }
 
 impl Default for FlightConfig {
@@ -233,6 +242,7 @@ impl Default for FlightConfig {
             enabled: false,
             host: default_flight_host(),
             port: default_flight_port(),
+            max_message_size: default_flight_max_message_size(),
         }
     }
 }
@@ -242,4 +252,157 @@ fn default_flight_host() -> String {
 }
 fn default_flight_port() -> u16 {
     50051
+}
+fn default_flight_max_message_size() -> usize {
+    64 * 1024 * 1024 // 64 MB
+}
+
+/// Role of this node in the distributed cluster topology.
+///
+/// - `Standalone`: single-process mode (default) — runs both query planning and execution
+/// - `Coordinator`: accepts client queries, plans execution, distributes partitions to workers
+/// - `Worker`: receives partition scan tasks from coordinator, executes and returns results
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum NodeRole {
+    Standalone,
+    Coordinator,
+    Worker,
+}
+
+impl Default for NodeRole {
+    fn default() -> Self {
+        Self::Standalone
+    }
+}
+
+/// Information about a worker node in the cluster.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerConfig {
+    /// Worker's Flight RPC address (e.g., `"10.0.1.5:50051"`).
+    pub address: String,
+    /// Optional human-readable label.
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+/// Distributed cluster configuration for multi-node execution.
+///
+/// Controls how RustLake nodes discover each other and distribute queries.
+/// In standalone mode (default), all fields are ignored.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClusterConfig {
+    /// Role of this node. Defaults to `Standalone`.
+    #[serde(default)]
+    pub node_role: NodeRole,
+    /// Address of the coordinator node. Workers use this to register.
+    /// Only required when `node_role` is `Worker`.
+    #[serde(default)]
+    pub coordinator_addr: Option<String>,
+    /// Static list of worker addresses (for non-K8s deployments).
+    /// Only used when `node_role` is `Coordinator` and `discovery` is `Static`.
+    #[serde(default)]
+    pub workers: Vec<WorkerConfig>,
+    /// Worker discovery mechanism.
+    #[serde(default)]
+    pub discovery: DiscoveryMethod,
+    /// Interval in seconds between worker heartbeats. Defaults to 10.
+    #[serde(default = "default_heartbeat_interval")]
+    pub heartbeat_interval_secs: u64,
+    /// Seconds without a heartbeat before a worker is marked unhealthy. Defaults to 30.
+    #[serde(default = "default_heartbeat_timeout")]
+    pub heartbeat_timeout_secs: u64,
+    /// Maximum number of concurrent partition scans per worker. Defaults to 4.
+    #[serde(default = "default_max_partitions_per_worker")]
+    pub max_partitions_per_worker: usize,
+    /// Buffer size in bytes for shuffle exchange between nodes. Defaults to 128 MB.
+    #[serde(default = "default_shuffle_buffer_size")]
+    pub shuffle_buffer_size: usize,
+}
+
+impl Default for ClusterConfig {
+    fn default() -> Self {
+        Self {
+            node_role: NodeRole::default(),
+            coordinator_addr: None,
+            workers: Vec::new(),
+            discovery: DiscoveryMethod::default(),
+            heartbeat_interval_secs: default_heartbeat_interval(),
+            heartbeat_timeout_secs: default_heartbeat_timeout(),
+            max_partitions_per_worker: default_max_partitions_per_worker(),
+            shuffle_buffer_size: default_shuffle_buffer_size(),
+        }
+    }
+}
+
+fn default_heartbeat_interval() -> u64 {
+    10
+}
+fn default_heartbeat_timeout() -> u64 {
+    30
+}
+fn default_max_partitions_per_worker() -> usize {
+    4
+}
+fn default_shuffle_buffer_size() -> usize {
+    128 * 1024 * 1024 // 128 MB
+}
+
+/// How the coordinator discovers worker nodes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DiscoveryMethod {
+    /// Workers are listed explicitly in `cluster.workers`.
+    Static,
+    /// Workers register themselves via gRPC (self-registration).
+    Register,
+    /// Discover workers via Kubernetes headless service DNS SRV records.
+    Kubernetes,
+}
+
+impl Default for DiscoveryMethod {
+    fn default() -> Self {
+        Self::Register
+    }
+}
+
+/// Kubernetes-specific discovery configuration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct K8sDiscoveryConfig {
+    /// Kubernetes namespace. Defaults to `"default"`.
+    #[serde(default = "default_k8s_namespace")]
+    pub namespace: String,
+    /// Headless service name for worker discovery.
+    #[serde(default = "default_k8s_service")]
+    pub service_name: String,
+    /// Port name in the K8s service spec. Defaults to `"flight"`.
+    #[serde(default = "default_k8s_port_name")]
+    pub port_name: String,
+    /// Polling interval in seconds for DNS re-resolution. Defaults to 15.
+    #[serde(default = "default_k8s_poll_interval")]
+    pub poll_interval_secs: u64,
+}
+
+impl Default for K8sDiscoveryConfig {
+    fn default() -> Self {
+        Self {
+            namespace: default_k8s_namespace(),
+            service_name: default_k8s_service(),
+            port_name: default_k8s_port_name(),
+            poll_interval_secs: default_k8s_poll_interval(),
+        }
+    }
+}
+
+fn default_k8s_namespace() -> String {
+    "default".to_string()
+}
+fn default_k8s_service() -> String {
+    "rustlake-workers".to_string()
+}
+fn default_k8s_port_name() -> String {
+    "flight".to_string()
+}
+fn default_k8s_poll_interval() -> u64 {
+    15
 }

@@ -1,0 +1,93 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rustlake-coordinator
+  namespace: rustlake
+  labels:
+    app.kubernetes.io/name: rustlake
+    app.kubernetes.io/component: coordinator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: rustlake
+      app.kubernetes.io/component: coordinator
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: rustlake
+        app.kubernetes.io/component: coordinator
+    spec:
+      serviceAccountName: rustlake-coordinator
+      containers:
+        - name: coordinator
+          image: rustlake/rustlake:latest
+          command: ["rustlake-api"]
+          ports:
+            - name: http
+              containerPort: 3000
+              protocol: TCP
+            - name: flight
+              containerPort: 50051
+              protocol: TCP
+          env:
+            - name: RUSTLAKE_CLUSTER__NODE_ROLE
+              value: "coordinator"
+            - name: RUSTLAKE_CLUSTER__DISCOVERY
+              value: "kubernetes"
+            - name: RUSTLAKE_FLIGHT__ENABLED
+              value: "true"
+            - name: RUSTLAKE_FLIGHT__HOST
+              value: "0.0.0.0"
+            - name: RUSTLAKE_FLIGHT__PORT
+              value: "50051"
+            - name: RUSTLAKE_K8S__NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: RUSTLAKE_K8S__SERVICE_NAME
+              value: "rustlake-worker-headless"
+            - name: RUSTLAKE_K8S__PORT_NAME
+              value: "flight"
+            - name: RUSTLAKE_K8S__POLL_INTERVAL_SECS
+              value: "30"
+          resources:
+            requests:
+              cpu: "500m"
+              memory: "1Gi"
+            limits:
+              cpu: "2"
+              memory: "4Gi"
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 15
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: rustlake-coordinator
+  namespace: rustlake
+  labels:
+    app.kubernetes.io/name: rustlake
+    app.kubernetes.io/component: coordinator
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: rustlake
+    app.kubernetes.io/component: coordinator
+  ports:
+    - name: http
+      port: 3000
+      targetPort: http
+    - name: flight
+      port: 50051
+      targetPort: flight

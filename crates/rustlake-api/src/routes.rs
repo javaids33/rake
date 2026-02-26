@@ -2,7 +2,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::Instant;
 
-use arrow::array::RecordBatch;
+use arrow::array::{Array, RecordBatch};
 use axum::extract::{Multipart, Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{delete, get, post, put};
@@ -182,21 +182,147 @@ pub struct SystemInfoResponse {
     pub datafusion_version: String,
 }
 
+/// Response for the system resources endpoint.
+#[derive(Serialize)]
+pub struct SystemResourcesResponse {
+    /// Number of logical CPU cores available.
+    pub cpu_cores: usize,
+    /// Total physical memory in bytes.
+    pub total_memory_bytes: u64,
+    /// Engine memory limit from config (None = unbounded).
+    pub engine_memory_limit: Option<usize>,
+    /// Rows per Arrow RecordBatch.
+    pub batch_size: usize,
+    /// Target partition count for DataFusion parallelism.
+    pub target_partitions: usize,
+    /// Number of Tokio worker threads.
+    pub tokio_workers: usize,
+    /// Whether distributed (multi-node) mode is active.
+    pub distributed_mode: bool,
+    /// Current status of the Flight gRPC server.
+    pub flight_status: String,
+    /// Role of this node in the cluster topology.
+    pub node_role: String,
+}
+
 /// Response for the Flight server info endpoint.
 #[derive(Serialize)]
 pub struct FlightInfoResponse {
-    /// Protocol name (e.g., "Arrow Flight SQL").
+    /// Protocol name (e.g., "Arrow Flight RPC").
     pub protocol: String,
+    /// Bind host for the Flight gRPC server.
+    pub host: String,
     /// gRPC port the Flight server listens on.
-    pub grpc_port: u16,
-    /// Current server status.
+    pub port: u16,
+    /// Current server status ("running", "stopped", "disabled").
     pub status: String,
+    /// Maximum gRPC message size in bytes.
+    pub max_message_size: usize,
     /// List of supported Flight capabilities.
     pub capabilities: Vec<String>,
     /// Apache Arrow version used by the server.
     pub arrow_version: String,
+    /// Number of active Flight gRPC connections.
+    pub active_clients: u64,
+    /// Total queries served via Flight since startup.
+    pub queries_served: u64,
     /// BI tools and clients known to be compatible.
     pub supported_clients: Vec<String>,
+}
+
+/// Detailed Flight server status for the /api/v1/flight/status endpoint.
+#[derive(Serialize)]
+pub struct FlightStatusResponse {
+    pub enabled: bool,
+    pub running: bool,
+    pub host: String,
+    pub port: u16,
+    pub active_connections: u64,
+    pub queries_served: u64,
+}
+
+/// Response for the system metrics endpoint (real-time OS metrics).
+#[derive(Serialize)]
+pub struct SystemMetricsResponse {
+    /// CPU usage percentage (0.0 - 100.0).
+    pub cpu_usage_percent: f64,
+    /// Memory used in bytes.
+    pub memory_used_bytes: u64,
+    /// Total memory in bytes.
+    pub memory_total_bytes: u64,
+    /// Memory usage percentage.
+    pub memory_usage_percent: f64,
+    /// Disk used in bytes (root partition).
+    pub disk_used_bytes: u64,
+    /// Disk total in bytes (root partition).
+    pub disk_total_bytes: u64,
+    /// Disk usage percentage.
+    pub disk_usage_percent: f64,
+    /// Load average (1 min).
+    pub load_avg_1m: f64,
+    /// Load average (5 min).
+    pub load_avg_5m: f64,
+    /// Active query count (approximate).
+    pub active_queries: u64,
+    /// Total queries since startup.
+    pub total_queries: u64,
+    /// Queries per second (last minute).
+    pub queries_per_second: f64,
+    /// Server uptime in seconds.
+    pub uptime_seconds: u64,
+}
+
+/// Response for query cost estimation.
+#[derive(Serialize)]
+pub struct QueryEstimateResponse {
+    /// The SQL query.
+    pub sql: String,
+    /// Estimated row count to process.
+    pub estimated_rows: u64,
+    /// Estimated bytes to scan.
+    pub estimated_bytes: u64,
+    /// Human-readable estimated scan size.
+    pub estimated_scan_size: String,
+    /// Number of partitions to read.
+    pub partitions: usize,
+    /// Cost rating: "low", "medium", "high".
+    pub cost_rating: String,
+    /// Tables referenced in the query.
+    pub tables_referenced: Vec<String>,
+    /// Planning notes.
+    pub notes: Vec<String>,
+}
+
+/// Request for connection test.
+#[derive(Deserialize)]
+pub struct ConnectionTestRequest {
+    /// Connection type: "postgres", "mysql", "s3", etc.
+    pub conn_type: String,
+    /// Host or endpoint.
+    pub host: String,
+    /// Port number.
+    pub port: Option<u16>,
+    /// Database name (if applicable).
+    pub database: Option<String>,
+    /// Username.
+    pub username: Option<String>,
+    /// Password.
+    pub password: Option<String>,
+}
+
+/// Response for connection test.
+#[derive(Serialize)]
+pub struct ConnectionTestResponse {
+    /// Whether the connection succeeded.
+    pub success: bool,
+    /// Human-readable status message.
+    pub message: String,
+    /// Latency of the test in milliseconds.
+    pub latency_ms: Option<u128>,
+    /// Server version (if available).
+    pub server_version: Option<String>,
+    /// Tables found (for database connections).
+    pub tables_found: Option<usize>,
 }
 
 /// A single transform model in the transforms list.
@@ -272,6 +398,168 @@ pub struct TransformRunResponse {
     pub duration_ms: u128,
 }
 
+/// Response for the EXPLAIN plan endpoint.
+#[derive(Serialize)]
+pub struct ExplainResponse {
+    /// Original SQL query.
+    pub sql: String,
+    /// Logical plan as a string.
+    pub logical_plan: String,
+    /// Physical plan as a string.
+    pub physical_plan: String,
+    /// Plan nodes for tree visualization.
+    pub nodes: Vec<PlanNode>,
+}
+
+/// A single node in the query plan tree.
+#[derive(Serialize, Clone)]
+pub struct PlanNode {
+    /// Node identifier.
+    pub id: usize,
+    /// Operator name (e.g., "TableScan", "Filter", "HashAggregate").
+    pub operator: String,
+    /// Detail string (e.g., filter expression, table name).
+    pub detail: String,
+    /// Estimated row count from plan (if available).
+    pub estimated_rows: Option<usize>,
+    /// Parent node ID (None for root).
+    pub parent: Option<usize>,
+    /// Depth in the tree (0 = root).
+    pub depth: usize,
+}
+
+/// Per-table quality check result.
+#[derive(Serialize, Clone)]
+pub struct TableQualityCheck {
+    /// Table name.
+    pub table: String,
+    /// Total row count.
+    pub row_count: usize,
+    /// Number of columns.
+    pub column_count: usize,
+    /// Per-column null percentages.
+    pub null_percentages: Vec<ColumnNullInfo>,
+    /// Overall health: "healthy", "warning", or "critical".
+    pub health: String,
+    /// List of issues found.
+    pub issues: Vec<String>,
+    /// When this check was performed.
+    pub checked_at: String,
+}
+
+/// Null info per column.
+#[derive(Serialize, Clone)]
+pub struct ColumnNullInfo {
+    /// Column name.
+    pub name: String,
+    /// Data type.
+    pub data_type: String,
+    /// Null count.
+    pub null_count: u64,
+    /// Total rows.
+    pub total_rows: usize,
+    /// Null percentage.
+    pub null_pct: f64,
+}
+
+/// Quality checks response.
+#[derive(Serialize)]
+pub struct QualityChecksResponse {
+    /// Per-table checks.
+    pub checks: Vec<TableQualityCheck>,
+    /// Summary counts.
+    pub healthy_count: usize,
+    pub warning_count: usize,
+    pub critical_count: usize,
+    pub total_tables: usize,
+}
+
+/// A quality alert rule.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QualityRule {
+    pub id: String,
+    pub table_name: String,
+    pub rule_type: String,
+    pub threshold: f64,
+    pub enabled: bool,
+    pub created_at: String,
+}
+
+/// DAG response for the scheduler.
+#[derive(Serialize)]
+pub struct SchedulerDagResponse {
+    pub nodes: Vec<DagNode>,
+    pub edges: Vec<DagEdge>,
+}
+
+#[derive(Serialize)]
+pub struct DagNode {
+    pub id: String,
+    pub name: String,
+    pub job_type: String,
+    pub status: String,
+    pub cron: String,
+    pub enabled: bool,
+    pub last_run: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct DagEdge {
+    pub from: String,
+    pub to: String,
+    pub label: Option<String>,
+}
+
+/// dbt model definition.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbtModel {
+    pub name: String,
+    pub sql: String,
+    pub depends_on: Vec<String>,
+    pub materialization: String,
+    pub description: String,
+    pub schema_name: Option<String>,
+    pub tags: Vec<String>,
+}
+
+/// dbt project state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbtProject {
+    pub name: String,
+    pub version: String,
+    pub models: Vec<DbtModel>,
+    pub sources: Vec<DbtSource>,
+    pub uploaded_at: String,
+}
+
+/// dbt source.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DbtSource {
+    pub name: String,
+    pub schema_name: String,
+    pub tables: Vec<String>,
+}
+
+/// Response for dbt model run.
+#[derive(Serialize)]
+pub struct DbtRunResponse {
+    pub model: String,
+    pub status: String,
+    pub compiled_sql: String,
+    pub row_count: usize,
+    pub duration_ms: u128,
+    pub error: Option<String>,
+}
+
+/// Response for dbt run-all.
+#[derive(Serialize)]
+pub struct DbtRunAllResponse {
+    pub results: Vec<DbtRunResponse>,
+    pub total_duration_ms: u128,
+    pub success_count: usize,
+    pub failure_count: usize,
+}
+
 // ── Routes ─────────────────────────────────────────────────────────
 
 /// Build the Axum router with all API routes.
@@ -280,6 +568,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/", get(dashboard))
         .route("/health", get(health))
         .route("/api/v1/sql", post(execute_sql))
+        .route("/api/v1/sql/explain", post(explain_sql))
         .route("/api/v1/tables", get(list_tables))
         .route("/api/v1/tables/register", post(register_table))
         .route("/api/v1/query/history", get(query_history))
@@ -287,8 +576,10 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/api/v1/tables/{name}/preview", get(table_preview))
         .route("/api/v1/tables/{name}/stats", get(table_stats))
         .route("/api/v1/system/info", get(system_info))
-        // Flight server info
+        .route("/api/v1/system/resources", get(system_resources))
+        // Flight server info + status
         .route("/api/v1/flight/info", get(flight_info))
+        .route("/api/v1/flight/status", get(flight_status))
         // Transform / lineage endpoints
         .route(
             "/api/v1/transforms",
@@ -334,6 +625,9 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/api/v1/schedules/runs", get(list_job_runs))
         // Job clusters
         .route("/api/v1/clusters", get(list_clusters))
+        // Cluster topology (distributed execution)
+        .route("/api/v1/cluster/topology", get(cluster_topology))
+        .route("/api/v1/cluster/workers", get(list_workers))
         // Table metadata + deregister
         .route("/api/v1/tables/{name}", delete(deregister_table))
         .route("/api/v1/tables/{name}/description", put(update_table_description).get(get_table_description))
@@ -349,6 +643,27 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             get(list_s3_configs).post(add_s3_config),
         )
         .route("/api/v1/storage/s3/{id}", delete(delete_s3_config))
+        // Quality checks
+        .route("/api/v1/quality/checks", get(quality_checks))
+        .route(
+            "/api/v1/quality/rules",
+            get(list_quality_rules).post(create_quality_rule),
+        )
+        .route("/api/v1/quality/rules/{id}", delete(delete_quality_rule))
+        // Scheduler DAG
+        .route("/api/v1/schedules/dag", get(scheduler_dag))
+        // dbt integration
+        .route("/api/v1/dbt/upload", post(dbt_upload))
+        .route("/api/v1/dbt/project", get(dbt_project_info))
+        .route("/api/v1/dbt/models", get(list_dbt_models))
+        .route("/api/v1/dbt/run/{name}", post(run_dbt_model))
+        .route("/api/v1/dbt/run-all", post(run_all_dbt_models))
+        // System metrics (real-time OS metrics)
+        .route("/api/v1/system/metrics", get(system_metrics))
+        // Query cost estimation
+        .route("/api/v1/sql/estimate", post(estimate_query))
+        // Connection testing
+        .route("/api/v1/connections/test", post(test_connection))
 }
 
 // ── Handlers ───────────────────────────────────────────────────────
@@ -871,29 +1186,140 @@ async fn system_info(State(state): State<Arc<AppState>>) -> Json<SystemInfoRespo
     })
 }
 
+/// GET /api/v1/system/resources — returns machine CPU/memory and engine configuration.
+async fn system_resources(State(state): State<Arc<AppState>>) -> Json<SystemResourcesResponse> {
+    let cpu_cores = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(1);
+
+    // Platform-specific total memory detection
+    let total_memory_bytes: u64 = {
+        #[cfg(target_os = "macos")]
+        {
+            std::process::Command::new("sysctl")
+                .args(["-n", "hw.memsize"])
+                .output()
+                .ok()
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .unwrap_or(0)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            std::fs::read_to_string("/proc/meminfo")
+                .ok()
+                .and_then(|s| {
+                    s.lines()
+                        .find(|l| l.starts_with("MemTotal:"))
+                        .and_then(|l| {
+                            l.split_whitespace()
+                                .nth(1)
+                                .and_then(|v| v.parse::<u64>().ok())
+                                .map(|kb| kb * 1024)
+                        })
+                })
+                .unwrap_or(0)
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            0u64
+        }
+    };
+
+    let flight_status = match &state.flight_metrics {
+        Some(fm) if fm.running.load(std::sync::atomic::Ordering::Relaxed) => "running".to_string(),
+        Some(_) => "stopped".to_string(),
+        None => "disabled".to_string(),
+    };
+
+    let ctx = state.ctx.read().await;
+    let node_role_str = match ctx.config().cluster.node_role {
+        rustlake_core::config::NodeRole::Standalone => "standalone",
+        rustlake_core::config::NodeRole::Coordinator => "coordinator",
+        rustlake_core::config::NodeRole::Worker => "worker",
+    };
+    let distributed = ctx.config().cluster.node_role != rustlake_core::config::NodeRole::Standalone;
+    drop(ctx);
+
+    Json(SystemResourcesResponse {
+        cpu_cores,
+        total_memory_bytes,
+        engine_memory_limit: None,
+        batch_size: 8192,
+        target_partitions: cpu_cores,
+        tokio_workers: cpu_cores,
+        distributed_mode: distributed,
+        flight_status,
+        node_role: node_role_str.to_string(),
+    })
+}
+
 // ── Flight Info ───────────────────────────────────────────────────
 
 /// GET /api/v1/flight/info — returns Arrow Flight server capabilities and status.
-async fn flight_info() -> Json<FlightInfoResponse> {
+async fn flight_info(State(state): State<Arc<AppState>>) -> Json<FlightInfoResponse> {
+    let (status, active_clients, queries_served) = match &state.flight_metrics {
+        Some(fm) => {
+            let running = fm.running.load(std::sync::atomic::Ordering::Relaxed);
+            let status = if running { "running" } else { "stopped" };
+            let active = fm.active_connections.load(std::sync::atomic::Ordering::Relaxed);
+            let served = fm.queries_served.load(std::sync::atomic::Ordering::Relaxed);
+            (status.to_string(), active, served)
+        }
+        None => ("disabled".to_string(), 0, 0),
+    };
+
+    // Read flight config from the engine context.
+    let ctx = state.ctx.read().await;
+    let flight_cfg = &ctx.config().flight;
+
     Json(FlightInfoResponse {
-        protocol: "Arrow Flight SQL".to_string(),
-        grpc_port: 50051,
-        status: "available".to_string(),
+        protocol: "Arrow Flight RPC".to_string(),
+        host: flight_cfg.host.clone(),
+        port: flight_cfg.port,
+        status,
+        max_message_size: flight_cfg.max_message_size,
         capabilities: vec![
-            "SQL queries".to_string(),
-            "Prepared statements".to_string(),
+            "SQL queries (do_get)".to_string(),
+            "Schema inspection (get_flight_info)".to_string(),
+            "Health check action".to_string(),
             "Bulk data transfer".to_string(),
-            "JDBC/ODBC gateway".to_string(),
         ],
         arrow_version: "57".to_string(),
+        active_clients,
+        queries_served,
         supported_clients: vec![
             "DBeaver".to_string(),
             "Tableau".to_string(),
             "Superset".to_string(),
-            "JDBC".to_string(),
-            "ODBC".to_string(),
             "Python (pyarrow.flight)".to_string(),
+            "Rust (arrow-flight)".to_string(),
+            "Go (apache-arrow-go)".to_string(),
         ],
+    })
+}
+
+/// GET /api/v1/flight/status — returns detailed Flight server status.
+async fn flight_status(State(state): State<Arc<AppState>>) -> Json<FlightStatusResponse> {
+    let ctx = state.ctx.read().await;
+    let flight_cfg = &ctx.config().flight;
+
+    let (running, active_connections, queries_served) = match &state.flight_metrics {
+        Some(fm) => (
+            fm.running.load(std::sync::atomic::Ordering::Relaxed),
+            fm.active_connections.load(std::sync::atomic::Ordering::Relaxed),
+            fm.queries_served.load(std::sync::atomic::Ordering::Relaxed),
+        ),
+        None => (false, 0, 0),
+    };
+
+    Json(FlightStatusResponse {
+        enabled: flight_cfg.enabled,
+        running,
+        host: flight_cfg.host.clone(),
+        port: flight_cfg.port,
+        active_connections,
+        queries_served,
     })
 }
 
@@ -2881,4 +3307,800 @@ async fn delete_s3_config(
         "status": "deleted",
         "name": name,
     })))
+}
+
+// ── EXPLAIN Plan ──────────────────────────────────────────────────
+
+/// POST /api/v1/sql/explain — returns logical and physical query plans.
+async fn explain_sql(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SqlRequest>,
+) -> Result<Json<ExplainResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let ctx = state.ctx.read().await;
+    let df_ctx = ctx.datafusion_ctx();
+
+    let logical_plan = match df_ctx.sql(&format!("EXPLAIN {}", req.sql)).await {
+        Ok(df) => {
+            let batches = df.collect().await.unwrap_or_default();
+            batches_to_text(&batches)
+        }
+        Err(e) => e.to_string(),
+    };
+
+    let physical_plan = match df_ctx.sql(&format!("EXPLAIN VERBOSE {}", req.sql)).await {
+        Ok(df) => {
+            let batches = df.collect().await.unwrap_or_default();
+            batches_to_text(&batches)
+        }
+        Err(e) => e.to_string(),
+    };
+
+    let nodes = parse_plan_nodes(&physical_plan);
+
+    Ok(Json(ExplainResponse {
+        sql: req.sql,
+        logical_plan,
+        physical_plan,
+        nodes,
+    }))
+}
+
+fn batches_to_text(batches: &[RecordBatch]) -> String {
+    let mut lines = Vec::new();
+    for batch in batches {
+        for col_idx in 0..batch.num_columns() {
+            let arr = batch.column(col_idx);
+            if let Some(str_arr) = arr.as_any().downcast_ref::<arrow::array::StringArray>() {
+                for i in 0..str_arr.len() {
+                    if !str_arr.is_null(i) { lines.push(str_arr.value(i).to_string()); }
+                }
+            } else if let Some(str_arr) = arr.as_any().downcast_ref::<arrow::array::LargeStringArray>() {
+                for i in 0..str_arr.len() {
+                    if !str_arr.is_null(i) { lines.push(str_arr.value(i).to_string()); }
+                }
+            }
+        }
+    }
+    lines.join("\n")
+}
+
+fn parse_plan_nodes(plan_text: &str) -> Vec<PlanNode> {
+    let mut nodes = Vec::new();
+    for (i, line) in plan_text.lines().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() { continue; }
+        let depth = line.len() - line.trim_start().len();
+        let depth_level = depth / 2;
+        let operator = trimmed.split(&[' ', ':', '(', ','][..]).next().unwrap_or(trimmed).to_string();
+        let parent = if depth_level == 0 { None } else {
+            nodes.iter().enumerate().rev().find_map(|(idx, n): (usize, &PlanNode)| {
+                if n.depth < depth_level { Some(idx) } else { None }
+            })
+        };
+        nodes.push(PlanNode { id: i, operator, detail: trimmed.to_string(), estimated_rows: None, parent, depth: depth_level });
+    }
+    nodes
+}
+
+// ── Quality Checks ────────────────────────────────────────────────
+
+async fn quality_checks(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<QualityChecksResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let ctx = state.ctx.read().await;
+    let tables = ctx.list_tables().await.map_err(|e| {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e.to_string() }))
+    })?;
+    let rules = state.quality_rules.read().await;
+    let mut checks = Vec::new();
+
+    for table_name in &tables {
+        let row_count = match ctx.sql(&format!("SELECT COUNT(*) AS cnt FROM \"{}\"", table_name)).await {
+            Ok(batches) => batches.first().and_then(|b| b.column(0).as_any().downcast_ref::<arrow::array::Int64Array>().map(|a| a.value(0) as usize)).unwrap_or(0),
+            Err(_) => 0,
+        };
+
+        let df_ctx = ctx.datafusion_ctx();
+        let schema_info = df_ctx.table(table_name).await.ok().map(|t| t.schema().clone());
+        let column_count = schema_info.as_ref().map(|s| s.fields().len()).unwrap_or(0);
+        let mut null_percentages = Vec::new();
+        let mut issues = Vec::new();
+
+        if let Some(schema) = &schema_info {
+            for field in schema.fields() {
+                let col_name = field.name();
+                let null_count = match ctx.sql(&format!(
+                    "SELECT COUNT(*) AS cnt FROM \"{}\" WHERE \"{}\" IS NULL", table_name, col_name
+                )).await {
+                    Ok(batches) => batches.first().and_then(|b| b.column(0).as_any().downcast_ref::<arrow::array::Int64Array>().map(|a| a.value(0) as u64)).unwrap_or(0),
+                    Err(_) => 0,
+                };
+                let null_pct = if row_count > 0 { (null_count as f64 / row_count as f64) * 100.0 } else { 0.0 };
+
+                for rule in rules.iter().filter(|r| r.enabled && r.table_name == *table_name && r.rule_type == "null_threshold") {
+                    if null_pct > rule.threshold {
+                        issues.push(format!("Column '{}' has {:.1}% nulls (threshold: {:.1}%)", col_name, null_pct, rule.threshold));
+                    }
+                }
+                if null_pct > 50.0 { issues.push(format!("Column '{}' has {:.1}% nulls", col_name, null_pct)); }
+
+                null_percentages.push(ColumnNullInfo { name: col_name.clone(), data_type: format!("{}", field.data_type()), null_count, total_rows: row_count, null_pct });
+            }
+        }
+
+        for rule in rules.iter().filter(|r| r.enabled && r.table_name == *table_name && r.rule_type == "min_row_count") {
+            if (row_count as f64) < rule.threshold { issues.push(format!("Row count {} below threshold {}", row_count, rule.threshold as usize)); }
+        }
+
+        let health = if issues.is_empty() { "healthy" } else if issues.len() <= 2 { "warning" } else { "critical" }.to_string();
+        checks.push(TableQualityCheck { table: table_name.clone(), row_count, column_count, null_percentages, health, issues, checked_at: Utc::now().to_rfc3339() });
+    }
+
+    let healthy_count = checks.iter().filter(|c| c.health == "healthy").count();
+    let warning_count = checks.iter().filter(|c| c.health == "warning").count();
+    let critical_count = checks.iter().filter(|c| c.health == "critical").count();
+    let total_tables = checks.len();
+    Ok(Json(QualityChecksResponse { checks, healthy_count, warning_count, critical_count, total_tables }))
+}
+
+async fn list_quality_rules(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let rules = state.quality_rules.read().await;
+    Json(serde_json::json!({ "rules": *rules }))
+}
+
+async fn create_quality_rule(State(state): State<Arc<AppState>>, Json(mut rule): Json<QualityRule>) -> Json<serde_json::Value> {
+    if rule.id.is_empty() { rule.id = Uuid::new_v4().to_string(); }
+    if rule.created_at.is_empty() { rule.created_at = Utc::now().to_rfc3339(); }
+    let mut rules = state.quality_rules.write().await;
+    rules.push(rule.clone());
+    Json(serde_json::json!({ "status": "created", "rule": rule }))
+}
+
+async fn delete_quality_rule(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let mut rules = state.quality_rules.write().await;
+    let before = rules.len();
+    rules.retain(|r| r.id != id);
+    if rules.len() == before { return Err((StatusCode::NOT_FOUND, Json(ErrorResponse { error: format!("Rule '{}' not found", id) }))); }
+    Ok(Json(serde_json::json!({ "status": "deleted" })))
+}
+
+// ── Scheduler DAG ─────────────────────────────────────────────────
+
+async fn scheduler_dag(State(state): State<Arc<AppState>>) -> Json<SchedulerDagResponse> {
+    let jobs = state.scheduled_jobs.read().await;
+    let runs = state.job_runs.read().await;
+    let mut nodes = Vec::new();
+    let mut edges = Vec::new();
+
+    for job in jobs.iter() {
+        let last_run_status = runs.iter()
+            .filter(|r| r.job_id == job.id)
+            .max_by_key(|r| &r.timestamp)
+            .map(|r| r.status.clone())
+            .unwrap_or_else(|| "pending".to_string());
+
+        nodes.push(DagNode { id: job.id.clone(), name: job.name.clone(), job_type: job.job_type.clone(), status: last_run_status, cron: job.cron.clone(), enabled: job.enabled, last_run: job.last_run.map(|d| d.to_rfc3339()) });
+
+        for tag in &job.tags {
+            if let Some(dep_name) = tag.strip_prefix("after:") {
+                if let Some(dep_job) = jobs.iter().find(|j| j.name == dep_name) {
+                    edges.push(DagEdge { from: dep_job.id.clone(), to: job.id.clone(), label: Some("depends on".to_string()) });
+                }
+            }
+        }
+    }
+
+    Json(SchedulerDagResponse { nodes, edges })
+}
+
+// ── dbt Integration ───────────────────────────────────────────────
+
+async fn dbt_upload(State(state): State<Arc<AppState>>, Json(project): Json<DbtProject>) -> Json<serde_json::Value> {
+    let model_count = project.models.len();
+    let source_count = project.sources.len();
+    let mut stored = state.dbt_project.write().await;
+    *stored = Some(project);
+    Json(serde_json::json!({ "status": "uploaded", "models": model_count, "sources": source_count }))
+}
+
+async fn dbt_project_info(State(state): State<Arc<AppState>>) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let project = state.dbt_project.read().await;
+    match &*project {
+        Some(p) => Ok(Json(serde_json::json!({ "name": p.name, "version": p.version, "model_count": p.models.len(), "source_count": p.sources.len(), "uploaded_at": p.uploaded_at }))),
+        None => Err((StatusCode::NOT_FOUND, Json(ErrorResponse { error: "No dbt project uploaded".into() }))),
+    }
+}
+
+async fn list_dbt_models(State(state): State<Arc<AppState>>) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let project = state.dbt_project.read().await;
+    match &*project {
+        Some(p) => Ok(Json(serde_json::json!({ "models": p.models, "sources": p.sources }))),
+        None => Err((StatusCode::NOT_FOUND, Json(ErrorResponse { error: "No dbt project uploaded".into() }))),
+    }
+}
+
+async fn run_dbt_model(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> Result<Json<DbtRunResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let project = state.dbt_project.read().await;
+    let project = project.as_ref().ok_or_else(|| (StatusCode::NOT_FOUND, Json(ErrorResponse { error: "No dbt project uploaded".into() })))?;
+    let model = project.models.iter().find(|m| m.name == name).ok_or_else(|| (StatusCode::NOT_FOUND, Json(ErrorResponse { error: format!("Model '{}' not found", name) })))?;
+
+    let mut compiled = model.sql.clone();
+    for dep in &model.depends_on {
+        compiled = compiled.replace(&format!("ref('{}')", dep), &format!("\"{}\"", dep));
+        compiled = compiled.replace(&format!("ref(\"{}\")", dep), &format!("\"{}\"", dep));
+    }
+
+    let start = Instant::now();
+    let ctx = state.ctx.read().await;
+    match ctx.sql(&compiled).await {
+        Ok(batches) => {
+            let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
+            if model.materialization == "table" || model.materialization == "incremental" {
+                if let Some(batch) = batches.first() {
+                    let schema = batch.schema();
+                    if let Ok(mem_table) = datafusion::datasource::MemTable::try_new(schema, vec![batches]) {
+                        let _ = ctx.datafusion_ctx().register_table(&name, std::sync::Arc::new(mem_table));
+                    }
+                }
+            }
+            Ok(Json(DbtRunResponse { model: name, status: "success".into(), compiled_sql: compiled, row_count, duration_ms: start.elapsed().as_millis(), error: None }))
+        }
+        Err(e) => Ok(Json(DbtRunResponse { model: name, status: "error".into(), compiled_sql: compiled, row_count: 0, duration_ms: start.elapsed().as_millis(), error: Some(e.to_string()) })),
+    }
+}
+
+async fn run_all_dbt_models(State(state): State<Arc<AppState>>) -> Result<Json<DbtRunAllResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let project = state.dbt_project.read().await;
+    let project_ref = project.as_ref().ok_or_else(|| (StatusCode::NOT_FOUND, Json(ErrorResponse { error: "No dbt project uploaded".into() })))?;
+    let mut remaining: Vec<DbtModel> = project_ref.models.clone();
+    drop(project);
+
+    let mut results = Vec::new();
+    let mut executed: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let all_start = Instant::now();
+
+    for _ in 0..20 {
+        if remaining.is_empty() { break; }
+        let mut still_remaining = Vec::new();
+        for model in remaining {
+            if !model.depends_on.iter().all(|d| executed.contains(d)) { still_remaining.push(model); continue; }
+            let mut compiled = model.sql.clone();
+            for dep in &model.depends_on {
+                compiled = compiled.replace(&format!("ref('{}')", dep), &format!("\"{}\"", dep));
+                compiled = compiled.replace(&format!("ref(\"{}\")", dep), &format!("\"{}\"", dep));
+            }
+            let start = Instant::now();
+            let ctx = state.ctx.read().await;
+            match ctx.sql(&compiled).await {
+                Ok(batches) => {
+                    let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
+                    if model.materialization == "table" || model.materialization == "incremental" {
+                        if let Some(batch) = batches.first() {
+                            let schema = batch.schema();
+                            if let Ok(mt) = datafusion::datasource::MemTable::try_new(schema, vec![batches]) {
+                                let _ = ctx.datafusion_ctx().register_table(&model.name, std::sync::Arc::new(mt));
+                            }
+                        }
+                    }
+                    executed.insert(model.name.clone());
+                    results.push(DbtRunResponse { model: model.name, status: "success".into(), compiled_sql: compiled, row_count, duration_ms: start.elapsed().as_millis(), error: None });
+                }
+                Err(e) => {
+                    executed.insert(model.name.clone());
+                    results.push(DbtRunResponse { model: model.name, status: "error".into(), compiled_sql: compiled, row_count: 0, duration_ms: start.elapsed().as_millis(), error: Some(e.to_string()) });
+                }
+            }
+        }
+        remaining = still_remaining;
+    }
+
+    let success_count = results.iter().filter(|r| r.status == "success").count();
+    let failure_count = results.iter().filter(|r| r.status == "error").count();
+    Ok(Json(DbtRunAllResponse { results, total_duration_ms: all_start.elapsed().as_millis(), success_count, failure_count }))
+}
+
+// ── Cluster Topology ────────────────────────────────────────────────
+
+/// GET /api/v1/cluster/topology — Get the full cluster topology overview.
+async fn cluster_topology(
+    State(state): State<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    let ctx = state.ctx.read().await;
+    let config = ctx.config();
+    let node_role = match config.cluster.node_role {
+        rustlake_core::config::NodeRole::Standalone => "standalone",
+        rustlake_core::config::NodeRole::Coordinator => "coordinator",
+        rustlake_core::config::NodeRole::Worker => "worker",
+    };
+    let discovery = match config.cluster.discovery {
+        rustlake_core::config::DiscoveryMethod::Static => "static",
+        rustlake_core::config::DiscoveryMethod::Register => "register",
+        rustlake_core::config::DiscoveryMethod::Kubernetes => "kubernetes",
+    };
+    let flight_enabled = config.flight.enabled;
+    let flight_host = config.flight.host.clone();
+    let flight_port = config.flight.port;
+    let heartbeat_interval = config.cluster.heartbeat_interval_secs;
+    let heartbeat_timeout = config.cluster.heartbeat_timeout_secs;
+    let max_partitions = config.cluster.max_partitions_per_worker;
+    let shuffle_buffer = config.cluster.shuffle_buffer_size;
+    let coordinator_addr = config.cluster.coordinator_addr.clone();
+    drop(ctx);
+
+    let worker_count = if let Some(ref coord) = state.coordinator {
+        coord.active_worker_count().await
+    } else {
+        0
+    };
+
+    let workers = if let Some(ref coord) = state.coordinator {
+        let handles = coord.list_workers().await;
+        handles
+            .into_iter()
+            .map(|w| serde_json::json!({
+                "id": w.id,
+                "endpoint": w.endpoint,
+                "label": w.label,
+                "cpu_cores": w.cpu_cores,
+                "memory_bytes": w.memory_bytes,
+                "status": format!("{:?}", w.status).to_lowercase(),
+                "active_partitions": w.active_partitions,
+                "queries_executed": w.queries_executed,
+            }))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+
+    let flight_running = state.flight_metrics.as_ref()
+        .map(|fm| fm.running.load(std::sync::atomic::Ordering::Relaxed))
+        .unwrap_or(false);
+
+    Json(serde_json::json!({
+        "node_role": node_role,
+        "discovery_method": discovery,
+        "flight_enabled": flight_enabled,
+        "flight_running": flight_running,
+        "flight_host": flight_host,
+        "flight_port": flight_port,
+        "coordinator_addr": coordinator_addr,
+        "heartbeat_interval_secs": heartbeat_interval,
+        "heartbeat_timeout_secs": heartbeat_timeout,
+        "max_partitions_per_worker": max_partitions,
+        "shuffle_buffer_size": shuffle_buffer,
+        "active_workers": worker_count,
+        "workers": workers,
+    }))
+}
+
+/// GET /api/v1/cluster/workers — List registered workers (coordinator only).
+async fn list_workers(
+    State(state): State<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    let workers = if let Some(ref coord) = state.coordinator {
+        let handles = coord.list_workers().await;
+        handles
+            .into_iter()
+            .map(|w| serde_json::json!({
+                "id": w.id,
+                "endpoint": w.endpoint,
+                "label": w.label,
+                "cpu_cores": w.cpu_cores,
+                "memory_bytes": w.memory_bytes,
+                "status": format!("{:?}", w.status).to_lowercase(),
+                "active_partitions": w.active_partitions,
+                "queries_executed": w.queries_executed,
+            }))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+
+    Json(serde_json::json!({
+        "workers": workers,
+        "count": workers.len(),
+    }))
+}
+
+// ── System Metrics (real-time OS metrics) ────────────────────────
+
+/// GET /api/v1/system/metrics — returns real-time CPU, memory, disk usage.
+async fn system_metrics(State(state): State<Arc<AppState>>) -> Json<SystemMetricsResponse> {
+    let total_queries = state.query_count.load(Ordering::Relaxed);
+    let uptime = state.start_time.elapsed().as_secs();
+
+    // CPU usage (approximate via load average on macOS/Linux)
+    let (load_1m, load_5m, cpu_percent) = get_load_average();
+
+    // Memory usage
+    let (mem_used, mem_total) = get_memory_usage();
+    let mem_percent = if mem_total > 0 {
+        (mem_used as f64 / mem_total as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    // Disk usage
+    let (disk_used, disk_total) = get_disk_usage();
+    let disk_percent = if disk_total > 0 {
+        (disk_used as f64 / disk_total as f64) * 100.0
+    } else {
+        0.0
+    };
+
+    // Approximate QPS (total / uptime)
+    let qps = if uptime > 0 {
+        total_queries as f64 / uptime as f64
+    } else {
+        0.0
+    };
+
+    Json(SystemMetricsResponse {
+        cpu_usage_percent: cpu_percent,
+        memory_used_bytes: mem_used,
+        memory_total_bytes: mem_total,
+        memory_usage_percent: (mem_percent * 10.0).round() / 10.0,
+        disk_used_bytes: disk_used,
+        disk_total_bytes: disk_total,
+        disk_usage_percent: (disk_percent * 10.0).round() / 10.0,
+        load_avg_1m: load_1m,
+        load_avg_5m: load_5m,
+        active_queries: 0, // No in-flight tracking yet
+        total_queries,
+        queries_per_second: (qps * 100.0).round() / 100.0,
+        uptime_seconds: uptime,
+    })
+}
+
+fn get_load_average() -> (f64, f64, f64) {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let output = std::process::Command::new("uptime")
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .unwrap_or_default();
+        // Parse "load averages: 2.50, 2.30, 2.10" or "load average: 2.50, 2.30, 2.10"
+        if let Some(idx) = output.find("load average") {
+            let rest = &output[idx..];
+            let nums: Vec<f64> = rest
+                .split(|c: char| !c.is_ascii_digit() && c != '.')
+                .filter_map(|s| s.parse::<f64>().ok())
+                .collect();
+            let load_1 = nums.first().copied().unwrap_or(0.0);
+            let load_5 = nums.get(1).copied().unwrap_or(0.0);
+            let cores = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(1);
+            let cpu_pct = (load_1 / cores as f64 * 100.0).min(100.0);
+            return (load_1, load_5, (cpu_pct * 10.0).round() / 10.0);
+        }
+        (0.0, 0.0, 0.0)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        (0.0, 0.0, 0.0)
+    }
+}
+
+fn get_memory_usage() -> (u64, u64) {
+    #[cfg(target_os = "macos")]
+    {
+        let total = std::process::Command::new("sysctl")
+            .args(["-n", "hw.memsize"])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+
+        // vm_stat gives page-level memory info
+        let vm_out = std::process::Command::new("vm_stat")
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .unwrap_or_default();
+
+        let page_size: u64 = 16384; // macOS Apple Silicon default
+        let mut active: u64 = 0;
+        let mut wired: u64 = 0;
+        let mut compressed: u64 = 0;
+
+        for line in vm_out.lines() {
+            let val = line
+                .split(':')
+                .nth(1)
+                .map(|s| s.trim().trim_end_matches('.'))
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(0);
+            if line.contains("Pages active") {
+                active = val;
+            } else if line.contains("Pages wired") {
+                wired = val;
+            } else if line.contains("Pages occupied by compressor") {
+                compressed = val;
+            }
+        }
+
+        let used = (active + wired + compressed) * page_size;
+        (used, total)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let meminfo = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
+        let mut total: u64 = 0;
+        let mut available: u64 = 0;
+        for line in meminfo.lines() {
+            if line.starts_with("MemTotal:") {
+                total = line.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0) * 1024;
+            } else if line.starts_with("MemAvailable:") {
+                available = line.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok()).unwrap_or(0) * 1024;
+            }
+        }
+        (total.saturating_sub(available), total)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        (0, 0)
+    }
+}
+
+fn get_disk_usage() -> (u64, u64) {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        let output = std::process::Command::new("df")
+            .args(["-k", "/"])
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .unwrap_or_default();
+
+        // Skip header line, parse: Filesystem 1K-blocks Used Available ...
+        if let Some(line) = output.lines().nth(1) {
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 4 {
+                let total = parts[1].parse::<u64>().unwrap_or(0) * 1024;
+                let used = parts[2].parse::<u64>().unwrap_or(0) * 1024;
+                return (used, total);
+            }
+        }
+        (0, 0)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        (0, 0)
+    }
+}
+
+// ── Query Cost Estimation ────────────────────────────────────────
+
+/// POST /api/v1/sql/estimate — estimate query cost before execution.
+async fn estimate_query(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SqlRequest>,
+) -> Result<Json<QueryEstimateResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let ctx = state.ctx.read().await;
+    let df_ctx = ctx.datafusion_ctx();
+
+    // Parse the query to extract table references
+    let tables_referenced = extract_table_references(&req.sql);
+
+    // Get table sizes for estimation
+    let mut total_estimated_rows: u64 = 0;
+    let mut total_estimated_bytes: u64 = 0;
+    let mut notes = Vec::new();
+
+    for table_name in &tables_referenced {
+        // Try to get row count via COUNT(*)
+        match df_ctx.sql(&format!("SELECT COUNT(*) as cnt FROM {}", table_name)).await {
+            Ok(df) => {
+                if let Ok(batches) = df.collect().await {
+                    for batch in &batches {
+                        if batch.num_rows() > 0 {
+                            if let Some(arr) = batch.column(0).as_any().downcast_ref::<arrow::array::Int64Array>() {
+                                let rows = arr.value(0) as u64;
+                                total_estimated_rows += rows;
+                                // Rough estimate: ~100 bytes per row average
+                                total_estimated_bytes += rows * 100;
+                                notes.push(format!("{}: ~{} rows", table_name, rows));
+                            }
+                        }
+                    }
+                }
+            }
+            Err(_) => {
+                notes.push(format!("{}: unable to estimate", table_name));
+            }
+        }
+    }
+
+    // Get partitions from EXPLAIN
+    let partitions = match df_ctx.sql(&format!("EXPLAIN {}", req.sql)).await {
+        Ok(df) => {
+            let text = df.collect().await
+                .map(|batches| batches_to_text(&batches))
+                .unwrap_or_default();
+            // Count RepartitionExec or similar partition nodes
+            text.matches("partition").count().max(1)
+        }
+        Err(_) => 1,
+    };
+
+    let cost_rating = if total_estimated_rows < 10_000 {
+        "low"
+    } else if total_estimated_rows < 1_000_000 {
+        "medium"
+    } else {
+        "high"
+    };
+
+    let scan_size = format_bytes(total_estimated_bytes);
+
+    Ok(Json(QueryEstimateResponse {
+        sql: req.sql,
+        estimated_rows: total_estimated_rows,
+        estimated_bytes: total_estimated_bytes,
+        estimated_scan_size: scan_size,
+        partitions,
+        cost_rating: cost_rating.to_string(),
+        tables_referenced,
+        notes,
+    }))
+}
+
+fn extract_table_references(sql: &str) -> Vec<String> {
+    let upper = sql.to_uppercase();
+    let mut tables = Vec::new();
+    let words: Vec<&str> = sql.split_whitespace().collect();
+
+    for (i, word) in words.iter().enumerate() {
+        let upper_word = word.to_uppercase();
+        if (upper_word == "FROM" || upper_word == "JOIN") && i + 1 < words.len() {
+            let table = words[i + 1]
+                .trim_matches(|c: char| c == '(' || c == ')' || c == ',' || c == ';')
+                .to_string();
+            if !table.is_empty()
+                && !table.starts_with('(')
+                && table.to_uppercase() != "SELECT"
+                && table.to_uppercase() != "WHERE"
+                && !table.starts_with('\'')
+            {
+                tables.push(table);
+            }
+        }
+    }
+
+    tables.sort();
+    tables.dedup();
+    tables
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{} B", bytes)
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KB", bytes as f64 / 1024.0)
+    } else if bytes < 1024 * 1024 * 1024 {
+        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+    }
+}
+
+// ── Connection Test ──────────────────────────────────────────────
+
+/// POST /api/v1/connections/test — test database connectivity.
+async fn test_connection(
+    Json(req): Json<ConnectionTestRequest>,
+) -> Json<ConnectionTestResponse> {
+    let start = Instant::now();
+
+    match req.conn_type.as_str() {
+        "postgres" | "postgresql" => {
+            let host = &req.host;
+            let port = req.port.unwrap_or(5432);
+            let db = req.database.as_deref().unwrap_or("postgres");
+            let user = req.username.as_deref().unwrap_or("postgres");
+            let pass = req.password.as_deref().unwrap_or("");
+
+            let conn_str = format!(
+                "host={} port={} dbname={} user={} password={}",
+                host, port, db, user, pass
+            );
+
+            match tokio_postgres::connect(&conn_str, tokio_postgres::NoTls).await {
+                Ok((client, connection)) => {
+                    tokio::spawn(async move { let _ = connection.await; });
+                    let latency = start.elapsed().as_millis();
+
+                    // Get server version
+                    let version = client
+                        .simple_query("SELECT version()")
+                        .await
+                        .ok()
+                        .and_then(|rows| {
+                            rows.into_iter().find_map(|msg| {
+                                if let tokio_postgres::SimpleQueryMessage::Row(row) = msg {
+                                    row.get(0).map(|v| v.to_string())
+                                } else {
+                                    None
+                                }
+                            })
+                        });
+
+                    // Count tables
+                    let table_count = client
+                        .simple_query("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'public'")
+                        .await
+                        .ok()
+                        .and_then(|rows| {
+                            rows.into_iter().find_map(|msg| {
+                                if let tokio_postgres::SimpleQueryMessage::Row(row) = msg {
+                                    row.get(0).and_then(|v| v.parse::<usize>().ok())
+                                } else {
+                                    None
+                                }
+                            })
+                        });
+
+                    Json(ConnectionTestResponse {
+                        success: true,
+                        message: "Connection successful".to_string(),
+                        latency_ms: Some(latency),
+                        server_version: version,
+                        tables_found: table_count,
+                    })
+                }
+                Err(e) => {
+                    Json(ConnectionTestResponse {
+                        success: false,
+                        message: format!("Connection failed: {}", e),
+                        latency_ms: Some(start.elapsed().as_millis()),
+                        server_version: None,
+                        tables_found: None,
+                    })
+                }
+            }
+        }
+        _ => {
+            // For non-Postgres types, attempt a basic TCP connection check
+            let host = &req.host;
+            let port = req.port.unwrap_or(80);
+            let addr = format!("{}:{}", host, port);
+
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                tokio::net::TcpStream::connect(&addr),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {
+                    let latency = start.elapsed().as_millis();
+                    Json(ConnectionTestResponse {
+                        success: true,
+                        message: format!("TCP connection to {} successful", addr),
+                        latency_ms: Some(latency),
+                        server_version: None,
+                        tables_found: None,
+                    })
+                }
+                Ok(Err(e)) => {
+                    Json(ConnectionTestResponse {
+                        success: false,
+                        message: format!("Connection failed: {}", e),
+                        latency_ms: Some(start.elapsed().as_millis()),
+                        server_version: None,
+                        tables_found: None,
+                    })
+                }
+                Err(_) => {
+                    Json(ConnectionTestResponse {
+                        success: false,
+                        message: "Connection timed out (5s)".to_string(),
+                        latency_ms: Some(5000),
+                        server_version: None,
+                        tables_found: None,
+                    })
+                }
+            }
+        }
+    }
 }

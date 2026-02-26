@@ -1,0 +1,43 @@
+{{- if .Values.serviceAccount.create }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Release.Name }}-coordinator
+  labels:
+    app.kubernetes.io/name: rustlake
+    app.kubernetes.io/component: coordinator
+    app.kubernetes.io/instance: {{ .Release.Name }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Release.Name }}-worker
+  labels:
+    app.kubernetes.io/name: rustlake
+    app.kubernetes.io/component: worker
+    app.kubernetes.io/instance: {{ .Release.Name }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ .Release.Name }}-coordinator
+rules:
+  - apiGroups: [""]
+    resources: ["endpoints", "pods", "services"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["apps"]
+    resources: ["statefulsets"]
+    verbs: ["get", "list", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ .Release.Name }}-coordinator
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Release.Name }}-coordinator
+roleRef:
+  kind: Role
+  name: {{ .Release.Name }}-coordinator
+  apiGroup: rbac.authorization.k8s.io
+{{- end }}

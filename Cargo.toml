@@ -24,7 +24,7 @@ license = "Apache-2.0"
 [workspace.dependencies]
 # Arrow ecosystem — these MUST move together
 arrow = { version = "57", features = ["prettyprint"] }
-arrow-flight = "57"
+arrow-flight = { version = "57", features = ["flight-sql-experimental"] }
 arrow-json = "57"
 arrow-cast = "57"
 arrow-schema = "57"

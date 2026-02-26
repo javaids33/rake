@@ -88,17 +88,16 @@ WORKDIR /opt/rustlake
 COPY --from=builder /usr/src/rustlake/target/release/rustlake /usr/local/bin/rustlake
 COPY --from=builder /usr/src/rustlake/target/release/rustlake-api /usr/local/bin/rustlake-api
 
-# Copy sample data and dashboard
+# Copy sample data
 COPY sample-data/ /opt/rustlake/sample-data/
-COPY dashboard.html /opt/rustlake/dashboard.html
 
 # Ensure the rustlake user owns the working directory
 RUN chown -R rustlake:rustlake /opt/rustlake
 
 USER rustlake
 
-# API server default port
-EXPOSE 3000
+# API server default port + Arrow Flight gRPC port
+EXPOSE 3000 50051
 
 # Health check — the API server exposes /health
 HEALTHCHECK --interval=15s --timeout=5s --start-period=10s --retries=3 \
