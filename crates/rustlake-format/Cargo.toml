@@ -1,0 +1,21 @@
+[package]
+name = "rustlake-format"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rustlake-core = { workspace = true }
+rustlake-storage = { workspace = true }
+arrow = { workspace = true }
+arrow-schema = { workspace = true }
+parquet = { workspace = true }
+datafusion = { workspace = true }
+object_store = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }

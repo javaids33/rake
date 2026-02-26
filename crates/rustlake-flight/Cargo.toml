@@ -1,0 +1,23 @@
+[package]
+name = "rustlake-flight"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rustlake-core = { workspace = true }
+rustlake-engine = { workspace = true }
+arrow = { workspace = true }
+arrow-flight = { workspace = true }
+arrow-schema = { workspace = true }
+arrow-array = { workspace = true }
+arrow-ipc = { workspace = true }
+datafusion = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+futures = { workspace = true }
+tracing = { workspace = true }
+tonic = { workspace = true }
+prost = { workspace = true }
+bytes = { workspace = true }
+uuid = { workspace = true }
+serde = { workspace = true }

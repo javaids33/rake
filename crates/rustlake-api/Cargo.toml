@@ -1,0 +1,32 @@
+[package]
+name = "rustlake-api"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rustlake-core = { workspace = true }
+rustlake-engine = { workspace = true }
+rustlake-router = { workspace = true }
+rustlake-stream = { workspace = true }
+rustlake-vector = { workspace = true }
+rustlake-transform = { workspace = true }
+rustlake-flight = { workspace = true }
+rand = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+arrow = { workspace = true }
+arrow-json = { workspace = true }
+arrow-cast = { workspace = true }
+arrow-schema = { workspace = true }
+datafusion = { workspace = true }
+anyhow = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tokio-postgres = { workspace = true }
+rust_decimal = { workspace = true }

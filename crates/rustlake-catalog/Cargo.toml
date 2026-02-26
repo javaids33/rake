@@ -1,0 +1,14 @@
+[package]
+name = "rustlake-catalog"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rustlake-core = { workspace = true }
+rustlake-storage = { workspace = true }
+datafusion = { workspace = true }
+arrow = { workspace = true }
+arrow-schema = { workspace = true }
+async-trait = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

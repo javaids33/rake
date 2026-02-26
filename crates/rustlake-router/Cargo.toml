@@ -1,0 +1,9 @@
+[package]
+name = "rustlake-router"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rustlake-core = { workspace = true }
+datafusion = { workspace = true }
+tracing = { workspace = true }

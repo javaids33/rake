@@ -1,0 +1,17 @@
+[package]
+name = "rustlake-vector"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rustlake-core = { workspace = true }
+arrow = { workspace = true }
+arrow-schema = { workspace = true }
+arrow-array = { workspace = true }
+datafusion = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }

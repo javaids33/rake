@@ -1,0 +1,12 @@
+[package]
+name = "rustlake-storage"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rustlake-core = { workspace = true }
+object_store = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }
+futures = { workspace = true }

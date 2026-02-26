@@ -1,0 +1,102 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rustlake-core",
+    "crates/rustlake-storage",
+    "crates/rustlake-catalog",
+    "crates/rustlake-format",
+    "crates/rustlake-engine",
+    "crates/rustlake-stream",
+    "crates/rustlake-vector",
+    "crates/rustlake-router",
+    "crates/rustlake-scheduler",
+    "crates/rustlake-flight",
+    "crates/rustlake-transform",
+    "crates/rustlake-api",
+    "crates/rustlake-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+# Arrow ecosystem — these MUST move together
+arrow = { version = "57", features = ["prettyprint"] }
+arrow-flight = "57"
+arrow-json = "57"
+arrow-cast = "57"
+arrow-schema = "57"
+arrow-array = "57"
+arrow-ipc = "57"
+parquet = { version = "57", features = ["arrow"] }
+datafusion = "51"
+object_store = { version = "0.12", features = ["aws"] }
+
+# Table formats
+deltalake = "0.24"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Async
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+futures = "0.3"
+
+# Web
+axum = { version = "0.8", features = ["multipart"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+
+# Postgres
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-serde_json-1"] }
+rust_decimal = { version = "1", features = ["db-tokio-postgres"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Logging & Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+comfy-table = "7"
+
+# Graph
+petgraph = "0.6"
+
+# Time / IDs
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# URL
+url = "2"
+
+# Bytes
+bytes = "1"
+
+# Random
+rand = "0.8"
+
+# gRPC (for Arrow Flight — must match arrow-flight's tonic version)
+tonic = "0.14"
+prost = "0.13"
+
+# Internal crates
+rustlake-core = { path = "crates/rustlake-core" }
+rustlake-storage = { path = "crates/rustlake-storage" }
+rustlake-catalog = { path = "crates/rustlake-catalog" }
+rustlake-format = { path = "crates/rustlake-format" }
+rustlake-engine = { path = "crates/rustlake-engine" }
+rustlake-stream = { path = "crates/rustlake-stream" }
+rustlake-vector = { path = "crates/rustlake-vector" }
+rustlake-router = { path = "crates/rustlake-router" }
+rustlake-scheduler = { path = "crates/rustlake-scheduler" }
+rustlake-flight = { path = "crates/rustlake-flight" }
+rustlake-transform = { path = "crates/rustlake-transform" }
