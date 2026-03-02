@@ -439,6 +439,16 @@ services:
       - RUSTLAKE_PG_DB=rustlake_demo
       - RUSTLAKE_PG_USER=rustlake
       - RUSTLAKE_PG_PASSWORD=rustlake
+      - RUSTLAKE_MYSQL_HOST=mysql
+      - RUSTLAKE_MYSQL_PORT=3306
+      - RUSTLAKE_MYSQL_DB=rustlake_demo
+      - RUSTLAKE_MYSQL_USER=rustlake
+      - RUSTLAKE_MYSQL_PASSWORD=rustlake
+      - RUSTLAKE_MONGO_HOST=mongo
+      - RUSTLAKE_MONGO_PORT=27017
+      - RUSTLAKE_MONGO_DB=rustlake_demo
+      - RUSTLAKE_MONGO_USER=rustlake
+      - RUSTLAKE_MONGO_PASSWORD=rustlake
     volumes:
       - rustlake-data:/opt/rustlake/data
       - rustlake-uploads:/opt/rustlake/uploads

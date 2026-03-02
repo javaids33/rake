@@ -210,7 +210,7 @@ export function About() {
     setBootstrapping(true)
     try {
       await runBootstrap()
-      toast.success('Bootstrap complete')
+      toast.success('Bootstrap complete — all services refreshed')
       fetchStatus()
     } catch (e) {
       toast.error('Bootstrap failed')
@@ -218,6 +218,13 @@ export function About() {
       setBootstrapping(false)
     }
   }
+
+  // Derived bootstrap metrics
+  const connectedCount = bootstrap
+    ? [bootstrap.postgres, bootstrap.mysql, bootstrap.mongodb, bootstrap.minio].filter(s => s.available).length
+    : 0
+  const allOnline = connectedCount === 4
+  const RING_CIRCUMFERENCE = 144.51 // 2 * π * 23
 
   return (
     <div className="flex flex-col h-full animate-fade-in">
@@ -596,104 +603,197 @@ core ──→ python  (PyO3 bridge to engine/stream/vector)`}</pre>
             </div>
           </Card>
 
-          {/* Quick Start Playground */}
+          {/* ── Systems Monitor ─────────────────────────────────── */}
           <div>
             <h2 className="text-sm font-display font-semibold text-zinc-200 mb-4 flex items-center gap-2">
               <Rocket className="w-4 h-4 text-amber-400" /> Quick Start Playground
             </h2>
 
-            {/* Bootstrap Status Panel */}
-            <Card padding="md" className="mb-4">
-              <div className="flex items-center justify-between mb-4">
-                <div>
-                  <h3 className="text-xs font-display font-semibold text-zinc-200">Bootstrap Status</h3>
-                  <p className="text-2xs text-zinc-500 mt-0.5">Auto-connected services and demo data from Docker Compose</p>
+            <Card padding="md" className="mb-4 relative overflow-hidden">
+              {/* Dot-grid background texture */}
+              <div className="absolute inset-0 opacity-[0.025]" style={{
+                backgroundImage: 'radial-gradient(circle, #fbbf24 1px, transparent 1px)',
+                backgroundSize: '24px 24px',
+              }} />
+
+              <div className="relative">
+                {/* ── Header bar ────────────────────────────── */}
+                <div className="flex items-center justify-between mb-5 pb-4 border-b border-white/[0.04]">
+                  <div className="flex items-center gap-3">
+                    {/* Animated status beacon */}
+                    <div className="relative flex items-center justify-center w-8 h-8">
+                      <div className={cn(
+                        'absolute w-8 h-8 rounded-full border transition-colors duration-700',
+                        bootstrap && allOnline ? 'border-emerald-400/20' : 'border-zinc-700/30'
+                      )} />
+                      <div className={cn(
+                        'absolute w-5 h-5 rounded-full border transition-colors duration-700',
+                        bootstrap && allOnline ? 'border-emerald-400/15' : 'border-zinc-700/20'
+                      )} />
+                      <div className={cn(
+                        'w-2.5 h-2.5 rounded-full transition-all duration-700',
+                        bootstrap && allOnline
+                          ? 'bg-emerald-400 shadow-[0_0_10px_rgba(52,211,153,0.5)]'
+                          : bootstrap
+                            ? 'bg-amber-400 shadow-[0_0_10px_rgba(251,191,36,0.4)]'
+                            : 'bg-zinc-600'
+                      )} />
+                      {bootstrap && allOnline && (
+                        <div className="absolute w-2.5 h-2.5 rounded-full bg-emerald-400 animate-ping opacity-60" />
+                      )}
+                    </div>
+                    <div>
+                      <h3 className="text-[11px] font-mono font-bold text-zinc-100 uppercase tracking-[0.15em]">
+                        Systems Monitor
+                      </h3>
+                      {bootstrap ? (
+                        <p className="text-[10px] font-mono mt-0.5">
+                          <span className={cn(allOnline ? 'text-emerald-400' : 'text-amber-400')}>
+                            {connectedCount}/4 ONLINE
+                          </span>
+                          <span className="mx-1.5 text-zinc-700">|</span>
+                          <span className="text-zinc-500">{bootstrap.registered_tables.length} TABLES REGISTERED</span>
+                        </p>
+                      ) : (
+                        <p className="text-[10px] font-mono mt-0.5 text-zinc-600">Scanning services...</p>
+                      )}
+                    </div>
+                  </div>
+                  <Button
+                    size="sm"
+                    variant="secondary"
+                    onClick={handleBootstrap}
+                    disabled={bootstrapping}
+                    className="text-2xs font-mono"
+                  >
+                    {bootstrapping ? <Loader2 className="w-3 h-3 animate-spin mr-1.5" /> : <RefreshCw className="w-3 h-3 mr-1.5" />}
+                    {bootstrapping ? 'Running...' : 'Re-bootstrap'}
+                  </Button>
                 </div>
-                <Button
-                  size="sm"
-                  variant="secondary"
-                  onClick={handleBootstrap}
-                  disabled={bootstrapping}
-                  className="text-2xs"
-                >
-                  {bootstrapping ? <Loader2 className="w-3 h-3 animate-spin mr-1" /> : <RefreshCw className="w-3 h-3 mr-1" />}
-                  {bootstrapping ? 'Bootstrapping...' : 'Re-bootstrap'}
-                </Button>
+
+                {bootstrap ? (
+                  <div className="space-y-4">
+                    {/* ── Service ring indicators ──────────── */}
+                    <div className="grid grid-cols-4 gap-3">
+                      {([
+                        { key: 'postgres', label: 'POSTGRES', svc: bootstrap.postgres, icon: Database, stroke: '#60a5fa', iconCls: 'text-blue-400', glowCls: 'hover:shadow-blue-400/10' },
+                        { key: 'mysql', label: 'MYSQL', svc: bootstrap.mysql, icon: Database, stroke: '#22d3ee', iconCls: 'text-cyan-400', glowCls: 'hover:shadow-cyan-400/10' },
+                        { key: 'mongodb', label: 'MONGODB', svc: bootstrap.mongodb, icon: Boxes, stroke: '#34d399', iconCls: 'text-emerald-400', glowCls: 'hover:shadow-emerald-400/10' },
+                        { key: 'minio', label: 'MINIO S3', svc: bootstrap.minio, icon: HardDrive, stroke: '#facc15', iconCls: 'text-yellow-400', glowCls: 'hover:shadow-yellow-400/10' },
+                      ] as const).map((item, i) => (
+                        <div
+                          key={item.key}
+                          className={cn(
+                            'relative p-4 rounded-xl border text-center transition-all duration-300',
+                            item.svc.available
+                              ? cn('bg-white/[0.015] border-white/[0.06] hover:border-white/[0.14] hover:bg-white/[0.03] hover:shadow-lg', item.glowCls)
+                              : 'bg-zinc-900/20 border-zinc-800/30'
+                          )}
+                        >
+                          {/* SVG ring indicator */}
+                          <div className="relative w-14 h-14 mx-auto mb-3">
+                            <svg className="w-14 h-14 -rotate-90" viewBox="0 0 56 56">
+                              <circle cx="28" cy="28" r="23" fill="none" stroke="rgba(255,255,255,0.04)" strokeWidth="2" />
+                              <circle
+                                cx="28" cy="28" r="23"
+                                fill="none"
+                                stroke={item.svc.available ? item.stroke : 'rgba(113,113,122,0.12)'}
+                                strokeWidth={item.svc.available ? '2.5' : '1.5'}
+                                strokeLinecap="round"
+                                strokeDasharray={RING_CIRCUMFERENCE}
+                                strokeDashoffset={item.svc.available ? 0 : RING_CIRCUMFERENCE}
+                                style={{
+                                  transition: `stroke-dashoffset 1.4s cubic-bezier(0.4,0,0.2,1) ${i * 0.15}s, stroke 0.5s`,
+                                }}
+                              />
+                            </svg>
+                            <div className="absolute inset-0 flex items-center justify-center">
+                              <item.icon className={cn('w-5 h-5 transition-colors duration-500', item.svc.available ? item.iconCls : 'text-zinc-700')} />
+                            </div>
+                          </div>
+
+                          {/* Service name */}
+                          <p className={cn(
+                            'font-mono text-[10px] font-bold tracking-[0.12em] transition-colors',
+                            item.svc.available ? 'text-zinc-200' : 'text-zinc-600'
+                          )}>
+                            {item.label}
+                          </p>
+
+                          {/* Table count / status */}
+                          <p className={cn(
+                            'font-mono text-[10px] mt-1 transition-colors',
+                            item.svc.available ? 'text-zinc-500' : 'text-zinc-700'
+                          )}>
+                            {item.svc.available
+                              ? (item.svc.tables.length > 0
+                                ? `${item.svc.tables.length} ${item.key === 'mongodb' ? 'collections' : 'tables'}`
+                                : item.key === 'minio' ? 'Configured' : 'Connected')
+                              : 'Offline'}
+                          </p>
+                        </div>
+                      ))}
+                    </div>
+
+                    {/* ── Telemetry counters ────────────────── */}
+                    <div className="grid grid-cols-4 gap-2">
+                      {([
+                        { label: 'TABLES', value: bootstrap.registered_tables.length, icon: Table2 },
+                        { label: 'JOBS', value: bootstrap.demo_jobs, icon: Clock },
+                        { label: 'PIPELINES', value: bootstrap.demo_pipelines, icon: Activity },
+                        { label: 'TRANSFORMS', value: bootstrap.demo_transforms, icon: GitBranch },
+                      ]).map(m => (
+                        <div key={m.label} className="p-2.5 rounded-lg bg-white/[0.015] border border-white/[0.03] text-center hover:bg-white/[0.03] transition-colors group/stat">
+                          <m.icon className="w-3 h-3 mx-auto mb-1.5 text-zinc-600 group-hover/stat:text-zinc-500 transition-colors" />
+                          <p className="text-base font-mono font-black text-zinc-100 tabular-nums leading-none">{m.value}</p>
+                          <p className="text-[9px] font-mono text-zinc-600 uppercase tracking-[0.15em] mt-1.5">{m.label}</p>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                ) : (
+                  /* Loading state — animated scanning ring */
+                  <div className="flex flex-col items-center justify-center py-10">
+                    <div className="relative w-14 h-14 mb-4">
+                      <svg className="w-14 h-14 -rotate-90" viewBox="0 0 56 56">
+                        <circle cx="28" cy="28" r="23" fill="none" stroke="rgba(255,255,255,0.04)" strokeWidth="2" />
+                        <circle
+                          cx="28" cy="28" r="23"
+                          fill="none"
+                          stroke="rgba(251,191,36,0.35)"
+                          strokeWidth="2.5"
+                          strokeLinecap="round"
+                          strokeDasharray={RING_CIRCUMFERENCE}
+                          strokeDashoffset={RING_CIRCUMFERENCE * 0.7}
+                          style={{ animation: 'spin 2.5s linear infinite', transformOrigin: 'center' }}
+                        />
+                      </svg>
+                      <div className="absolute inset-0 flex items-center justify-center">
+                        <Server className="w-5 h-5 text-zinc-600" />
+                      </div>
+                    </div>
+                    <p className="text-[10px] font-mono text-zinc-500 uppercase tracking-[0.15em]">Scanning services...</p>
+                  </div>
+                )}
               </div>
-
-              {bootstrap ? (
-                <div className="space-y-3">
-                  {/* Service status row */}
-                  <div className="grid grid-cols-2 gap-3">
-                    <div className="p-3 rounded-lg bg-white/[0.02] border border-white/[0.04]">
-                      <div className="flex items-center gap-2 mb-1">
-                        <div className={cn('w-2 h-2 rounded-full', bootstrap.postgres.available ? 'bg-emerald-400' : 'bg-zinc-600')} />
-                        <span className="text-xs font-semibold text-zinc-200">Postgres</span>
-                        <Badge className={cn('text-[10px]', bootstrap.postgres.available ? 'bg-emerald-400/10 text-emerald-400 border-emerald-400/20' : 'bg-zinc-800 text-zinc-500 border-zinc-700')}>
-                          {bootstrap.postgres.available ? 'Connected' : 'Offline'}
-                        </Badge>
-                      </div>
-                      {bootstrap.postgres.available && (
-                        <p className="text-2xs text-zinc-500">{bootstrap.postgres.tables.length} tables discovered</p>
-                      )}
-                      {bootstrap.postgres.error && (
-                        <p className="text-2xs text-zinc-600">{bootstrap.postgres.error}</p>
-                      )}
-                    </div>
-                    <div className="p-3 rounded-lg bg-white/[0.02] border border-white/[0.04]">
-                      <div className="flex items-center gap-2 mb-1">
-                        <div className={cn('w-2 h-2 rounded-full', bootstrap.minio.available ? 'bg-emerald-400' : 'bg-zinc-600')} />
-                        <span className="text-xs font-semibold text-zinc-200">MinIO S3</span>
-                        <Badge className={cn('text-[10px]', bootstrap.minio.available ? 'bg-emerald-400/10 text-emerald-400 border-emerald-400/20' : 'bg-zinc-800 text-zinc-500 border-zinc-700')}>
-                          {bootstrap.minio.available ? 'Configured' : 'Offline'}
-                        </Badge>
-                      </div>
-                      {bootstrap.minio.error && (
-                        <p className="text-2xs text-zinc-600">{bootstrap.minio.error}</p>
-                      )}
-                    </div>
-                  </div>
-
-                  {/* Demo data counts */}
-                  <div className="grid grid-cols-4 gap-3">
-                    {[
-                      { label: 'Tables', value: bootstrap.registered_tables.length, icon: Table2 },
-                      { label: 'Jobs', value: bootstrap.demo_jobs, icon: Clock },
-                      { label: 'Pipelines', value: bootstrap.demo_pipelines, icon: Activity },
-                      { label: 'Transforms', value: bootstrap.demo_transforms, icon: GitBranch },
-                    ].map(item => (
-                      <div key={item.label} className="p-2.5 rounded-lg bg-white/[0.02] border border-white/[0.04] text-center">
-                        <item.icon className="w-3.5 h-3.5 text-zinc-500 mx-auto mb-1" />
-                        <p className="text-sm font-mono font-bold text-zinc-200">{item.value}</p>
-                        <p className="text-2xs text-zinc-500">{item.label}</p>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              ) : (
-                <div className="flex items-center justify-center py-6">
-                  <Loader2 className="w-4 h-4 animate-spin text-zinc-500" />
-                  <span className="text-2xs text-zinc-500 ml-2">Loading status...</span>
-                </div>
-              )}
             </Card>
 
-            {/* Validation Checklist */}
+            {/* ── Validation Quick-Launch ──────────────────── */}
             <div className="grid grid-cols-3 gap-3">
-              {[
-                { title: 'SQL Engine', desc: 'Run a cross-table query', icon: Terminal, path: '/sql', color: 'text-amber-400' },
-                { title: 'Streaming', desc: 'View live events pipeline', icon: Radio, path: '/streaming', color: 'text-cyan-400' },
-                { title: 'Scheduler', desc: 'Run a demo job', icon: Clock, path: '/scheduler', color: 'text-blue-400' },
-                { title: 'Transforms', desc: 'Compile a model', icon: GitBranch, path: '/transforms', color: 'text-emerald-400' },
-                { title: 'Vector Search', desc: 'Search products by text', icon: Search, path: '/vector', color: 'text-rose-400' },
-                { title: 'Data Catalog', desc: 'Browse table metadata', icon: Database, path: '/catalog', color: 'text-violet-400' },
-              ].map(item => (
+              {([
+                { title: 'SQL Engine', desc: 'Run a cross-table query', icon: Terminal, path: '/sql', color: 'text-amber-400', borderHover: 'hover:border-amber-400/20' },
+                { title: 'Streaming', desc: 'View live events pipeline', icon: Radio, path: '/streaming', color: 'text-cyan-400', borderHover: 'hover:border-cyan-400/20' },
+                { title: 'Scheduler', desc: 'Run a demo job', icon: Clock, path: '/scheduler', color: 'text-blue-400', borderHover: 'hover:border-blue-400/20' },
+                { title: 'Transforms', desc: 'Compile a model', icon: GitBranch, path: '/transforms', color: 'text-emerald-400', borderHover: 'hover:border-emerald-400/20' },
+                { title: 'Vector Search', desc: 'Search products by text', icon: Search, path: '/vector', color: 'text-rose-400', borderHover: 'hover:border-rose-400/20' },
+                { title: 'Data Catalog', desc: 'Browse table metadata', icon: Database, path: '/catalog', color: 'text-violet-400', borderHover: 'hover:border-violet-400/20' },
+              ]).map(item => (
                 <Card
                   key={item.title}
                   padding="sm"
                   hover
                   onClick={() => navigate(item.path)}
-                  className="cursor-pointer group"
+                  className={cn('cursor-pointer group transition-all duration-300', item.borderHover)}
                 >
                   <div className="flex items-center gap-2 mb-1.5">
                     <item.icon className={cn('w-4 h-4', item.color)} />

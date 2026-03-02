@@ -487,6 +487,8 @@ export interface ServiceStatus {
 
 export interface BootstrapStatus {
   postgres: ServiceStatus
+  mysql: ServiceStatus
+  mongodb: ServiceStatus
   minio: ServiceStatus
   demo_jobs: number
   demo_pipelines: number

@@ -26,7 +26,9 @@ export function formatNumber(n: number): string {
 }
 
 export function formatRelativeTime(iso: string): string {
-  const diff = Date.now() - new Date(iso).getTime()
+  const time = new Date(iso).getTime()
+  if (isNaN(time)) return '-'
+  const diff = Date.now() - time
   const seconds = Math.floor(diff / 1000)
   if (seconds < 60) return 'just now'
   const minutes = Math.floor(seconds / 60)
@@ -44,6 +46,8 @@ export function truncate(str: string, len: number): string {
 export function inferFormat(tableName: string): { format: string; variant: string } {
   if (!tableName) return { format: 'Unknown', variant: 'unknown' }
   if (tableName.startsWith('pg_')) return { format: 'PostgreSQL', variant: 'external' }
+  if (tableName.startsWith('mysql_')) return { format: 'MySQL', variant: 'external' }
+  if (tableName.startsWith('mongo_')) return { format: 'MongoDB', variant: 'external' }
   if (tableName.startsWith('uploads_')) return { format: 'Upload', variant: 'file' }
   if (tableName.includes('parquet')) return { format: 'Parquet', variant: 'file' }
   if (tableName.includes('csv')) return { format: 'CSV', variant: 'file' }
@@ -70,5 +74,7 @@ export const FORMAT_COLORS: Record<string, string> = {
   JSON: 'bg-lime-500/15 text-lime-400 border-lime-500/20',
   Lance: 'bg-pink-500/15 text-pink-400 border-pink-500/20',
   PostgreSQL: 'bg-blue-500/15 text-blue-400 border-blue-500/20',
+  MySQL: 'bg-cyan-500/15 text-cyan-400 border-cyan-500/20',
+  MongoDB: 'bg-emerald-500/15 text-emerald-400 border-emerald-500/20',
   Upload: 'bg-orange-500/15 text-orange-400 border-orange-500/20',
 }

@@ -56,6 +56,12 @@ tower-http = { version = "0.6", features = ["cors", "trace"] }
 tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-serde_json-1"] }
 rust_decimal = { version = "1", features = ["db-tokio-postgres"] }
 
+# MySQL
+mysql_async = { version = "0.34", default-features = false, features = ["default-rustls"] }
+
+# MongoDB
+mongodb = "2.8"
+
 # Error handling
 thiserror = "2"
 anyhow = "1"

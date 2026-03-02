@@ -11,13 +11,13 @@ import { Tabs } from '../components/ui/Tabs'
 import { Modal } from '../components/ui/Modal'
 import { Input } from '../components/ui/Input'
 import { cn, formatDuration, QUERY_TYPE_COLORS, FORMAT_COLORS, inferFormat } from '../lib/utils'
-import { executeSql, explainSql, estimateQuery, getTables, getTableSchema, getConnections } from '../api/client'
-import type { ChartType, ColumnSchema, ConnectionEntry, ExplainResponse, QueryEstimateResponse } from '../types'
+import { executeSql, explainSql, estimateQuery, getTables, getTableSchema, getConnections, getS3Configs } from '../api/client'
+import type { ChartType, ColumnSchema, ConnectionEntry, S3Config, ExplainResponse, QueryEstimateResponse } from '../types'
 import { Tooltip } from '../components/ui/Tooltip'
 import {
   Play, Plus, X, Table2, BarChart3, LineChart, ScatterChart, PieChart,
   AreaChart, Save, BookOpen, Zap, Clock, Rows3, Terminal, FileSearch, Gauge,
-  ChevronDown, ChevronRight, GitBranch, Radio, Workflow, Database, Plug, Search, Columns3, MousePointerClick,
+  ChevronDown, ChevronRight, GitBranch, Radio, Workflow, Database, Plug, Search, Columns3, MousePointerClick, HardDrive, Trash2,
 } from 'lucide-react'
 
 const chartOptions: Array<{ type: ChartType; icon: React.ReactNode; label: string }> = [
@@ -52,9 +52,30 @@ export function SqlEditorPage() {
   const [expandedConn, setExpandedConn] = useState<Set<string>>(new Set())
   const [expandedTable, setExpandedTable] = useState<string | null>(null)
   const [tableSchemas, setTableSchemas] = useState<Record<string, ColumnSchema[]>>({})
+  const [s3Configs, setS3Configs] = useState<S3Config[]>([])
   const [catalogFilter, setCatalogFilter] = useState('')
+  const [renamingTabId, setRenamingTabId] = useState<string | null>(null)
+  const [renameValue, setRenameValue] = useState('')
+  const [editorHeight, setEditorHeight] = useState(45) // percentage
+  const resizing = useRef(false)
+  const containerRef = useRef<HTMLDivElement>(null)
   const workflowRef = useRef<HTMLDivElement>(null)
   const demoRef = useRef<HTMLDivElement>(null)
+
+  // Panel resizer
+  const startResize = useCallback((e: React.MouseEvent) => {
+    e.preventDefault()
+    resizing.current = true
+    const onMove = (ev: MouseEvent) => {
+      if (!resizing.current || !containerRef.current) return
+      const rect = containerRef.current.getBoundingClientRect()
+      const pct = ((ev.clientY - rect.top) / rect.height) * 100
+      setEditorHeight(Math.max(15, Math.min(85, pct)))
+    }
+    const onUp = () => { resizing.current = false; document.removeEventListener('mousemove', onMove); document.removeEventListener('mouseup', onUp) }
+    document.addEventListener('mousemove', onMove)
+    document.addEventListener('mouseup', onUp)
+  }, [])
 
   // Close dropdowns on outside click
   useEffect(() => {
@@ -74,8 +95,12 @@ export function SqlEditorPage() {
     navigate(`/${target}`, { state: { sql, name } })
   }
 
-  // Clear estimate when switching tabs
-  useEffect(() => { setEstimate(null) }, [store.activeTabId])
+  // Clear transient state when switching tabs
+  useEffect(() => {
+    setEstimate(null)
+    setExplainResult(null)
+    setView('table')
+  }, [store.activeTabId])
 
   useEffect(() => {
     getTables().then(async (r) => {
@@ -96,6 +121,7 @@ export function SqlEditorPage() {
       setConnections(conns)
       if (conns.length === 1) setExpandedConn(new Set([conns[0].id]))
     }).catch(() => {})
+    getS3Configs().then(r => setS3Configs(r.configs || [])).catch(() => {})
   }, [])
 
   const runQuery = useCallback(async () => {
@@ -156,12 +182,27 @@ export function SqlEditorPage() {
     })
   }
 
+  // Build mapping: connection raw table name → registered table name (e.g. "customers" → "pg_customers")
+  const resolveRegistered = useCallback((connTableName: string, connType?: string) => {
+    // Direct match first
+    if (tables.includes(connTableName)) return connTableName
+    // Try common prefixes based on connection type
+    const prefixes = connType === 'mysql' ? ['mysql_'] : connType === 'mongodb' ? ['mongo_'] : ['pg_', 'mysql_', 'mongo_']
+    for (const prefix of prefixes) {
+      const prefixed = `${prefix}${connTableName}`
+      if (tables.includes(prefixed)) return prefixed
+    }
+    return null
+  }, [tables])
+
   const handleExpandTable = async (tableName: string) => {
     if (expandedTable === tableName) { setExpandedTable(null); return }
     setExpandedTable(tableName)
+    // Try registered name for schema lookup
+    const registered = resolveRegistered(tableName) || tableName
     if (!tableSchemas[tableName]) {
       try {
-        const schema = await getTableSchema(tableName)
+        const schema = await getTableSchema(registered)
         setTableSchemas(prev => ({ ...prev, [tableName]: schema.columns }))
       } catch { /* skip */ }
     }
@@ -172,9 +213,13 @@ export function SqlEditorPage() {
     store.updateTabSql(store.activeTabId, current ? `${current}\n${text}` : text)
   }
 
-  // Compute tables belonging to connections vs standalone
-  const connTableSet = new Set(connections.flatMap(c => c.tables || []))
-  const otherTables = tables.filter(t => !connTableSet.has(t))
+  // Build set of registered table names that belong to a connection (for dedup)
+  const connRegisteredSet = new Set(
+    connections.flatMap(c => (c.tables || []).map(t => resolveRegistered(t, c.conn_type)).filter(Boolean) as string[])
+  )
+  // Also include the raw connection table names for matching
+  const connRawSet = new Set(connections.flatMap(c => c.tables || []))
+  const otherTables = tables.filter(t => !connRegisteredSet.has(t) && !connRawSet.has(t))
   const filteredOther = catalogFilter
     ? otherTables.filter(t => t.toLowerCase().includes(catalogFilter.toLowerCase()))
     : otherTables
@@ -182,7 +227,7 @@ export function SqlEditorPage() {
   return (
     <div className="flex flex-col h-full">
       {/* Toolbar */}
-      <div className="flex items-center gap-2 px-4 py-2 border-b border-white/[0.03] bg-navy-950/50 backdrop-blur-md">
+      <div className="flex items-center gap-2 px-4 py-2 border-b border-white/[0.03] bg-navy-950/50 backdrop-blur-md relative z-20">
         {/* Tabs */}
         <div className="flex items-center gap-1 flex-1 min-w-0 overflow-x-auto">
           {store.tabs.map(tab => (
@@ -196,10 +241,19 @@ export function SqlEditorPage() {
                   : 'text-zinc-500 hover:text-zinc-300 hover:bg-white/[0.03] border border-transparent'
               )}
             >
-              <span onDoubleClick={() => {
-                const name = prompt('Tab name:', tab.name)
-                if (name) store.renameTab(tab.id, name)
-              }}>{tab.name}</span>
+              {renamingTabId === tab.id ? (
+                <input
+                  autoFocus
+                  value={renameValue}
+                  onChange={e => setRenameValue(e.target.value)}
+                  onBlur={() => { if (renameValue.trim()) store.renameTab(tab.id, renameValue.trim()); setRenamingTabId(null) }}
+                  onKeyDown={e => { if (e.key === 'Enter') { if (renameValue.trim()) store.renameTab(tab.id, renameValue.trim()); setRenamingTabId(null) } else if (e.key === 'Escape') setRenamingTabId(null) }}
+                  className="bg-transparent border-b border-amber-400/50 text-xs text-zinc-100 outline-none w-20"
+                  onClick={e => e.stopPropagation()}
+                />
+              ) : (
+                <span onDoubleClick={(e) => { e.stopPropagation(); setRenamingTabId(tab.id); setRenameValue(tab.name) }}>{tab.name}</span>
+              )}
               {store.tabs.length > 1 && (
                 <X
                   className="w-3 h-3 opacity-0 group-hover:opacity-100 hover:text-red-400 transition-all"
@@ -231,8 +285,9 @@ export function SqlEditorPage() {
               {demoOpen && (
                 <div className="absolute right-0 top-full mt-1 w-72 rounded-lg border border-white/[0.06] bg-navy-950/95 backdrop-blur-xl shadow-2xl z-50 py-1 animate-fade-in">
                   {[
-                    { label: 'Customer Orders', sql: 'SELECT c.name, COUNT(*) as orders\nFROM pg_customers c\nJOIN pg_orders o ON c.id = o.customer_id\nGROUP BY c.name\nORDER BY orders DESC' },
-                    { label: 'Sales Summary', sql: 'SELECT p.name, SUM(s.amount) as revenue\nFROM pg_products p\nJOIN pg_sales s ON p.id = s.product_id\nGROUP BY p.name\nORDER BY revenue DESC' },
+                    { label: 'Customer Orders', sql: 'SELECT c.name, COUNT(*) as order_count\nFROM pg_customers c\nJOIN pg_orders o ON c.customer_id = o.customer_id\nGROUP BY c.name\nORDER BY order_count DESC' },
+                    { label: 'Sales by Product', sql: 'SELECT p.name, p.category, SUM(s.amount) as revenue\nFROM pg_products p\nJOIN pg_sales s ON p.product_id = s.product_id\nGROUP BY p.name, p.category\nORDER BY revenue DESC' },
+                    { label: 'Cross-Source Join', sql: 'SELECT pg.name as pg_name, my.c_name as mysql_name\nFROM pg_tpch_customer pg\nJOIN mysql_tpch_customer my ON pg.c_custkey = my.c_custkey\nLIMIT 20' },
                     { label: 'All Tables', sql: 'SHOW TABLES' },
                   ].map(q => (
                     <button
@@ -301,16 +356,16 @@ export function SqlEditorPage() {
             <span className="text-amber-400">Estimate</span>
           </Button>
           <Button variant="primary" size="sm" icon={<Play className="w-3.5 h-3.5" />} onClick={runQuery} loading={loading}>
-            Run <kbd className="ml-1 text-2xs opacity-60">⌘↵</kbd>
+            Run
           </Button>
         </div>
       </div>
 
       {/* Editor + Saved Queries sidebar */}
       <div className="flex flex-1 min-h-0">
-        <div className="flex flex-col flex-1 min-w-0">
+        <div ref={containerRef} className="flex flex-col flex-1 min-w-0">
           {/* Monaco Editor */}
-          <div className="h-[45%] min-h-[200px] border-b border-white/[0.03]">
+          <div style={{ height: `${editorHeight}%` }} className="min-h-[120px]">
             <SqlEditorComponent
               value={activeTab.sql}
               onChange={(v) => { store.updateTabSql(store.activeTabId, v); setEstimate(null) }}
@@ -318,6 +373,14 @@ export function SqlEditorPage() {
               tables={tables}
               columns={colMap}
             />
+          </div>
+
+          {/* Resize handle */}
+          <div
+            onMouseDown={startResize}
+            className="h-1.5 cursor-row-resize border-y border-white/[0.03] bg-navy-950/60 hover:bg-amber-400/10 transition-colors flex items-center justify-center group"
+          >
+            <div className="w-8 h-0.5 rounded-full bg-zinc-700 group-hover:bg-amber-400/40 transition-colors" />
           </div>
 
           {/* Cost Estimation Bar */}
@@ -385,9 +448,11 @@ export function SqlEditorPage() {
                     )}
                   </div>
                   <div className="flex items-center gap-3">
-                    <Badge className={QUERY_TYPE_COLORS[result.query_type] || 'bg-surface-4 text-zinc-400 border-zinc-700/50'}>
-                      {result.query_type}
-                    </Badge>
+                    <Tooltip content="Detected query type (auto-classified)" position="bottom">
+                      <span className={cn('inline-flex items-center px-2 py-0.5 rounded-md text-2xs font-medium border', QUERY_TYPE_COLORS[result.query_type] || 'bg-surface-4 text-zinc-400 border-zinc-700/50')}>
+                        {result.query_type}
+                      </span>
+                    </Tooltip>
                     <Tooltip content={`Rows returned: ${result.row_count.toLocaleString()} | Query type: ${result.query_type}`} position="bottom">
                       <span className="flex items-center gap-1 text-2xs font-mono text-zinc-500">
                         <Rows3 className="w-3 h-3" /> {result.row_count}
@@ -411,29 +476,37 @@ export function SqlEditorPage() {
                   {view === 'table' ? (
                     <DataTable columns={result.columns} rows={result.rows} maxHeight="100%" />
                   ) : view === 'explain' && explainResult ? (
-                    <div className="p-4 space-y-4">
+                    <div className="p-4 space-y-5">
                       <div>
-                        <h3 className="text-xs font-semibold text-zinc-300 mb-2">Query Plan Tree</h3>
-                        <div className="space-y-0.5">
+                        <h3 className="text-xs font-semibold text-zinc-300 mb-3 flex items-center gap-2">
+                          <FileSearch className="w-3.5 h-3.5 text-amber-400" />
+                          Query Plan Tree
+                        </h3>
+                        <div className="bg-navy-950/60 rounded-lg border border-white/[0.04] p-3 space-y-0.5">
                           {explainResult.nodes.map(node => (
-                            <div key={node.id} className="flex items-center gap-2" style={{ paddingLeft: `${node.depth * 24}px` }}>
-                              <div className={cn('w-2 h-2 rounded-full flex-shrink-0', node.depth === 0 ? 'bg-amber-400' : 'bg-cyan-400/60')} />
-                              <span className="text-xs font-mono text-amber-400/80">{node.operator}</span>
-                              <span className="text-2xs font-mono text-zinc-500 truncate">{node.detail !== node.operator ? node.detail : ''}</span>
+                            <div key={node.id} className="flex items-center gap-2" style={{ paddingLeft: `${node.depth * 20}px` }}>
+                              <div className={cn(
+                                'w-1.5 h-1.5 rounded-full flex-shrink-0',
+                                node.depth === 0 ? 'bg-amber-400' : node.depth === 1 ? 'bg-cyan-400' : 'bg-zinc-500'
+                              )} />
+                              <span className="text-xs font-mono text-amber-400/90 font-semibold">{node.operator}</span>
+                              {node.detail !== node.operator && (
+                                <span className="text-2xs font-mono text-zinc-500 truncate">{node.detail}</span>
+                              )}
                             </div>
                           ))}
                           {explainResult.nodes.length === 0 && (
-                            <p className="text-xs text-zinc-600">No plan nodes parsed</p>
+                            <p className="text-xs text-zinc-600 italic">No plan nodes parsed</p>
                           )}
                         </div>
                       </div>
                       <div>
                         <h3 className="text-xs font-semibold text-zinc-300 mb-2">Logical Plan</h3>
-                        <pre className="text-2xs font-mono text-zinc-400 bg-navy-950/60 rounded-lg p-3 overflow-x-auto border border-white/[0.04] whitespace-pre-wrap">{explainResult.logical_plan}</pre>
+                        <pre className="text-2xs font-mono text-zinc-400 bg-navy-950/60 rounded-lg p-3 overflow-x-auto border border-white/[0.04] whitespace-pre-wrap leading-relaxed">{explainResult.logical_plan}</pre>
                       </div>
                       <div>
                         <h3 className="text-xs font-semibold text-zinc-300 mb-2">Physical Plan</h3>
-                        <pre className="text-2xs font-mono text-zinc-400 bg-navy-950/60 rounded-lg p-3 overflow-x-auto border border-white/[0.04] whitespace-pre-wrap">{explainResult.physical_plan}</pre>
+                        <pre className="text-2xs font-mono text-zinc-400 bg-navy-950/60 rounded-lg p-3 overflow-x-auto border border-white/[0.04] whitespace-pre-wrap leading-relaxed">{explainResult.physical_plan}</pre>
                       </div>
                     </div>
                   ) : (
@@ -445,32 +518,49 @@ export function SqlEditorPage() {
               </>
             )}
 
-            {!result && !error && explainResult && (
-              <div className="flex-1 overflow-auto p-4 space-y-4">
+            {!result && !error && explainResult && !loading && (
+              <div className="flex-1 overflow-auto p-4 space-y-5">
                 <div>
-                  <h3 className="text-xs font-semibold text-zinc-300 mb-2">Query Plan Tree</h3>
-                  <div className="space-y-0.5">
+                  <h3 className="text-xs font-semibold text-zinc-300 mb-3 flex items-center gap-2">
+                    <FileSearch className="w-3.5 h-3.5 text-amber-400" />
+                    Query Plan Tree
+                  </h3>
+                  <div className="bg-navy-950/60 rounded-lg border border-white/[0.04] p-3 space-y-0.5">
                     {explainResult.nodes.map(node => (
-                      <div key={node.id} className="flex items-center gap-2" style={{ paddingLeft: `${node.depth * 24}px` }}>
-                        <div className={cn('w-2 h-2 rounded-full flex-shrink-0', node.depth === 0 ? 'bg-amber-400' : 'bg-cyan-400/60')} />
-                        <span className="text-xs font-mono text-amber-400/80">{node.operator}</span>
-                        <span className="text-2xs font-mono text-zinc-500 truncate">{node.detail !== node.operator ? node.detail : ''}</span>
+                      <div key={node.id} className="flex items-center gap-2" style={{ paddingLeft: `${node.depth * 20}px` }}>
+                        <div className={cn(
+                          'w-1.5 h-1.5 rounded-full flex-shrink-0',
+                          node.depth === 0 ? 'bg-amber-400' : node.depth === 1 ? 'bg-cyan-400' : 'bg-zinc-500'
+                        )} />
+                        <span className="text-xs font-mono text-amber-400/90 font-semibold">{node.operator}</span>
+                        {node.detail !== node.operator && (
+                          <span className="text-2xs font-mono text-zinc-500 truncate">{node.detail}</span>
+                        )}
                       </div>
                     ))}
                   </div>
                 </div>
                 <div>
                   <h3 className="text-xs font-semibold text-zinc-300 mb-2">Logical Plan</h3>
-                  <pre className="text-2xs font-mono text-zinc-400 bg-navy-950/60 rounded-lg p-3 overflow-x-auto border border-white/[0.04] whitespace-pre-wrap">{explainResult.logical_plan}</pre>
+                  <pre className="text-2xs font-mono text-zinc-400 bg-navy-950/60 rounded-lg p-3 overflow-x-auto border border-white/[0.04] whitespace-pre-wrap leading-relaxed">{explainResult.logical_plan}</pre>
                 </div>
                 <div>
                   <h3 className="text-xs font-semibold text-zinc-300 mb-2">Physical Plan</h3>
-                  <pre className="text-2xs font-mono text-zinc-400 bg-navy-950/60 rounded-lg p-3 overflow-x-auto border border-white/[0.04] whitespace-pre-wrap">{explainResult.physical_plan}</pre>
+                  <pre className="text-2xs font-mono text-zinc-400 bg-navy-950/60 rounded-lg p-3 overflow-x-auto border border-white/[0.04] whitespace-pre-wrap leading-relaxed">{explainResult.physical_plan}</pre>
                 </div>
               </div>
             )}
 
-            {!result && !error && !explainResult && (
+            {loading && (
+              <div className="flex-1 flex items-center justify-center">
+                <div className="text-center">
+                  <div className="w-6 h-6 border-2 border-amber-400/30 border-t-amber-400 rounded-full animate-spin mx-auto mb-3" />
+                  <p className="text-xs text-zinc-500">Executing query...</p>
+                </div>
+              </div>
+            )}
+
+            {!result && !error && !explainResult && !loading && (
               <div className="flex-1 flex items-center justify-center">
                 <div className="text-center">
                   <Terminal className="w-8 h-8 text-zinc-700 mx-auto mb-3" />
@@ -562,6 +652,7 @@ export function SqlEditorPage() {
                           <p className="px-4 py-1.5 text-2xs text-zinc-600 italic">No tables</p>
                         )}
                         {connTables.map(tbl => {
+                          const registered = resolveRegistered(tbl, conn.conn_type) || tbl
                           const isTableExpanded = expandedTable === tbl
                           const cols = tableSchemas[tbl]
                           return (
@@ -576,11 +667,11 @@ export function SqlEditorPage() {
                                     : <ChevronRight className="w-2.5 h-2.5 text-zinc-600 flex-shrink-0" />
                                   }
                                   <Table2 className="w-3 h-3 text-zinc-500 flex-shrink-0" />
-                                  <span className="text-2xs font-mono text-zinc-400 truncate">{tbl}</span>
+                                  <span className="text-2xs font-mono text-zinc-400 truncate">{registered}</span>
                                 </button>
-                                <Tooltip content="Insert SELECT query" position="left">
+                                <Tooltip content={`SELECT * FROM ${registered} LIMIT 100`} position="left">
                                   <button
-                                    onClick={() => insertAtCursor(`SELECT * FROM ${tbl} LIMIT 100;`)}
+                                    onClick={() => insertAtCursor(`SELECT * FROM ${registered} LIMIT 100;`)}
                                     className="p-1 mr-2 rounded opacity-0 group-hover:opacity-100 hover:bg-white/[0.04] transition-all"
                                   >
                                     <MousePointerClick className="w-3 h-3 text-amber-400/70" />
@@ -592,9 +683,9 @@ export function SqlEditorPage() {
                                   {cols.map(col => (
                                     <button
                                       key={col.name}
-                                      onClick={() => insertAtCursor(`${tbl}.${col.name}`)}
+                                      onClick={() => insertAtCursor(`${registered}.${col.name}`)}
                                       className="w-full flex items-center gap-1.5 px-3 py-1 hover:bg-white/[0.02] transition-colors cursor-pointer"
-                                      title={`Insert ${tbl}.${col.name}`}
+                                      title={`Insert ${registered}.${col.name}`}
                                     >
                                       <Columns3 className="w-2.5 h-2.5 text-zinc-600 flex-shrink-0" />
                                       <span className="text-2xs font-mono text-zinc-500 truncate">{col.name}</span>
@@ -615,10 +706,42 @@ export function SqlEditorPage() {
                 )
               })}
 
+              {/* S3/MinIO connections */}
+              {s3Configs.map(s3 => {
+                const s3Id = `s3-${s3.name}`
+                const isExpanded = expandedConn.has(s3Id)
+                if (catalogFilter && !s3.name.toLowerCase().includes(catalogFilter.toLowerCase()) && !s3.bucket.toLowerCase().includes(catalogFilter.toLowerCase())) return null
+                return (
+                  <div key={s3Id}>
+                    <button
+                      onClick={() => toggleConn(s3Id)}
+                      className="w-full flex items-center gap-2 px-3 py-2 hover:bg-white/[0.02] transition-colors group"
+                    >
+                      {isExpanded
+                        ? <ChevronDown className="w-3 h-3 text-zinc-500 flex-shrink-0" />
+                        : <ChevronRight className="w-3 h-3 text-zinc-500 flex-shrink-0" />
+                      }
+                      <HardDrive className="w-3 h-3 text-emerald-400 flex-shrink-0" />
+                      <span className="text-xs font-semibold text-zinc-300 truncate">{s3.name}</span>
+                      <Badge className="ml-auto text-2xs bg-emerald-500/15 text-emerald-400 border-emerald-500/20">
+                        {s3.status}
+                      </Badge>
+                    </button>
+                    {isExpanded && (
+                      <div className="border-l-2 border-l-emerald-400/20 ml-4 px-4 py-2 space-y-1">
+                        <p className="text-2xs text-zinc-500"><span className="text-zinc-600">Bucket:</span> {s3.bucket}</p>
+                        <p className="text-2xs text-zinc-500"><span className="text-zinc-600">Endpoint:</span> {s3.endpoint}</p>
+                        <p className="text-2xs text-zinc-500"><span className="text-zinc-600">Region:</span> {s3.region}</p>
+                      </div>
+                    )}
+                  </div>
+                )
+              })}
+
               {/* Other tables (not in any connection) */}
               {filteredOther.length > 0 && (
                 <div>
-                  {connections.length > 0 && (
+                  {(connections.length > 0 || s3Configs.length > 0) && (
                     <div className="px-3 py-2 border-t border-white/[0.03]">
                       <p className="text-2xs font-semibold text-zinc-500 uppercase tracking-wider">
                         Other Tables ({filteredOther.length})
@@ -681,7 +804,7 @@ export function SqlEditorPage() {
               )}
 
               {/* Empty state */}
-              {tables.length === 0 && connections.length === 0 && (
+              {tables.length === 0 && connections.length === 0 && s3Configs.length === 0 && (
                 <div className="flex flex-col items-center justify-center py-8 px-4">
                   <Database className="w-6 h-6 text-zinc-700 mb-2" />
                   <p className="text-2xs text-zinc-600 text-center">No tables registered yet</p>
@@ -702,14 +825,25 @@ export function SqlEditorPage() {
                 </div>
               ) : (
                 store.savedQueries.map(q => (
-                  <button
+                  <div
                     key={q.id}
-                    onClick={() => store.updateTabSql(store.activeTabId, q.sql)}
-                    className="w-full text-left px-3 py-2 border-b border-zinc-800/20 hover:bg-surface-3/40 transition-colors group"
+                    className="flex items-center border-b border-zinc-800/20 hover:bg-surface-3/40 transition-colors group"
                   >
-                    <p className="text-xs text-zinc-300 truncate">{q.name}</p>
-                    <p className="text-2xs text-zinc-600 font-mono truncate mt-0.5">{q.sql}</p>
-                  </button>
+                    <button
+                      onClick={() => store.updateTabSql(store.activeTabId, q.sql)}
+                      className="flex-1 text-left px-3 py-2 min-w-0"
+                    >
+                      <p className="text-xs text-zinc-300 truncate">{q.name}</p>
+                      <p className="text-2xs text-zinc-600 font-mono truncate mt-0.5">{q.sql}</p>
+                    </button>
+                    <button
+                      onClick={(e) => { e.stopPropagation(); store.deleteSavedQuery(q.id) }}
+                      className="px-2 py-2 opacity-0 group-hover:opacity-100 transition-opacity text-zinc-600 hover:text-rose-400"
+                      title="Delete saved query"
+                    >
+                      <Trash2 className="w-3 h-3" />
+                    </button>
+                  </div>
                 ))
               )}
             </div>

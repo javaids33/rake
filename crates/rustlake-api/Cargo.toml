@@ -30,3 +30,6 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 tokio-postgres = { workspace = true }
 rust_decimal = { workspace = true }
+mysql_async = { workspace = true }
+mongodb = { workspace = true }
+futures = { workspace = true }

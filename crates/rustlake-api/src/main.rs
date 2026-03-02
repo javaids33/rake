@@ -16,6 +16,8 @@ use rustlake_flight::worker::WorkerNode;
 use rustlake_vector::embedding::SimpleEmbeddingGenerator;
 use rustlake_vector::search::VectorIndex;
 
+mod mongodb_conn;
+mod mysql_conn;
 mod postgres;
 mod routes;
 mod state;
@@ -169,7 +171,153 @@ async fn bootstrap_demo_connections(state: Arc<AppState>) {
         }
     }
 
-    // ── 2. Seed MinIO S3 config (via env vars) ────────────────────
+    // ── 2. Try connecting to MySQL ──────────────────────────────────
+    let mysql_host = std::env::var("RUSTLAKE_MYSQL_HOST").unwrap_or_else(|_| "localhost".to_string());
+    let mysql_port: u16 = std::env::var("RUSTLAKE_MYSQL_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3307);
+    let mysql_db = std::env::var("RUSTLAKE_MYSQL_DB").unwrap_or_else(|_| "rustlake_demo".to_string());
+    let mysql_user = std::env::var("RUSTLAKE_MYSQL_USER").unwrap_or_else(|_| "rustlake".to_string());
+    let mysql_pass = std::env::var("RUSTLAKE_MYSQL_PASSWORD").unwrap_or_else(|_| "rustlake".to_string());
+
+    let mysql_params = mysql_conn::MysqlConnParams {
+        host: mysql_host.clone(),
+        port: mysql_port,
+        database: mysql_db.clone(),
+        username: mysql_user.clone(),
+        password: mysql_pass.clone(),
+    };
+
+    match mysql_conn::connect_and_discover(&mysql_params).await {
+        Ok(tables) => {
+            let entry = ConnectionEntry {
+                id: "bootstrap-mysql".to_string(),
+                name: "Docker MySQL".to_string(),
+                conn_type: "mysql".to_string(),
+                host: mysql_host.clone(),
+                port: mysql_port,
+                database: mysql_db.clone(),
+                username: mysql_user.clone(),
+                status: "connected".to_string(),
+                tables: tables.clone(),
+                created_at: chrono::Utc::now(),
+                source: "bootstrap".to_string(),
+            };
+
+            if state.seed_connection(entry, mysql_pass.clone()).await {
+                tracing::info!(
+                    source = "bootstrap",
+                    conn_type = "mysql",
+                    tables = tables.len(),
+                    "Data source added: Docker MySQL ({} tables discovered)",
+                    tables.len()
+                );
+            }
+
+            // Register each table into DataFusion
+            for table_name in &tables {
+                match mysql_conn::fetch_table_as_arrow(&mysql_params, table_name).await {
+                    Ok(batch) => {
+                        let row_count = batch.num_rows();
+                        let schema = batch.schema();
+                        match datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]) {
+                            Ok(mem_table) => {
+                                let df_name = format!("mysql_{}", table_name);
+                                let ctx = state.ctx.read().await;
+                                match ctx.datafusion_ctx().register_table(&df_name, std::sync::Arc::new(mem_table)) {
+                                    Ok(_) => {
+                                        tracing::info!(table = %df_name, rows = row_count, "Bootstrap: registered MySQL table");
+                                    }
+                                    Err(e) => tracing::warn!(table = %df_name, error = %e, "Bootstrap: failed to register MySQL table"),
+                                }
+                            }
+                            Err(e) => tracing::warn!(table = %table_name, error = %e, "Bootstrap: failed to create MySQL MemTable"),
+                        }
+                    }
+                    Err(e) => tracing::warn!(table = %table_name, error = %e, "Bootstrap: failed to fetch MySQL table"),
+                }
+            }
+        }
+        Err(e) => {
+            tracing::info!(error = %e, "Bootstrap: MySQL not available (start with docker compose up -d)");
+        }
+    }
+
+    // ── 3. Try connecting to MongoDB ─────────────────────────────────
+    let mongo_host = std::env::var("RUSTLAKE_MONGO_HOST").unwrap_or_else(|_| "localhost".to_string());
+    let mongo_port: u16 = std::env::var("RUSTLAKE_MONGO_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(27018);
+    let mongo_db = std::env::var("RUSTLAKE_MONGO_DB").unwrap_or_else(|_| "rustlake_demo".to_string());
+    let mongo_user = std::env::var("RUSTLAKE_MONGO_USER").unwrap_or_else(|_| "rustlake".to_string());
+    let mongo_pass = std::env::var("RUSTLAKE_MONGO_PASSWORD").unwrap_or_else(|_| "rustlake".to_string());
+
+    let mongo_params = mongodb_conn::MongoConnParams {
+        host: mongo_host.clone(),
+        port: mongo_port,
+        database: mongo_db.clone(),
+        username: mongo_user.clone(),
+        password: mongo_pass.clone(),
+    };
+
+    match mongodb_conn::connect_and_discover(&mongo_params).await {
+        Ok(collections) => {
+            let entry = ConnectionEntry {
+                id: "bootstrap-mongodb".to_string(),
+                name: "Docker MongoDB".to_string(),
+                conn_type: "mongodb".to_string(),
+                host: mongo_host.clone(),
+                port: mongo_port,
+                database: mongo_db.clone(),
+                username: mongo_user.clone(),
+                status: "connected".to_string(),
+                tables: collections.clone(),
+                created_at: chrono::Utc::now(),
+                source: "bootstrap".to_string(),
+            };
+
+            if state.seed_connection(entry, mongo_pass.clone()).await {
+                tracing::info!(
+                    source = "bootstrap",
+                    conn_type = "mongodb",
+                    collections = collections.len(),
+                    "Data source added: Docker MongoDB ({} collections discovered)",
+                    collections.len()
+                );
+            }
+
+            // Register each collection into DataFusion
+            for coll_name in &collections {
+                match mongodb_conn::fetch_collection_as_arrow(&mongo_params, coll_name).await {
+                    Ok(batch) => {
+                        let row_count = batch.num_rows();
+                        let schema = batch.schema();
+                        match datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]) {
+                            Ok(mem_table) => {
+                                let df_name = format!("mongo_{}", coll_name);
+                                let ctx = state.ctx.read().await;
+                                match ctx.datafusion_ctx().register_table(&df_name, std::sync::Arc::new(mem_table)) {
+                                    Ok(_) => {
+                                        tracing::info!(table = %df_name, rows = row_count, "Bootstrap: registered MongoDB collection");
+                                    }
+                                    Err(e) => tracing::warn!(table = %df_name, error = %e, "Bootstrap: failed to register MongoDB collection"),
+                                }
+                            }
+                            Err(e) => tracing::warn!(collection = %coll_name, error = %e, "Bootstrap: failed to create MongoDB MemTable"),
+                        }
+                    }
+                    Err(e) => tracing::warn!(collection = %coll_name, error = %e, "Bootstrap: failed to fetch MongoDB collection"),
+                }
+            }
+        }
+        Err(e) => {
+            tracing::info!(error = %e, "Bootstrap: MongoDB not available (start with docker compose up -d)");
+        }
+    }
+
+    // ── 4. Seed MinIO S3 config (via env vars) ────────────────────
     let minio_endpoint = std::env::var("RUSTLAKE_MINIO_ENDPOINT").unwrap_or_else(|_| "http://localhost:9000".to_string());
     let minio_access = std::env::var("RUSTLAKE_MINIO_ACCESS_KEY").unwrap_or_else(|_| "rustlake".to_string());
     let minio_secret = std::env::var("RUSTLAKE_MINIO_SECRET_KEY").unwrap_or_else(|_| "rustlake123".to_string());
@@ -192,7 +340,7 @@ async fn bootstrap_demo_connections(state: Arc<AppState>) {
         }
     }
 
-    // ── 3. Seed demo scheduled jobs ──────────────────────────────
+    // ── 5. Seed demo scheduled jobs ──────────────────────────────
     let demo_jobs = vec![
         ScheduledJob {
             id: "demo-pg-snapshot".to_string(),
@@ -296,7 +444,7 @@ async fn bootstrap_demo_connections(state: Arc<AppState>) {
         tracing::info!(count = jobs_seeded, "Bootstrap: seeded demo scheduled jobs");
     }
 
-    // ── 4. Seed demo streaming pipeline ──────────────────────────
+    // ── 6. Seed demo streaming pipeline ──────────────────────────
     let demo_pipeline = StreamingPipeline {
         id: "demo-events-ingestion".to_string(),
         name: "Events Ingestion".to_string(),
@@ -316,7 +464,7 @@ async fn bootstrap_demo_connections(state: Arc<AppState>) {
         tracing::info!("Bootstrap: seeded demo streaming pipeline");
     }
 
-    // ── 5. Seed demo transforms ──────────────────────────────────
+    // ── 7. Seed demo transforms ──────────────────────────────────
     let demo_transforms = vec![
         UserTransform {
             name: "customer_orders".to_string(),

@@ -2769,6 +2769,8 @@ struct ServiceStatus {
 #[derive(Serialize)]
 struct BootstrapStatusResponse {
     postgres: ServiceStatus,
+    mysql: ServiceStatus,
+    mongodb: ServiceStatus,
     minio: ServiceStatus,
     demo_jobs: usize,
     demo_pipelines: usize,
@@ -2793,6 +2795,36 @@ async fn bootstrap_status(
             available: false,
             tables: vec![],
             error: Some("No Postgres connection".to_string()),
+        },
+    };
+
+    // Check MySQL connection
+    let mysql_conn = connections.iter().find(|c| c.conn_type == "mysql");
+    let mysql = match mysql_conn {
+        Some(conn) => ServiceStatus {
+            available: conn.status == "connected",
+            tables: conn.tables.clone(),
+            error: None,
+        },
+        None => ServiceStatus {
+            available: false,
+            tables: vec![],
+            error: Some("No MySQL connection".to_string()),
+        },
+    };
+
+    // Check MongoDB connection
+    let mongo_conn = connections.iter().find(|c| c.conn_type == "mongodb");
+    let mongodb = match mongo_conn {
+        Some(conn) => ServiceStatus {
+            available: conn.status == "connected",
+            tables: conn.tables.clone(),
+            error: None,
+        },
+        None => ServiceStatus {
+            available: false,
+            tables: vec![],
+            error: Some("No MongoDB connection".to_string()),
         },
     };
     drop(connections);
@@ -2842,6 +2874,8 @@ async fn bootstrap_status(
 
     Json(BootstrapStatusResponse {
         postgres,
+        mysql,
+        mongodb,
         minio,
         demo_jobs,
         demo_pipelines,
@@ -2953,6 +2987,134 @@ async fn run_bootstrap(
             results.insert("minio".to_string(), serde_json::json!({ "status": "configured" }));
         } else {
             results.insert("minio".to_string(), serde_json::json!({ "status": "already_configured" }));
+        }
+    }
+
+    // Try MySQL (config via env vars, fallback to Docker defaults)
+    let mysql_host = std::env::var("RUSTLAKE_MYSQL_HOST").unwrap_or_else(|_| "localhost".to_string());
+    let mysql_port: u16 = std::env::var("RUSTLAKE_MYSQL_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(3307);
+    let mysql_db = std::env::var("RUSTLAKE_MYSQL_DB").unwrap_or_else(|_| "rustlake_demo".to_string());
+    let mysql_user = std::env::var("RUSTLAKE_MYSQL_USER").unwrap_or_else(|_| "rustlake".to_string());
+    let mysql_pass = std::env::var("RUSTLAKE_MYSQL_PASSWORD").unwrap_or_else(|_| "rustlake".to_string());
+
+    let mysql_params = crate::mysql_conn::MysqlConnParams {
+        host: mysql_host.clone(),
+        port: mysql_port,
+        database: mysql_db.clone(),
+        username: mysql_user.clone(),
+        password: mysql_pass,
+    };
+
+    match crate::mysql_conn::connect_and_discover(&mysql_params).await {
+        Ok(tables) => {
+            let entry = ConnectionEntry {
+                id: "bootstrap-mysql".to_string(),
+                name: "Docker MySQL".to_string(),
+                conn_type: "mysql".to_string(),
+                host: mysql_host,
+                port: mysql_port,
+                database: mysql_db,
+                username: mysql_user,
+                status: "connected".to_string(),
+                tables: tables.clone(),
+                created_at: Utc::now(),
+                source: "bootstrap".to_string(),
+            };
+            state.seed_connection(entry, "rustlake".to_string()).await;
+
+            let mut mysql_tables_registered = Vec::new();
+            for table_name in &tables {
+                match crate::mysql_conn::fetch_table_as_arrow(&mysql_params, table_name).await {
+                    Ok(batch) => {
+                        let schema = batch.schema();
+                        if let Ok(mem_table) = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]) {
+                            let df_name = format!("mysql_{}", table_name);
+                            let ctx = state.ctx.read().await;
+                            if ctx.datafusion_ctx().register_table(&df_name, std::sync::Arc::new(mem_table)).is_ok() {
+                                mysql_tables_registered.push(df_name);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(table = table_name, error = %e, "Bootstrap: failed to fetch MySQL table");
+                    }
+                }
+            }
+            results.insert("mysql".to_string(), serde_json::json!({
+                "status": "connected",
+                "tables_discovered": tables.len(),
+                "tables_registered": mysql_tables_registered,
+            }));
+        }
+        Err(e) => {
+            results.insert("mysql".to_string(), serde_json::json!({
+                "status": "unavailable",
+                "error": e,
+            }));
+        }
+    }
+
+    // Try MongoDB (config via env vars, fallback to Docker defaults)
+    let mongo_host = std::env::var("RUSTLAKE_MONGO_HOST").unwrap_or_else(|_| "localhost".to_string());
+    let mongo_port: u16 = std::env::var("RUSTLAKE_MONGO_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(27018);
+    let mongo_db = std::env::var("RUSTLAKE_MONGO_DB").unwrap_or_else(|_| "rustlake_demo".to_string());
+    let mongo_user = std::env::var("RUSTLAKE_MONGO_USER").unwrap_or_else(|_| "rustlake".to_string());
+    let mongo_pass = std::env::var("RUSTLAKE_MONGO_PASSWORD").unwrap_or_else(|_| "rustlake".to_string());
+
+    let mongo_params = crate::mongodb_conn::MongoConnParams {
+        host: mongo_host.clone(),
+        port: mongo_port,
+        database: mongo_db.clone(),
+        username: mongo_user.clone(),
+        password: mongo_pass,
+    };
+
+    match crate::mongodb_conn::connect_and_discover(&mongo_params).await {
+        Ok(collections) => {
+            let entry = ConnectionEntry {
+                id: "bootstrap-mongodb".to_string(),
+                name: "Docker MongoDB".to_string(),
+                conn_type: "mongodb".to_string(),
+                host: mongo_host,
+                port: mongo_port,
+                database: mongo_db,
+                username: mongo_user,
+                status: "connected".to_string(),
+                tables: collections.clone(),
+                created_at: Utc::now(),
+                source: "bootstrap".to_string(),
+            };
+            state.seed_connection(entry, "rustlake".to_string()).await;
+
+            let mut mongo_tables_registered = Vec::new();
+            for coll_name in &collections {
+                match crate::mongodb_conn::fetch_collection_as_arrow(&mongo_params, coll_name).await {
+                    Ok(batch) => {
+                        let schema = batch.schema();
+                        if let Ok(mem_table) = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]) {
+                            let df_name = format!("mongo_{}", coll_name);
+                            let ctx = state.ctx.read().await;
+                            if ctx.datafusion_ctx().register_table(&df_name, std::sync::Arc::new(mem_table)).is_ok() {
+                                mongo_tables_registered.push(df_name);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!(collection = coll_name, error = %e, "Bootstrap: failed to fetch MongoDB collection");
+                    }
+                }
+            }
+            results.insert("mongodb".to_string(), serde_json::json!({
+                "status": "connected",
+                "collections_discovered": collections.len(),
+                "tables_registered": mongo_tables_registered,
+            }));
+        }
+        Err(e) => {
+            results.insert("mongodb".to_string(), serde_json::json!({
+                "status": "unavailable",
+                "error": e,
+            }));
         }
     }
 
@@ -4569,7 +4731,7 @@ async fn estimate_query(
 }
 
 fn extract_table_references(sql: &str) -> Vec<String> {
-    let upper = sql.to_uppercase();
+    let _upper = sql.to_uppercase();
     let mut tables = Vec::new();
     let words: Vec<&str> = sql.split_whitespace().collect();
 

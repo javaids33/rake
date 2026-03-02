@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useMemo } from 'react'
 import { useLocation } from 'react-router-dom'
 import { Card } from '../components/ui/Card'
 import { Button } from '../components/ui/Button'
@@ -8,6 +8,7 @@ import { Modal } from '../components/ui/Modal'
 import { Input, Textarea, Select } from '../components/ui/Input'
 import { DataTable } from '../components/ui/DataTable'
 import { EmptyState } from '../components/ui/EmptyState'
+import { StatusDot } from '../components/ui/StatusDot'
 import { DagGraph, type DagNode, type DagEdge } from '../components/ui/DagGraph'
 import { cn, formatDuration, formatRelativeTime } from '../lib/utils'
 import { getTransforms, createTransform, deleteTransform, runTransform, getLineage, getDbtProject, getDbtModels, uploadDbtProject, runDbtModel, runAllDbtModels } from '../api/client'
@@ -15,9 +16,28 @@ import type { UserTransform, TransformRunResponse, LineageNode, LineageEdge, Dbt
 import {
   GitBranch, Plus, Play, Trash2, Code2, Network,
   Table2, Eye, FileCode, Clock, ArrowRight, CheckCircle2,
-  Search, Layers, RefreshCw, XCircle, Upload, Package,
+  Search, Layers, RefreshCw, XCircle, Upload, Package, Copy, History,
 } from 'lucide-react'
 import toast from 'react-hot-toast'
+
+// Materialization color mapping
+const MAT_COLORS: Record<string, string> = {
+  table: 'bg-blue-400/10 text-blue-400 border-blue-400/20',
+  view: 'bg-emerald-400/10 text-emerald-400 border-emerald-400/20',
+  incremental: 'bg-amber-400/10 text-amber-400 border-amber-400/20',
+  ephemeral: 'bg-violet-400/10 text-violet-400 border-violet-400/20',
+}
+
+// Run history entry (tracked client-side per session)
+interface RunHistoryEntry {
+  name: string
+  status: 'success' | 'error'
+  duration_ms: number
+  row_count: number
+  compiled_sql: string
+  timestamp: string
+  error?: string
+}
 
 export function Transforms() {
   const location = useLocation()
@@ -30,6 +50,10 @@ export function Transforms() {
   const [lineageNodes, setLineageNodes] = useState<LineageNode[]>([])
   const [lineageEdges, setLineageEdges] = useState<LineageEdge[]>([])
   const [search, setSearch] = useState('')
+
+  // Run history (persisted per session)
+  const [runHistory, setRunHistory] = useState<RunHistoryEntry[]>([])
+
   // dbt state
   const [dbtModels, setDbtModels] = useState<DbtModel[]>([])
   const [dbtSources, setDbtSources] = useState<DbtSource[]>([])
@@ -63,17 +87,42 @@ export function Transforms() {
     try {
       const res = await runTransform(name)
       setRunResult(res)
+      setRunHistory(prev => [{
+        name,
+        status: 'success',
+        duration_ms: res.duration_ms,
+        row_count: res.row_count,
+        compiled_sql: res.compiled_sql,
+        timestamp: new Date().toISOString(),
+      }, ...prev])
       toast.success(`Transform completed in ${formatDuration(res.duration_ms)}`)
-    } catch (e) { toast.error((e as Error).message) }
+      setTab('result')
+    } catch (e) {
+      const msg = (e as Error).message
+      setRunHistory(prev => [{
+        name,
+        status: 'error',
+        duration_ms: 0,
+        row_count: 0,
+        compiled_sql: '',
+        timestamp: new Date().toISOString(),
+        error: msg,
+      }, ...prev])
+      toast.error(msg)
+    }
     setRunning(false)
   }
 
   const handleCreate = async () => {
+    if (!form.name.trim()) { toast.error('Model name is required'); return }
+    if (!form.sql.trim()) { toast.error('SQL is required'); return }
+    if (!/^[a-z][a-z0-9_]*$/.test(form.name.trim())) { toast.error('Name must be snake_case (lowercase letters, numbers, underscores)'); return }
+    if (transforms.some(t => t.name === form.name.trim())) { toast.error(`Model "${form.name}" already exists`); return }
     try {
       await createTransform({
-        name: form.name,
+        name: form.name.trim(),
         sql: form.sql,
-        depends_on: form.depends_on ? form.depends_on.split(',').map(s => s.trim()) : [],
+        depends_on: form.depends_on ? form.depends_on.split(',').map(s => s.trim()).filter(Boolean) : [],
         materialization: form.materialization,
         description: form.description,
       })
@@ -86,6 +135,33 @@ export function Transforms() {
 
   const selectedTransform = transforms.find(t => t.name === selected)
   const filteredTransforms = transforms.filter(t => t.name.toLowerCase().includes(search.toLowerCase()))
+
+  // Last run status per transform (from run history)
+  const lastRunStatus = useMemo(() => {
+    const map: Record<string, RunHistoryEntry> = {}
+    for (const r of runHistory) {
+      if (!map[r.name]) map[r.name] = r
+    }
+    return map
+  }, [runHistory])
+
+  // Run history for selected transform
+  const selectedHistory = useMemo(() =>
+    runHistory.filter(r => r.name === selected),
+    [runHistory, selected]
+  )
+
+  // Navigate to a dependency — select it if it's a transform
+  const navigateToDep = (depName: string) => {
+    const found = transforms.find(t => t.name === depName)
+    if (found) {
+      setSelected(found.name)
+      setRunResult(null)
+      setTab('models')
+    } else {
+      toast.error(`"${depName}" is not a transform model`)
+    }
+  }
 
   return (
     <div className="flex h-full animate-fade-in">
@@ -115,32 +191,40 @@ export function Transforms() {
           </div>
         </div>
         <div className="flex-1 overflow-y-auto">
-          {filteredTransforms.map(t => (
-            <button
-              key={t.name}
-              onClick={() => { setSelected(t.name); setRunResult(null); setTab('models') }}
-              className={cn(
-                'w-full text-left px-3 py-2.5 border-b border-white/[0.02] transition-all',
-                selected === t.name
-                  ? 'bg-violet-400/[0.06] border-l-2 border-l-violet-400'
-                  : 'hover:bg-white/[0.03] border-l-2 border-l-transparent'
-              )}
-            >
-              <div className="flex items-center gap-2">
-                <FileCode className="w-3.5 h-3.5 text-zinc-600" />
-                <span className="text-xs font-mono text-zinc-300">{t.name}</span>
-              </div>
-              <div className="flex items-center gap-1.5 mt-1">
-                <Badge className={t.materialization === 'table'
-                  ? 'bg-blue-400/10 text-blue-400 border-blue-400/20'
-                  : 'bg-emerald-400/10 text-emerald-400 border-emerald-400/20'
-                }>
-                  {t.materialization}
-                </Badge>
-                {t.depends_on.length > 0 && <Badge className="bg-white/[0.04] text-zinc-500 border-white/[0.06]">{t.depends_on.length} deps</Badge>}
-              </div>
-            </button>
-          ))}
+          {filteredTransforms.map(t => {
+            const lastRun = lastRunStatus[t.name]
+            return (
+              <button
+                key={t.name}
+                onClick={() => { setSelected(t.name); setRunResult(null); setTab('models') }}
+                className={cn(
+                  'w-full text-left px-3 py-2.5 border-b border-white/[0.02] transition-all',
+                  selected === t.name
+                    ? 'bg-violet-400/[0.06] border-l-2 border-l-violet-400'
+                    : 'hover:bg-white/[0.03] border-l-2 border-l-transparent'
+                )}
+              >
+                <div className="flex items-center gap-2">
+                  <FileCode className="w-3.5 h-3.5 text-zinc-600 flex-shrink-0" />
+                  <span className="text-xs font-mono text-zinc-300 flex-1 truncate">{t.name}</span>
+                  {lastRun && (
+                    lastRun.status === 'success'
+                      ? <CheckCircle2 className="w-3 h-3 text-emerald-400 flex-shrink-0" />
+                      : <XCircle className="w-3 h-3 text-rose-400 flex-shrink-0" />
+                  )}
+                </div>
+                <div className="flex items-center gap-1.5 mt-1">
+                  <Badge className={MAT_COLORS[t.materialization] || MAT_COLORS.view}>
+                    {t.materialization}
+                  </Badge>
+                  {t.depends_on.length > 0 && <Badge className="bg-white/[0.04] text-zinc-500 border-white/[0.06]">{t.depends_on.length} deps</Badge>}
+                  {lastRun && (
+                    <span className="text-2xs text-zinc-600 ml-auto">{formatDuration(lastRun.duration_ms)}</span>
+                  )}
+                </div>
+              </button>
+            )
+          })}
           {filteredTransforms.length === 0 && (
             <EmptyState icon={<Code2 className="w-5 h-5" />} title="No transforms" description="Create dbt-compatible SQL transforms" />
           )}
@@ -152,17 +236,20 @@ export function Transforms() {
         {selectedTransform ? (
           <>
             <div className="flex items-center justify-between px-5 py-3 border-b border-white/[0.04] bg-navy-950/40">
-              <div>
+              <div className="min-w-0">
                 <div className="flex items-center gap-2">
                   <h3 className="text-sm font-display font-semibold text-zinc-100">{selectedTransform.name}</h3>
-                  <Badge className={selectedTransform.materialization === 'table'
-                    ? 'bg-blue-400/10 text-blue-400 border-blue-400/20'
-                    : 'bg-emerald-400/10 text-emerald-400 border-emerald-400/20'
-                  }>{selectedTransform.materialization}</Badge>
+                  <Badge className={MAT_COLORS[selectedTransform.materialization] || MAT_COLORS.view}>{selectedTransform.materialization}</Badge>
+                  {lastRunStatus[selectedTransform.name] && (
+                    <StatusDot
+                      status={lastRunStatus[selectedTransform.name].status === 'success' ? 'healthy' : 'error'}
+                      label={lastRunStatus[selectedTransform.name].status === 'success' ? 'passed' : 'failed'}
+                    />
+                  )}
                 </div>
                 <p className="text-2xs text-zinc-500 mt-0.5">{selectedTransform.description || 'No description'}</p>
               </div>
-              <div className="flex items-center gap-2">
+              <div className="flex items-center gap-2 flex-shrink-0">
                 <Button variant="danger" size="sm" icon={<Trash2 className="w-3.5 h-3.5" />}
                   onClick={async () => {
                     await deleteTransform(selectedTransform.name)
@@ -180,6 +267,7 @@ export function Transforms() {
                 { id: 'models', label: 'SQL', icon: <Code2 className="w-3 h-3" /> },
                 { id: 'lineage', label: 'Lineage', icon: <Network className="w-3 h-3" /> },
                 { id: 'result', label: 'Result', icon: <Table2 className="w-3 h-3" /> },
+                { id: 'history', label: 'History', icon: <History className="w-3 h-3" />, count: selectedHistory.length || undefined },
                 { id: 'dbt', label: 'dbt', icon: <Package className="w-3 h-3" />, count: dbtModels.length || undefined },
               ]}
               active={tab}
@@ -188,25 +276,53 @@ export function Transforms() {
             />
 
             <div className="flex-1 overflow-auto p-5">
+              {/* ─── SQL Tab ─── */}
               {tab === 'models' && (
                 <div className="space-y-4">
                   <div className="rounded-xl border border-white/[0.04] overflow-hidden">
-                    <div className="px-4 py-2 border-b border-white/[0.04] flex items-center gap-2 bg-white/[0.02]">
-                      <Code2 className="w-3.5 h-3.5 text-zinc-500" />
-                      <span className="text-2xs font-display font-semibold text-zinc-500 uppercase tracking-wider">Source SQL</span>
+                    <div className="px-4 py-2 border-b border-white/[0.04] flex items-center justify-between bg-white/[0.02]">
+                      <div className="flex items-center gap-2">
+                        <Code2 className="w-3.5 h-3.5 text-zinc-500" />
+                        <span className="text-2xs font-display font-semibold text-zinc-500 uppercase tracking-wider">Source SQL</span>
+                      </div>
+                      <button
+                        onClick={() => { navigator.clipboard.writeText(selectedTransform.sql); toast.success('SQL copied') }}
+                        className="p-1 rounded text-zinc-600 hover:text-zinc-300 transition-colors"
+                        title="Copy SQL"
+                      >
+                        <Copy className="w-3.5 h-3.5" />
+                      </button>
                     </div>
-                    <pre className="p-4 text-xs font-mono text-zinc-300 overflow-x-auto leading-relaxed bg-navy-950/40">{selectedTransform.sql}</pre>
+                    <pre className="p-4 text-xs font-mono text-zinc-300 overflow-x-auto leading-relaxed bg-navy-950/40 whitespace-pre-wrap">{selectedTransform.sql}</pre>
                   </div>
+
                   <div className="grid grid-cols-3 gap-3">
                     <Card padding="sm">
                       <p className="text-2xs text-zinc-500">Materialization</p>
-                      <p className="text-sm font-semibold text-zinc-200 mt-0.5">{selectedTransform.materialization}</p>
+                      <p className="text-sm font-semibold text-zinc-200 mt-0.5 capitalize">{selectedTransform.materialization}</p>
                     </Card>
                     <Card padding="sm">
                       <p className="text-2xs text-zinc-500">Dependencies</p>
                       <div className="flex flex-wrap gap-1 mt-0.5">
                         {selectedTransform.depends_on.length > 0
-                          ? selectedTransform.depends_on.map(d => <Badge key={d} className="bg-white/[0.04] text-zinc-400 border-white/[0.06]">{d}</Badge>)
+                          ? selectedTransform.depends_on.map(d => {
+                              const isTransform = transforms.some(t => t.name === d)
+                              return (
+                                <button
+                                  key={d}
+                                  onClick={() => navigateToDep(d)}
+                                  className={cn(
+                                    'inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md text-2xs font-mono border transition-colors',
+                                    isTransform
+                                      ? 'bg-violet-400/[0.06] text-violet-400 border-violet-400/20 hover:bg-violet-400/10 cursor-pointer'
+                                      : 'bg-white/[0.04] text-zinc-400 border-white/[0.06] hover:bg-white/[0.06] cursor-pointer'
+                                  )}
+                                >
+                                  {isTransform && <ArrowRight className="w-2.5 h-2.5" />}
+                                  {d}
+                                </button>
+                              )
+                            })
                           : <span className="text-sm text-zinc-500">None</span>
                         }
                       </div>
@@ -214,47 +330,65 @@ export function Transforms() {
                     <Card padding="sm">
                       <p className="text-2xs text-zinc-500">Created</p>
                       <p className="text-sm font-semibold text-zinc-200 mt-0.5">{formatRelativeTime(selectedTransform.created_at)}</p>
+                      {selectedTransform.created_at && selectedTransform.created_at !== '-' && (
+                        <p className="text-2xs text-zinc-600 mt-0.5 font-mono">
+                          {new Date(selectedTransform.created_at).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })}
+                        </p>
+                      )}
                     </Card>
                   </div>
                 </div>
               )}
 
+              {/* ─── Lineage Tab ─── */}
               {tab === 'lineage' && (
                 <Card>
                   <h3 className="text-sm font-display font-semibold text-zinc-200 mb-4 flex items-center gap-2">
                     <Network className="w-4 h-4 text-violet-400" /> Lineage Graph
                   </h3>
                   {(() => {
-                    // Build DAG from transforms
                     const dagNodes: DagNode[] = []
                     const dagEdges: DagEdge[] = []
                     const added = new Set<string>()
 
-                    // Add the selected transform as the primary node
                     if (selectedTransform) {
+                      const selfStatus = lastRunStatus[selectedTransform.name]
                       dagNodes.push({
                         id: selectedTransform.name,
                         label: selectedTransform.name,
                         type: 'transform',
-                        status: 'healthy',
+                        status: selfStatus ? (selfStatus.status === 'success' ? 'healthy' : 'error') : 'healthy',
                         meta: selectedTransform.materialization
                       })
                       added.add(selectedTransform.name)
 
-                      // Add dependencies as source nodes
                       for (const dep of selectedTransform.depends_on || []) {
                         if (!added.has(dep)) {
-                          dagNodes.push({ id: dep, label: dep, type: 'source', meta: 'source table' })
+                          const depTransform = transforms.find(t => t.name === dep)
+                          const depStatus = lastRunStatus[dep]
+                          dagNodes.push({
+                            id: dep,
+                            label: dep,
+                            type: depTransform ? 'transform' : 'source',
+                            status: depStatus ? (depStatus.status === 'success' ? 'healthy' : 'error') : undefined,
+                            meta: depTransform ? depTransform.materialization : 'source table'
+                          })
                           added.add(dep)
                         }
                         dagEdges.push({ source: dep, target: selectedTransform.name })
                       }
 
-                      // Find transforms that depend on this one (downstream)
                       for (const t of transforms) {
                         if (t.name !== selectedTransform.name && t.depends_on?.includes(selectedTransform.name)) {
                           if (!added.has(t.name)) {
-                            dagNodes.push({ id: t.name, label: t.name, type: 'target', status: 'healthy', meta: t.materialization })
+                            const tStatus = lastRunStatus[t.name]
+                            dagNodes.push({
+                              id: t.name,
+                              label: t.name,
+                              type: 'target',
+                              status: tStatus ? (tStatus.status === 'success' ? 'healthy' : 'error') : 'healthy',
+                              meta: t.materialization
+                            })
                             added.add(t.name)
                           }
                           dagEdges.push({ source: selectedTransform.name, target: t.name })
@@ -265,10 +399,10 @@ export function Transforms() {
                     return dagNodes.length > 1 ? (
                       <DagGraph nodes={dagNodes} edges={dagEdges} onNodeClick={(id) => {
                         const found = transforms.find(t => t.name === id)
-                        if (found) setSelected(found.name)
+                        if (found) { setSelected(found.name); setRunResult(null) }
                       }} height={300} />
                     ) : (
-                      <div style={{ textAlign: 'center', padding: 40, color: '#64748b', fontSize: 13 }}>
+                      <div className="text-center py-10 text-zinc-600 text-xs">
                         {selectedTransform?.depends_on?.length ? 'Loading lineage...' : 'No dependencies — this transform has no upstream sources'}
                       </div>
                     )
@@ -276,6 +410,7 @@ export function Transforms() {
                 </Card>
               )}
 
+              {/* ─── Result Tab ─── */}
               {tab === 'result' && (
                 runResult ? (
                   <div className="space-y-3">
@@ -293,6 +428,50 @@ export function Transforms() {
                 ) : (
                   <EmptyState icon={<Eye className="w-5 h-5" />} title="No results" description="Run the transform to see output" />
                 )
+              )}
+
+              {/* ─── History Tab ─── */}
+              {tab === 'history' && (
+                <div className="space-y-3">
+                  {selectedHistory.length === 0 ? (
+                    <EmptyState icon={<History className="w-5 h-5" />} title="No run history" description="Run this transform to see execution history" />
+                  ) : (
+                    <Card padding="none">
+                      <div className="px-4 py-2.5 border-b border-white/[0.04] bg-white/[0.02] flex items-center justify-between">
+                        <span className="text-2xs font-display font-semibold text-zinc-500 uppercase tracking-wider">Run History</span>
+                        <span className="text-2xs text-zinc-600">{selectedHistory.length} runs this session</span>
+                      </div>
+                      <div className="divide-y divide-white/[0.02]">
+                        {selectedHistory.map((r, i) => (
+                          <div key={i} className="px-4 py-3 flex items-center gap-4 hover:bg-white/[0.01] transition-colors">
+                            {r.status === 'success'
+                              ? <CheckCircle2 className="w-4 h-4 text-emerald-400 flex-shrink-0" />
+                              : <XCircle className="w-4 h-4 text-rose-400 flex-shrink-0" />
+                            }
+                            <div className="flex-1 min-w-0">
+                              <div className="flex items-center gap-2">
+                                <Badge className={r.status === 'success' ? 'bg-emerald-400/10 text-emerald-400 border-emerald-400/20' : 'bg-rose-400/10 text-rose-400 border-rose-400/20'}>
+                                  {r.status}
+                                </Badge>
+                                {r.status === 'success' && (
+                                  <span className="text-2xs text-zinc-500">{r.row_count} rows written</span>
+                                )}
+                              </div>
+                              {r.error && <p className="text-2xs text-rose-400 font-mono mt-1 truncate">{r.error}</p>}
+                              {r.compiled_sql && <p className="text-2xs text-zinc-600 font-mono mt-1 truncate">{r.compiled_sql}</p>}
+                            </div>
+                            <div className="text-right flex-shrink-0">
+                              <Badge className="bg-white/[0.04] text-zinc-400 border-white/[0.06]">
+                                <Clock className="w-3 h-3" /> {formatDuration(r.duration_ms)}
+                              </Badge>
+                              <p className="text-2xs text-zinc-600 mt-1">{new Date(r.timestamp).toLocaleTimeString()}</p>
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </Card>
+                  )}
+                </div>
               )}
             </div>
           </>
@@ -418,12 +597,18 @@ export function Transforms() {
       {/* Create modal */}
       <Modal open={createOpen} onClose={() => setCreateOpen(false)} title="Create Transform" width="max-w-xl">
         <div className="space-y-4">
-          <Input label="Name" value={form.name} onChange={e => setForm(f => ({ ...f, name: e.target.value }))} placeholder="my_transform" hint="Use snake_case naming convention" />
-          <Textarea label="SQL" value={form.sql} onChange={e => setForm(f => ({ ...f, sql: e.target.value }))} placeholder="SELECT * FROM {{ ref('source_table') }} WHERE ..." rows={6} />
+          <Input label="Name *" value={form.name} onChange={e => setForm(f => ({ ...f, name: e.target.value }))} placeholder="my_transform"
+            hint={transforms.some(t => t.name === form.name.trim()) ? '⚠ This name already exists' : 'Use snake_case naming convention'} />
+          <Textarea label="SQL *" value={form.sql} onChange={e => setForm(f => ({ ...f, sql: e.target.value }))} placeholder="SELECT * FROM {{ ref('source_table') }} WHERE ..." rows={6} />
           <Input label="Dependencies (comma-separated)" value={form.depends_on} onChange={e => setForm(f => ({ ...f, depends_on: e.target.value }))} placeholder="table1, table2" hint="Tables this transform depends on (for DAG ordering)" />
           <div className="grid grid-cols-2 gap-3">
             <Select label="Materialization" value={form.materialization} onChange={e => setForm(f => ({ ...f, materialization: e.target.value }))}
-              options={[{ value: 'view', label: 'View' }, { value: 'table', label: 'Table' }]} />
+              options={[
+                { value: 'view', label: 'View — virtual, always fresh' },
+                { value: 'table', label: 'Table — persisted, fast reads' },
+                { value: 'incremental', label: 'Incremental — append/merge' },
+                { value: 'ephemeral', label: 'Ephemeral — CTE, no table' },
+              ]} />
             <Input label="Description" value={form.description} onChange={e => setForm(f => ({ ...f, description: e.target.value }))} placeholder="What does this do?" />
           </div>
           <div className="flex justify-end gap-2 pt-2">

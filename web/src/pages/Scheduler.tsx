@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useMemo, useRef } from 'react'
 import { useLocation } from 'react-router-dom'
 import { Card } from '../components/ui/Card'
 import { Button } from '../components/ui/Button'
@@ -19,8 +19,47 @@ import {
   Settings, Repeat, ArrowRight, Pause, RefreshCw,
   Database, HardDrive, Layers, Eye, Snowflake, Wrench,
   GitBranch, BarChart3, Shield, Copy, FileText, Network,
+  Search, MoreVertical, ChevronUp, ChevronDown, ChevronsUpDown,
+  ChevronLeft, ChevronRight,
 } from 'lucide-react'
 import toast from 'react-hot-toast'
+
+// ─────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────
+const PAGE_SIZE = 25
+
+function cronToHuman(cron: string): string {
+  const map: Record<string, string> = {
+    '* * * * *': 'Every minute',
+    '*/5 * * * *': 'Every 5 min',
+    '*/15 * * * *': 'Every 15 min',
+    '0 * * * *': 'Hourly',
+    '0 */6 * * *': 'Every 6h',
+    '0 0 * * *': 'Daily midnight',
+    '0 6 * * *': 'Daily 6 AM',
+    '0 1 * * *': 'Daily 1 AM',
+    '0 2 * * *': 'Daily 2 AM',
+    '0 3 * * *': 'Daily 3 AM',
+    '0 4 * * *': 'Daily 4 AM',
+    '0 5 * * *': 'Daily 5 AM',
+    '0 0 * * 1': 'Weekly Mon',
+    '0 4 * * 1': 'Weekly Mon 4 AM',
+    '0 0 * * 0': 'Weekly Sun',
+    '0 3 * * 0': 'Weekly Sun 3 AM',
+    '0 5 * * 0': 'Weekly Sun 5 AM',
+    '0 0 1 * *': 'Monthly 1st',
+    '0 0 1 */3 *': 'Quarterly',
+    '30 1 * * *': 'Daily 1:30 AM',
+    '*/30 * * * *': 'Every 30 min',
+  }
+  if (map[cron]) return map[cron]
+  // Fallback patterns
+  if (/^every \d+/.test(cron)) return cron.charAt(0).toUpperCase() + cron.slice(1)
+  return cron
+}
+
+type SortField = 'name' | 'type' | 'status' | 'last_run'
 
 // ─────────────────────────────────────────────────
 // Job types — ETL, materialized views, transforms
@@ -117,6 +156,27 @@ export function Scheduler() {
   const [dagNodes, setDagNodes] = useState<DagNode[]>([])
   const [dagEdges, setDagEdges] = useState<DagEdge[]>([])
 
+  // Search, filter, sort, pagination state
+  const [searchQuery, setSearchQuery] = useState('')
+  const [statusFilter, setStatusFilter] = useState<'all' | 'active' | 'paused'>('all')
+  const [typeFilter, setTypeFilter] = useState<string>('all')
+  const [sortBy, setSortBy] = useState<SortField>('name')
+  const [sortDir, setSortDir] = useState<'asc' | 'desc'>('asc')
+  const [page, setPage] = useState(1)
+  const [actionMenu, setActionMenu] = useState<string | null>(null)
+  const actionMenuRef = useRef<HTMLDivElement>(null)
+
+  // Close action menu on outside click
+  useEffect(() => {
+    const handleClick = (e: MouseEvent) => {
+      if (actionMenuRef.current && !actionMenuRef.current.contains(e.target as Node)) {
+        setActionMenu(null)
+      }
+    }
+    if (actionMenu) document.addEventListener('mousedown', handleClick)
+    return () => document.removeEventListener('mousedown', handleClick)
+  }, [actionMenu])
+
   // Auto-open create modal when navigated with SQL from SQL Editor
   useEffect(() => {
     const state = location.state as { sql?: string; name?: string; jobType?: string } | null
@@ -188,10 +248,84 @@ export function Scheduler() {
   const errorRuns = runs.filter(r => r.status === 'error').length
   const avgDuration = runs.length > 0 ? runs.reduce((s, r) => s + (r.duration_ms || 0), 0) / runs.length : 0
   const activeJob = jobs.find(j => j.id === selectedJob)
-  const jobRuns = runs.filter(r => activeJob && r.job_name === activeJob.name)
 
   const etlJobs = jobs.filter(j => j.job_type === 'etl_pipeline' || j.job_type === 'materialized_view')
   const maintenanceJobs = jobs.filter(j => j.job_type === 'compaction' || j.job_type === 'snapshot' || j.job_type === 'data_quality')
+
+  // Build per-job run lookup
+  const jobRunMap = useMemo(() => {
+    const m: Record<string, JobRun[]> = {}
+    for (const r of runs) {
+      if (!m[r.job_name]) m[r.job_name] = []
+      m[r.job_name].push(r)
+    }
+    return m
+  }, [runs])
+
+  // Filtered + sorted + paginated jobs
+  const filteredJobs = useMemo(() => {
+    let result = [...jobs]
+
+    // Search
+    if (searchQuery) {
+      const q = searchQuery.toLowerCase()
+      result = result.filter(j =>
+        j.name.toLowerCase().includes(q) ||
+        j.job_type.toLowerCase().includes(q) ||
+        j.tags.some(t => t.toLowerCase().includes(q)) ||
+        j.target.toLowerCase().includes(q)
+      )
+    }
+
+    // Status filter
+    if (statusFilter === 'active') result = result.filter(j => j.enabled)
+    if (statusFilter === 'paused') result = result.filter(j => !j.enabled)
+
+    // Type filter
+    if (typeFilter !== 'all') result = result.filter(j => j.job_type === typeFilter)
+
+    // Sort
+    result.sort((a, b) => {
+      let cmp = 0
+      switch (sortBy) {
+        case 'name': cmp = a.name.localeCompare(b.name); break
+        case 'type': cmp = a.job_type.localeCompare(b.job_type); break
+        case 'status': cmp = (a.enabled ? 0 : 1) - (b.enabled ? 0 : 1); break
+        case 'last_run': {
+          const aTime = a.last_run ? new Date(a.last_run).getTime() : 0
+          const bTime = b.last_run ? new Date(b.last_run).getTime() : 0
+          cmp = bTime - aTime // most recent first by default
+          break
+        }
+      }
+      return sortDir === 'asc' ? cmp : -cmp
+    })
+
+    return result
+  }, [jobs, searchQuery, statusFilter, typeFilter, sortBy, sortDir])
+
+  const totalPages = Math.max(1, Math.ceil(filteredJobs.length / PAGE_SIZE))
+  const pagedJobs = filteredJobs.slice((page - 1) * PAGE_SIZE, page * PAGE_SIZE)
+
+  // Reset page when filters change
+  useEffect(() => { setPage(1) }, [searchQuery, statusFilter, typeFilter])
+
+  // Unique job types present
+  const jobTypes = useMemo(() => [...new Set(jobs.map(j => j.job_type))], [jobs])
+
+  const handleSort = (field: SortField) => {
+    if (sortBy === field) {
+      setSortDir(d => d === 'asc' ? 'desc' : 'asc')
+    } else {
+      setSortBy(field)
+      setSortDir(field === 'last_run' ? 'desc' : 'asc')
+    }
+  }
+
+  const SortIcon = ({ field }: { field: SortField }) => {
+    if (sortBy !== field) return <ChevronsUpDown className="w-3 h-3 text-zinc-700" />
+    return sortDir === 'asc' ? <ChevronUp className="w-3 h-3 text-amber-400" /> : <ChevronDown className="w-3 h-3 text-amber-400" />
+  }
 
   return (
     <div className="flex h-full animate-fade-in">
@@ -245,7 +379,7 @@ export function Scheduler() {
         <div className="flex-1 overflow-auto p-6">
           {/* ─── All Jobs ─── */}
           {tab === 'jobs' && (
-            <div className="space-y-2">
+            <div className="space-y-3">
               {jobs.length === 0 ? (
                 <EmptyState
                   icon={<Calendar className="w-6 h-6" />}
@@ -253,112 +387,292 @@ export function Scheduler() {
                   description="Create ETL pipelines, materialized views, and table maintenance jobs"
                   action={<Button variant="primary" size="sm" icon={<Plus className="w-3.5 h-3.5" />} onClick={() => setCreateOpen(true)}>Create Job</Button>}
                 />
-              ) : jobs.map(job => {
-                const cfg = JOB_TYPE_CONFIG[job.job_type] || JOB_TYPE_CONFIG.sql_query
-                return (
-                  <button
-                    key={job.id}
-                    onClick={() => setSelectedJob(selectedJob === job.id ? null : job.id)}
-                    className={cn(
-                      'w-full text-left rounded-xl border transition-all p-4',
-                      selectedJob === job.id
-                        ? 'bg-white/[0.04] border-amber-400/20'
-                        : 'bg-white/[0.02] border-white/[0.04] hover:bg-white/[0.03] hover:border-white/[0.06]',
-                      !job.enabled && 'opacity-50'
+              ) : (
+                <>
+                  {/* Search + Filter bar */}
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <div className="relative flex-1 min-w-[200px]">
+                      <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-zinc-600" />
+                      <input
+                        type="text"
+                        value={searchQuery}
+                        onChange={e => setSearchQuery(e.target.value)}
+                        placeholder="Search jobs by name, type, or tag..."
+                        className="w-full pl-9 pr-3 py-2 text-xs bg-white/[0.03] border border-white/[0.06] rounded-lg text-zinc-300 placeholder-zinc-600 outline-none focus:border-amber-400/30 transition-colors"
+                      />
+                    </div>
+                    <select
+                      value={statusFilter}
+                      onChange={e => setStatusFilter(e.target.value as 'all' | 'active' | 'paused')}
+                      className="text-xs bg-white/[0.03] border border-white/[0.06] rounded-lg px-3 py-2 text-zinc-400 outline-none focus:border-amber-400/30 cursor-pointer"
+                    >
+                      <option value="all">All Status</option>
+                      <option value="active">Active ({jobs.filter(j => j.enabled).length})</option>
+                      <option value="paused">Paused ({jobs.filter(j => !j.enabled).length})</option>
+                    </select>
+                    <select
+                      value={typeFilter}
+                      onChange={e => setTypeFilter(e.target.value)}
+                      className="text-xs bg-white/[0.03] border border-white/[0.06] rounded-lg px-3 py-2 text-zinc-400 outline-none focus:border-amber-400/30 cursor-pointer"
+                    >
+                      <option value="all">All Types</option>
+                      {jobTypes.map(t => (
+                        <option key={t} value={t}>{JOB_TYPE_CONFIG[t]?.label || t}</option>
+                      ))}
+                    </select>
+                    {(searchQuery || statusFilter !== 'all' || typeFilter !== 'all') && (
+                      <button
+                        onClick={() => { setSearchQuery(''); setStatusFilter('all'); setTypeFilter('all') }}
+                        className="text-2xs text-zinc-500 hover:text-zinc-300 transition-colors px-2 py-2"
+                      >
+                        Clear filters
+                      </button>
                     )}
-                  >
-                    <div className="flex items-center gap-4">
-                      <div className={cn('w-10 h-10 rounded-lg border flex items-center justify-center', cfg.color)}>
-                        <cfg.icon className="w-5 h-5" />
+                    <span className="text-2xs text-zinc-600 ml-auto">
+                      {filteredJobs.length === jobs.length ? `${jobs.length} jobs` : `${filteredJobs.length} of ${jobs.length}`}
+                    </span>
+                  </div>
+
+                  {/* Table header — sortable columns */}
+                  <div className="flex items-center gap-3 px-4 py-2 text-2xs text-zinc-600 border-b border-white/[0.04]">
+                    <div className="w-8" /> {/* icon space */}
+                    <button onClick={() => handleSort('name')} className="flex items-center gap-1 flex-1 min-w-0 hover:text-zinc-400 transition-colors">
+                      Name <SortIcon field="name" />
+                    </button>
+                    <button onClick={() => handleSort('type')} className="flex items-center gap-1 w-28 hover:text-zinc-400 transition-colors">
+                      Type <SortIcon field="type" />
+                    </button>
+                    <div className="w-24">Schedule</div>
+                    <button onClick={() => handleSort('last_run')} className="flex items-center gap-1 w-36 hover:text-zinc-400 transition-colors">
+                      Last Run <SortIcon field="last_run" />
+                    </button>
+                    <button onClick={() => handleSort('status')} className="flex items-center gap-1 w-20 hover:text-zinc-400 transition-colors">
+                      Status <SortIcon field="status" />
+                    </button>
+                    <div className="w-10" /> {/* actions space */}
+                  </div>
+
+                  {/* Job rows */}
+                  <div className="space-y-1">
+                    {pagedJobs.length === 0 && (
+                      <div className="text-center py-8">
+                        <Search className="w-5 h-5 text-zinc-700 mx-auto mb-2" />
+                        <p className="text-xs text-zinc-600">No jobs match your filters</p>
                       </div>
-                      <div className="flex-1 min-w-0">
-                        <div className="flex items-center gap-2">
-                          <h3 className="text-sm font-display font-semibold text-zinc-200">{job.name}</h3>
-                          {job.enabled ? <StatusDot status="healthy" label="Active" /> : <StatusDot status="idle" label="Paused" />}
-                        </div>
-                        <div className="flex items-center gap-2 mt-1 flex-wrap">
-                          <Badge className={cfg.color}>{cfg.label}</Badge>
-                          <Tooltip content={`Schedule: ${job.cron}${job.cron === '0 * * * *' ? ' (hourly)' : job.cron === '0 0 * * *' ? ' (daily midnight)' : job.cron === '*/5 * * * *' ? ' (every 5 min)' : job.cron === '*/15 * * * *' ? ' (every 15 min)' : ''}`} position="top">
-                            <Badge className="font-mono bg-white/[0.04] text-zinc-400 border-white/[0.06]">{job.cron}</Badge>
-                          </Tooltip>
-                          {job.last_run && <span className="text-2xs text-zinc-600">last run: {formatRelativeTime(job.last_run)}</span>}
-                          {job.tags.map(t => <Badge key={t} className="bg-white/[0.03] text-zinc-500 border-white/[0.04]">{t}</Badge>)}
-                        </div>
-                      </div>
-                      <div className="flex items-center gap-1 flex-shrink-0" onClick={e => e.stopPropagation()}>
-                        <Tooltip content={job.enabled ? 'Pause job' : 'Enable job'} position="top">
+                    )}
+                    {pagedJobs.map(job => {
+                      const cfg = JOB_TYPE_CONFIG[job.job_type] || JOB_TYPE_CONFIG.sql_query
+                      const jRuns = jobRunMap[job.name] || []
+                      const lastRun = jRuns[0]
+                      const successRate = jRuns.length > 0 ? (jRuns.filter(r => r.status === 'success').length / jRuns.length * 100) : null
+                      return (
+                        <div key={job.id}>
                           <button
-                            onClick={() => handleToggleEnabled(job)}
-                            className="p-1.5 rounded-lg hover:bg-white/[0.04] transition-colors"
+                            onClick={() => setSelectedJob(selectedJob === job.id ? null : job.id)}
+                            className={cn(
+                              'w-full text-left rounded-lg border transition-all px-4 py-3 flex items-center gap-3',
+                              selectedJob === job.id
+                                ? 'bg-white/[0.04] border-amber-400/20'
+                                : 'bg-white/[0.02] border-white/[0.04] hover:bg-white/[0.03] hover:border-white/[0.06]',
+                              !job.enabled && 'opacity-60'
+                            )}
                           >
-                            {job.enabled
-                              ? <ToggleRight className="w-5 h-5 text-amber-400" />
-                              : <ToggleLeft className="w-5 h-5 text-zinc-600" />
-                            }
+                            {/* Type icon */}
+                            <Tooltip content={cfg.desc} position="right">
+                              <div className={cn('w-8 h-8 rounded-lg border flex items-center justify-center flex-shrink-0', cfg.color)}>
+                                <cfg.icon className="w-4 h-4" />
+                              </div>
+                            </Tooltip>
+
+                            {/* Name + tags */}
+                            <div className="flex-1 min-w-0">
+                              <div className="flex items-center gap-2">
+                                <h3 className="text-xs font-semibold text-zinc-200 truncate">{job.name}</h3>
+                                {job.tags.slice(0, 2).map(t => (
+                                  <span key={t} className="text-[9px] text-zinc-600 bg-white/[0.03] px-1.5 py-0.5 rounded flex-shrink-0">{t}</span>
+                                ))}
+                                {job.tags.length > 2 && <span className="text-[9px] text-zinc-700">+{job.tags.length - 2}</span>}
+                              </div>
+                            </div>
+
+                            {/* Type */}
+                            <div className="w-28 flex-shrink-0">
+                              <Badge className={cn('text-[9px]', cfg.color)}>{cfg.label}</Badge>
+                            </div>
+
+                            {/* Schedule */}
+                            <Tooltip content={`Cron: ${job.cron}`} position="top">
+                              <div className="w-24 flex-shrink-0">
+                                <span className="text-2xs text-zinc-400">{cronToHuman(job.cron)}</span>
+                              </div>
+                            </Tooltip>
+
+                            {/* Last run — status + time + duration */}
+                            <div className="w-36 flex-shrink-0">
+                              {lastRun ? (
+                                <div className="flex items-center gap-1.5">
+                                  {lastRun.status === 'success'
+                                    ? <CheckCircle2 className="w-3 h-3 text-emerald-400 flex-shrink-0" />
+                                    : <XCircle className="w-3 h-3 text-rose-400 flex-shrink-0" />
+                                  }
+                                  <span className="text-2xs text-zinc-400">{formatRelativeTime(lastRun.started_at)}</span>
+                                  {lastRun.duration_ms != null && (
+                                    <span className="text-[9px] font-mono text-zinc-600">{formatDuration(lastRun.duration_ms)}</span>
+                                  )}
+                                </div>
+                              ) : (
+                                <span className="text-2xs text-zinc-700">Never run</span>
+                              )}
+                              {successRate !== null && (
+                                <div className="flex items-center gap-1 mt-0.5">
+                                  <div className="w-12 h-1 bg-white/[0.04] rounded-full overflow-hidden">
+                                    <div className={cn('h-full rounded-full', successRate >= 80 ? 'bg-emerald-400' : successRate >= 50 ? 'bg-amber-400' : 'bg-rose-400')}
+                                      style={{ width: `${successRate}%` }} />
+                                  </div>
+                                  <span className="text-[9px] font-mono text-zinc-600">{successRate.toFixed(0)}%</span>
+                                </div>
+                              )}
+                            </div>
+
+                            {/* Status */}
+                            <div className="w-20 flex-shrink-0">
+                              {job.enabled
+                                ? <StatusDot status="healthy" label="Active" />
+                                : <StatusDot status="idle" label="Paused" />
+                              }
+                            </div>
+
+                            {/* Action menu */}
+                            <div className="w-10 flex-shrink-0 flex justify-end relative" onClick={e => e.stopPropagation()}>
+                              <button
+                                onClick={() => setActionMenu(actionMenu === job.id ? null : job.id)}
+                                className="p-1.5 rounded-lg hover:bg-white/[0.06] transition-colors"
+                              >
+                                <MoreVertical className="w-4 h-4 text-zinc-600" />
+                              </button>
+                              {actionMenu === job.id && (
+                                <div ref={actionMenuRef} className="absolute right-0 top-8 z-50 w-40 bg-navy-900 border border-white/[0.08] rounded-lg shadow-xl py-1 animate-fade-in">
+                                  <button onClick={() => { handleRun(job.id); setActionMenu(null) }}
+                                    className="w-full text-left px-3 py-1.5 text-xs text-zinc-300 hover:bg-white/[0.04] flex items-center gap-2">
+                                    <Play className="w-3 h-3 text-emerald-400" /> Run Now
+                                  </button>
+                                  <button onClick={() => { setSelectedJob(job.id); setActionMenu(null) }}
+                                    className="w-full text-left px-3 py-1.5 text-xs text-zinc-300 hover:bg-white/[0.04] flex items-center gap-2">
+                                    <Eye className="w-3 h-3 text-zinc-400" /> View Details
+                                  </button>
+                                  <button onClick={() => { handleToggleEnabled(job); setActionMenu(null) }}
+                                    className="w-full text-left px-3 py-1.5 text-xs text-zinc-300 hover:bg-white/[0.04] flex items-center gap-2">
+                                    {job.enabled ? <><Pause className="w-3 h-3 text-amber-400" /> Pause</> : <><Play className="w-3 h-3 text-amber-400" /> Enable</>}
+                                  </button>
+                                  <div className="border-t border-white/[0.04] my-1" />
+                                  <button onClick={async () => {
+                                    await deleteSchedule(job.id)
+                                    setJobs(js => js.filter(j => j.id !== job.id))
+                                    setActionMenu(null)
+                                    toast.success('Deleted')
+                                  }}
+                                    className="w-full text-left px-3 py-1.5 text-xs text-rose-400 hover:bg-rose-400/[0.06] flex items-center gap-2">
+                                    <Trash2 className="w-3 h-3" /> Delete
+                                  </button>
+                                </div>
+                              )}
+                            </div>
                           </button>
-                        </Tooltip>
-                        <Button variant="ghost" size="sm" onClick={() => handleRun(job.id)} title="Run now"><Play className="w-3.5 h-3.5 text-emerald-400" /></Button>
-                        <Button variant="ghost" size="sm" onClick={async () => {
-                          await deleteSchedule(job.id)
-                          setJobs(js => js.filter(j => j.id !== job.id))
-                          toast.success('Deleted')
-                        }}><Trash2 className="w-3.5 h-3.5 text-zinc-600" /></Button>
+
+                          {/* Expanded detail */}
+                          {selectedJob === job.id && (
+                            <div className="ml-4 mr-4 mt-1 mb-2 p-4 rounded-lg bg-white/[0.02] border border-white/[0.04]">
+                              <div className="grid grid-cols-3 gap-4 mb-4">
+                                <div>
+                                  <p className="text-2xs text-zinc-500 mb-1.5 font-semibold">Configuration</p>
+                                  <div className="space-y-1.5 text-2xs">
+                                    <div className="flex justify-between"><span className="text-zinc-500">Schedule</span><Tooltip content="Cron expression: min hour dom month dow" position="top"><span className="font-mono text-zinc-300 cursor-help">{job.cron} ({cronToHuman(job.cron)})</span></Tooltip></div>
+                                    <div className="flex justify-between"><span className="text-zinc-500">Retries</span><span className="font-mono text-zinc-300">{job.retries || 0}</span></div>
+                                    {job.timeout_seconds && <div className="flex justify-between"><span className="text-zinc-500">Timeout</span><span className="font-mono text-zinc-300">{job.timeout_seconds}s</span></div>}
+                                  </div>
+                                </div>
+                                <div>
+                                  <p className="text-2xs text-zinc-500 mb-1.5 font-semibold">Recent Runs ({jRuns.length})</p>
+                                  {jRuns.length === 0 ? (
+                                    <p className="text-2xs text-zinc-600">No runs yet</p>
+                                  ) : (
+                                    <div className="space-y-1">
+                                      {jRuns.slice(0, 5).map(r => (
+                                        <div key={r.id} className="flex items-center gap-2 text-2xs">
+                                          {r.status === 'success' ? <CheckCircle2 className="w-3 h-3 text-emerald-400" /> : <XCircle className="w-3 h-3 text-rose-400" />}
+                                          <span className="text-zinc-400">{formatRelativeTime(r.started_at)}</span>
+                                          {r.duration_ms != null && <span className="font-mono text-zinc-600">{formatDuration(r.duration_ms)}</span>}
+                                        </div>
+                                      ))}
+                                    </div>
+                                  )}
+                                </div>
+                                <div>
+                                  <p className="text-2xs text-zinc-500 mb-1.5 font-semibold">Stats</p>
+                                  <div className="space-y-1.5 text-2xs">
+                                    <div className="flex justify-between"><span className="text-zinc-500">Total Runs</span><span className="font-mono text-zinc-300">{jRuns.length}</span></div>
+                                    <div className="flex justify-between"><span className="text-zinc-500">Success Rate</span><span className="font-mono text-emerald-400">{jRuns.length > 0 ? `${((jRuns.filter(r => r.status === 'success').length / jRuns.length) * 100).toFixed(0)}%` : '—'}</span></div>
+                                    <div className="flex justify-between"><span className="text-zinc-500">Avg Duration</span><span className="font-mono text-zinc-300">{jRuns.length > 0 ? formatDuration(jRuns.reduce((s, r) => s + (r.duration_ms || 0), 0) / jRuns.length) : '—'}</span></div>
+                                  </div>
+                                </div>
+                              </div>
+                              {/* SQL preview */}
+                              {job.target && job.target.length > 30 && (
+                                <div className="relative">
+                                  <pre className="text-2xs font-mono text-zinc-400 bg-navy-950/80 rounded-lg p-3 overflow-x-auto border border-white/[0.03]">{job.target}</pre>
+                                  <button
+                                    onClick={(e) => { e.stopPropagation(); navigator.clipboard.writeText(job.target); toast.success('Copied SQL') }}
+                                    className="absolute top-2 right-2 p-1 rounded text-zinc-600 hover:text-zinc-300 transition-colors"
+                                  >
+                                    <Copy className="w-3 h-3" />
+                                  </button>
+                                </div>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      )
+                    })}
+                  </div>
+
+                  {/* Pagination */}
+                  {filteredJobs.length > PAGE_SIZE && (
+                    <div className="flex items-center justify-between pt-2 border-t border-white/[0.04]">
+                      <span className="text-2xs text-zinc-600">
+                        Showing {(page - 1) * PAGE_SIZE + 1}–{Math.min(page * PAGE_SIZE, filteredJobs.length)} of {filteredJobs.length} jobs
+                      </span>
+                      <div className="flex items-center gap-1">
+                        <button
+                          onClick={() => setPage(p => Math.max(1, p - 1))}
+                          disabled={page <= 1}
+                          className="p-1.5 rounded-lg hover:bg-white/[0.04] transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
+                        >
+                          <ChevronLeft className="w-4 h-4 text-zinc-400" />
+                        </button>
+                        {Array.from({ length: totalPages }, (_, i) => i + 1).map(p => (
+                          <button
+                            key={p}
+                            onClick={() => setPage(p)}
+                            className={cn(
+                              'w-7 h-7 rounded-lg text-xs font-mono transition-colors',
+                              p === page ? 'bg-amber-400/10 text-amber-400 border border-amber-400/20' : 'text-zinc-500 hover:bg-white/[0.04]'
+                            )}
+                          >
+                            {p}
+                          </button>
+                        ))}
+                        <button
+                          onClick={() => setPage(p => Math.min(totalPages, p + 1))}
+                          disabled={page >= totalPages}
+                          className="p-1.5 rounded-lg hover:bg-white/[0.04] transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
+                        >
+                          <ChevronRight className="w-4 h-4 text-zinc-400" />
+                        </button>
                       </div>
                     </div>
-                    {/* Expanded detail */}
-                    {selectedJob === job.id && (
-                      <div className="mt-4 pt-4 border-t border-white/[0.04]">
-                        <div className="grid grid-cols-3 gap-4 mb-4">
-                          <div>
-                            <p className="text-2xs text-zinc-500 mb-1.5">Configuration</p>
-                            <div className="space-y-1.5 text-2xs">
-                              <div className="flex justify-between"><span className="text-zinc-500">Target</span><span className="font-mono text-zinc-300 truncate max-w-[200px]">{job.target}</span></div>
-                              <div className="flex justify-between"><span className="text-zinc-500">Schedule</span><Tooltip content="Cron expression: minute hour day-of-month month day-of-week" position="top"><span className="font-mono text-zinc-300 cursor-help">{job.cron}</span></Tooltip></div>
-                              <div className="flex justify-between"><span className="text-zinc-500">Retries</span><span className="font-mono text-zinc-300">{job.retries || 0}</span></div>
-                            </div>
-                          </div>
-                          <div>
-                            <p className="text-2xs text-zinc-500 mb-1.5">Recent Runs</p>
-                            {jobRuns.length === 0 ? (
-                              <p className="text-2xs text-zinc-600">No runs yet</p>
-                            ) : (
-                              <div className="space-y-1">
-                                {jobRuns.slice(0, 5).map(r => (
-                                  <div key={r.id} className="flex items-center gap-2 text-2xs">
-                                    {r.status === 'success' ? <CheckCircle2 className="w-3 h-3 text-emerald-400" /> : <XCircle className="w-3 h-3 text-rose-400" />}
-                                    <span className="text-zinc-400">{formatRelativeTime(r.started_at)}</span>
-                                    {r.duration_ms && <span className="font-mono text-zinc-600">{formatDuration(r.duration_ms)}</span>}
-                                  </div>
-                                ))}
-                              </div>
-                            )}
-                          </div>
-                          <div>
-                            <p className="text-2xs text-zinc-500 mb-1.5">Stats</p>
-                            <div className="space-y-1.5 text-2xs">
-                              <div className="flex justify-between"><span className="text-zinc-500">Total Runs</span><span className="font-mono text-zinc-300">{jobRuns.length}</span></div>
-                              <div className="flex justify-between"><span className="text-zinc-500">Success Rate</span><span className="font-mono text-emerald-400">{jobRuns.length > 0 ? `${((jobRuns.filter(r => r.status === 'success').length / jobRuns.length) * 100).toFixed(0)}%` : '—'}</span></div>
-                              <div className="flex justify-between"><span className="text-zinc-500">Avg Duration</span><span className="font-mono text-zinc-300">{jobRuns.length > 0 ? formatDuration(jobRuns.reduce((s, r) => s + (r.duration_ms || 0), 0) / jobRuns.length) : '—'}</span></div>
-                            </div>
-                          </div>
-                        </div>
-                        {/* SQL preview */}
-                        {job.target && job.target.length > 30 && (
-                          <div className="relative">
-                            <pre className="text-2xs font-mono text-zinc-400 bg-navy-950/80 rounded-lg p-3 overflow-x-auto border border-white/[0.03]">{job.target}</pre>
-                            <button
-                              onClick={(e) => { e.stopPropagation(); navigator.clipboard.writeText(job.target); toast.success('Copied SQL') }}
-                              className="absolute top-2 right-2 p-1 rounded text-zinc-600 hover:text-zinc-300 transition-colors"
-                            >
-                              <Copy className="w-3 h-3" />
-                            </button>
-                          </div>
-                        )}
-                      </div>
-                    )}
-                  </button>
-                )
-              })}
+                  )}
+                </>
+              )}
             </div>
           )}
 
