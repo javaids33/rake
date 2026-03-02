@@ -121,6 +121,8 @@ pub struct ConnectionEntry {
     pub tables: Vec<String>,
     /// When the connection was established.
     pub created_at: DateTime<Utc>,
+    /// How this connection was added: "bootstrap" (auto) or "user" (manual).
+    pub source: String,
 }
 
 /// A user-created transform model.
@@ -285,6 +287,8 @@ pub struct AppState {
     pub quality_rules: RwLock<Vec<crate::routes::QualityRule>>,
     /// Uploaded dbt project (at most one at a time).
     pub dbt_project: RwLock<Option<crate::routes::DbtProject>>,
+    /// Benchmark run results (TPC-H query timings).
+    pub benchmark_results: RwLock<Vec<crate::routes::BenchmarkResult>>,
 }
 
 impl AppState {
@@ -316,6 +320,7 @@ impl AppState {
             column_descriptions: RwLock::new(std::collections::HashMap::new()),
             quality_rules: RwLock::new(Vec::new()),
             dbt_project: RwLock::new(None),
+            benchmark_results: RwLock::new(Vec::new()),
         }
     }
 
@@ -347,6 +352,7 @@ impl AppState {
             column_descriptions: RwLock::new(std::collections::HashMap::new()),
             quality_rules: RwLock::new(Vec::new()),
             dbt_project: RwLock::new(None),
+            benchmark_results: RwLock::new(Vec::new()),
         }
     }
 
@@ -436,6 +442,54 @@ impl AppState {
             let drain_count = runs.len() - MAX_JOB_RUNS;
             runs.drain(..drain_count);
         }
+    }
+
+    /// Seed a database connection entry directly (used by bootstrap, bypasses HTTP layer).
+    /// Returns `true` if a new connection was added, `false` if one with the same name already exists.
+    pub async fn seed_connection(&self, entry: ConnectionEntry, password: String) -> bool {
+        let mut connections = self.connections.write().await;
+        if connections.iter().any(|c| c.name == entry.name) {
+            return false;
+        }
+        let id = entry.id.clone();
+        connections.push(entry);
+        drop(connections);
+        self.connection_passwords.write().await.insert(id, password);
+        true
+    }
+
+    /// Seed a streaming pipeline if one with the same name doesn't already exist.
+    pub async fn seed_pipeline(&self, pipeline: StreamingPipeline) -> bool {
+        let mut pipelines = self.streaming_pipelines.write().await;
+        if pipelines.iter().any(|p| p.name == pipeline.name) {
+            return false;
+        }
+        pipelines.push(pipeline);
+        true
+    }
+
+    /// Seed a scheduled job if one with the same name doesn't already exist.
+    /// Persists to disk.
+    pub async fn seed_scheduled_job(&self, job: ScheduledJob) -> bool {
+        let jobs = self.scheduled_jobs.read().await;
+        if jobs.iter().any(|j| j.name == job.name) {
+            return false;
+        }
+        drop(jobs);
+        self.add_scheduled_job(job).await;
+        true
+    }
+
+    /// Seed a user transform if one with the same name doesn't already exist.
+    /// Persists to disk.
+    pub async fn seed_user_transform(&self, ut: UserTransform) -> bool {
+        let transforms = self.user_transforms.read().await;
+        if transforms.iter().any(|t| t.name == ut.name) {
+            return false;
+        }
+        drop(transforms);
+        self.add_user_transform(ut).await;
+        true
     }
 
     /// Append stream events to the circular buffer.

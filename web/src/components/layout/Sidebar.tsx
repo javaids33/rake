@@ -4,7 +4,7 @@ import { useAppStore } from '../../stores/app'
 import {
   Home, Terminal, Database, FolderInput, Radio, Search,
   GitBranch, Clock, Settings, Info, Layers, PanelLeftClose, PanelLeft,
-  Gauge, ShieldCheck,
+  Gauge, ShieldCheck, Timer,
 } from 'lucide-react'
 
 const nav = [
@@ -12,12 +12,13 @@ const nav = [
   { to: '/sql', icon: Terminal, label: 'SQL Editor', accent: 'amber' },
   { to: '/catalog', icon: Database, label: 'Data Catalog', accent: 'cyan' },
   { to: '/sources', icon: FolderInput, label: 'Data Sources', accent: 'cyan' },
+  { to: '/quality', icon: ShieldCheck, label: 'Data Quality', accent: 'cyan' },
   { to: '/streaming', icon: Radio, label: 'Streaming', accent: 'cyan' },
   { to: '/vector', icon: Search, label: 'Vector Search', accent: 'rose' },
   { to: '/transforms', icon: GitBranch, label: 'Transforms', accent: 'violet' },
   { to: '/scheduler', icon: Clock, label: 'Scheduler', accent: 'amber' },
+  { to: '/benchmarks', icon: Timer, label: 'Benchmarks', accent: 'amber' },
   { to: '/metrics', icon: Gauge, label: 'Engine Metrics', accent: 'emerald' },
-  { to: '/quality', icon: ShieldCheck, label: 'Data Quality', accent: 'emerald' },
   { to: '/history', icon: Layers, label: 'Query History', accent: 'emerald' },
   { to: '/settings', icon: Settings, label: 'Settings', accent: 'zinc' },
   { to: '/about', icon: Info, label: 'About', accent: 'zinc' },

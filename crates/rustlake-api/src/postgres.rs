@@ -47,7 +47,7 @@ pub async fn connect_and_discover(params: &PgConnParams) -> Result<Vec<String>, 
     let rows = client
         .query(
             "SELECT table_name FROM information_schema.tables \
-             WHERE table_schema = 'public' AND table_type = 'BASE TABLE' \
+             WHERE table_schema = 'public' AND table_type IN ('BASE TABLE', 'VIEW') \
              ORDER BY table_name",
             &[],
         )

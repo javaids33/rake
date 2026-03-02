@@ -7,6 +7,7 @@ import type {
   ClusterInfo, StreamEvent, ExplainResponse, QualityChecksResponse, QualityRule,
   SchedulerDagResponse, DbtProject, DbtModel, DbtSource, DbtRunResponse, DbtRunAllResponse,
   SystemMetricsResponse, QueryEstimateResponse, ConnectionTestRequest, ConnectionTestResponse,
+  BootstrapStatus, BenchmarkQueriesResponse, BenchmarkRunResponse, BenchmarkResult,
 } from '../types'
 
 const BASE = ''
@@ -156,3 +157,13 @@ export const estimateQuery = (sql: string) =>
 // Connection Test
 export const testConnection = (params: ConnectionTestRequest) =>
   request<ConnectionTestResponse>('/api/v1/connections/test', { method: 'POST', body: JSON.stringify(params) })
+
+// Bootstrap
+export const getBootstrapStatus = () => request<BootstrapStatus>('/api/v1/bootstrap/status')
+export const runBootstrap = () => request<Record<string, unknown>>('/api/v1/bootstrap', { method: 'POST' })
+
+// Benchmarks
+export const getBenchmarkQueries = () => request<BenchmarkQueriesResponse>('/api/v1/benchmarks/queries')
+export const runBenchmark = (queryId: string) =>
+  request<BenchmarkRunResponse>('/api/v1/benchmarks/run', { method: 'POST', body: JSON.stringify({ query_id: queryId }) })
+export const getBenchmarkResults = () => request<{ results: BenchmarkResult[] }>('/api/v1/benchmarks/results')

@@ -1,5 +1,8 @@
+import { useState, useEffect, useCallback } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { Card } from '../components/ui/Card'
 import { Badge } from '../components/ui/Badge'
+import { Button } from '../components/ui/Button'
 import { cn } from '../lib/utils'
 import {
   Info, Cpu, Database, Layers, GitBranch, Boxes, ArrowRight,
@@ -8,8 +11,11 @@ import {
   Plane, Activity, FileText, CheckCircle2, Route,
   HardDrive, Network, BookOpen, Workflow, Settings,
   Upload, Table2, Eye, Trash2, Play, PenTool, Milestone,
+  RefreshCw, Loader2, Rocket,
 } from 'lucide-react'
 import toast from 'react-hot-toast'
+import { getBootstrapStatus, runBootstrap } from '../api/client'
+import type { BootstrapStatus } from '../types'
 
 // ── Static data ─────────────────────────────────────────────────
 
@@ -190,6 +196,29 @@ const E2E_FEATURES = [
 // ── Component ─────────────────────────────────────────────────
 
 export function About() {
+  const navigate = useNavigate()
+  const [bootstrap, setBootstrap] = useState<BootstrapStatus | null>(null)
+  const [bootstrapping, setBootstrapping] = useState(false)
+
+  const fetchStatus = useCallback(() => {
+    getBootstrapStatus().then(setBootstrap).catch(() => {})
+  }, [])
+
+  useEffect(() => { fetchStatus() }, [fetchStatus])
+
+  const handleBootstrap = async () => {
+    setBootstrapping(true)
+    try {
+      await runBootstrap()
+      toast.success('Bootstrap complete')
+      fetchStatus()
+    } catch (e) {
+      toast.error('Bootstrap failed')
+    } finally {
+      setBootstrapping(false)
+    }
+  }
+
   return (
     <div className="flex flex-col h-full animate-fade-in">
       {/* Header */}
@@ -566,6 +595,118 @@ core ──→ python  (PyO3 bridge to engine/stream/vector)`}</pre>
               ))}
             </div>
           </Card>
+
+          {/* Quick Start Playground */}
+          <div>
+            <h2 className="text-sm font-display font-semibold text-zinc-200 mb-4 flex items-center gap-2">
+              <Rocket className="w-4 h-4 text-amber-400" /> Quick Start Playground
+            </h2>
+
+            {/* Bootstrap Status Panel */}
+            <Card padding="md" className="mb-4">
+              <div className="flex items-center justify-between mb-4">
+                <div>
+                  <h3 className="text-xs font-display font-semibold text-zinc-200">Bootstrap Status</h3>
+                  <p className="text-2xs text-zinc-500 mt-0.5">Auto-connected services and demo data from Docker Compose</p>
+                </div>
+                <Button
+                  size="sm"
+                  variant="secondary"
+                  onClick={handleBootstrap}
+                  disabled={bootstrapping}
+                  className="text-2xs"
+                >
+                  {bootstrapping ? <Loader2 className="w-3 h-3 animate-spin mr-1" /> : <RefreshCw className="w-3 h-3 mr-1" />}
+                  {bootstrapping ? 'Bootstrapping...' : 'Re-bootstrap'}
+                </Button>
+              </div>
+
+              {bootstrap ? (
+                <div className="space-y-3">
+                  {/* Service status row */}
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="p-3 rounded-lg bg-white/[0.02] border border-white/[0.04]">
+                      <div className="flex items-center gap-2 mb-1">
+                        <div className={cn('w-2 h-2 rounded-full', bootstrap.postgres.available ? 'bg-emerald-400' : 'bg-zinc-600')} />
+                        <span className="text-xs font-semibold text-zinc-200">Postgres</span>
+                        <Badge className={cn('text-[10px]', bootstrap.postgres.available ? 'bg-emerald-400/10 text-emerald-400 border-emerald-400/20' : 'bg-zinc-800 text-zinc-500 border-zinc-700')}>
+                          {bootstrap.postgres.available ? 'Connected' : 'Offline'}
+                        </Badge>
+                      </div>
+                      {bootstrap.postgres.available && (
+                        <p className="text-2xs text-zinc-500">{bootstrap.postgres.tables.length} tables discovered</p>
+                      )}
+                      {bootstrap.postgres.error && (
+                        <p className="text-2xs text-zinc-600">{bootstrap.postgres.error}</p>
+                      )}
+                    </div>
+                    <div className="p-3 rounded-lg bg-white/[0.02] border border-white/[0.04]">
+                      <div className="flex items-center gap-2 mb-1">
+                        <div className={cn('w-2 h-2 rounded-full', bootstrap.minio.available ? 'bg-emerald-400' : 'bg-zinc-600')} />
+                        <span className="text-xs font-semibold text-zinc-200">MinIO S3</span>
+                        <Badge className={cn('text-[10px]', bootstrap.minio.available ? 'bg-emerald-400/10 text-emerald-400 border-emerald-400/20' : 'bg-zinc-800 text-zinc-500 border-zinc-700')}>
+                          {bootstrap.minio.available ? 'Configured' : 'Offline'}
+                        </Badge>
+                      </div>
+                      {bootstrap.minio.error && (
+                        <p className="text-2xs text-zinc-600">{bootstrap.minio.error}</p>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Demo data counts */}
+                  <div className="grid grid-cols-4 gap-3">
+                    {[
+                      { label: 'Tables', value: bootstrap.registered_tables.length, icon: Table2 },
+                      { label: 'Jobs', value: bootstrap.demo_jobs, icon: Clock },
+                      { label: 'Pipelines', value: bootstrap.demo_pipelines, icon: Activity },
+                      { label: 'Transforms', value: bootstrap.demo_transforms, icon: GitBranch },
+                    ].map(item => (
+                      <div key={item.label} className="p-2.5 rounded-lg bg-white/[0.02] border border-white/[0.04] text-center">
+                        <item.icon className="w-3.5 h-3.5 text-zinc-500 mx-auto mb-1" />
+                        <p className="text-sm font-mono font-bold text-zinc-200">{item.value}</p>
+                        <p className="text-2xs text-zinc-500">{item.label}</p>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ) : (
+                <div className="flex items-center justify-center py-6">
+                  <Loader2 className="w-4 h-4 animate-spin text-zinc-500" />
+                  <span className="text-2xs text-zinc-500 ml-2">Loading status...</span>
+                </div>
+              )}
+            </Card>
+
+            {/* Validation Checklist */}
+            <div className="grid grid-cols-3 gap-3">
+              {[
+                { title: 'SQL Engine', desc: 'Run a cross-table query', icon: Terminal, path: '/sql', color: 'text-amber-400' },
+                { title: 'Streaming', desc: 'View live events pipeline', icon: Radio, path: '/streaming', color: 'text-cyan-400' },
+                { title: 'Scheduler', desc: 'Run a demo job', icon: Clock, path: '/scheduler', color: 'text-blue-400' },
+                { title: 'Transforms', desc: 'Compile a model', icon: GitBranch, path: '/transforms', color: 'text-emerald-400' },
+                { title: 'Vector Search', desc: 'Search products by text', icon: Search, path: '/vector', color: 'text-rose-400' },
+                { title: 'Data Catalog', desc: 'Browse table metadata', icon: Database, path: '/catalog', color: 'text-violet-400' },
+              ].map(item => (
+                <Card
+                  key={item.title}
+                  padding="sm"
+                  hover
+                  onClick={() => navigate(item.path)}
+                  className="cursor-pointer group"
+                >
+                  <div className="flex items-center gap-2 mb-1.5">
+                    <item.icon className={cn('w-4 h-4', item.color)} />
+                    <h3 className="text-xs font-display font-semibold text-zinc-200">{item.title}</h3>
+                  </div>
+                  <p className="text-2xs text-zinc-500">{item.desc}</p>
+                  <div className="flex items-center gap-1 mt-2 text-2xs text-zinc-600 group-hover:text-amber-400 transition-colors">
+                    <Play className="w-3 h-3" /> Try it
+                  </div>
+                </Card>
+              ))}
+            </div>
+          </div>
 
           {/* Local Docker Credentials */}
           <div>

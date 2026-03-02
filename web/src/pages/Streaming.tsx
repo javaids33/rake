@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react'
+import { useLocation } from 'react-router-dom'
 import { Card } from '../components/ui/Card'
 import { Button } from '../components/ui/Button'
 import { Badge } from '../components/ui/Badge'
@@ -33,6 +34,7 @@ const DELIVERY_SEMANTICS = [
 ]
 
 export function Streaming() {
+  const location = useLocation()
   const [tab, setTab] = useState('overview')
   const [metrics, setMetrics] = useState<StreamingMetrics | null>(null)
   const [events, setEvents] = useState<StreamEvent[]>([])
@@ -40,6 +42,17 @@ export function Streaming() {
   const [createOpen, setCreateOpen] = useState(false)
   const [selectedPipeline, setSelectedPipeline] = useState<string | null>(null)
   const [form, setForm] = useState({ name: '', source_type: 'kafka', sink_table: '', transform_sql: '', broker: '', topic: '' })
+
+  // Auto-open create modal when navigated with SQL from SQL Editor
+  useEffect(() => {
+    const state = location.state as { sql?: string; name?: string } | null
+    if (state?.sql) {
+      setForm(f => ({ ...f, transform_sql: state.sql!, name: state.name || '' }))
+      setTab('overview')
+      setCreateOpen(true)
+      window.history.replaceState({}, '')
+    }
+  }, [location.state])
 
   const loadAll = () => {
     getStreamStatus().then(r => { if (r?.metrics) setMetrics(r.metrics) }).catch(() => {})

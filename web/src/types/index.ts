@@ -432,6 +432,66 @@ export interface ConnectionTestResponse {
   latency_ms?: number
   server_version?: string
   tables_found?: number
+  validation_level: string
+  checks: ConnectionCheck[]
+}
+
+export interface ConnectionCheck {
+  name: string
+  passed: boolean
+  detail: string
+}
+
+// ── Benchmarks ──────────────────────────────────────────────────
+export interface BenchmarkQuery {
+  id: string
+  name: string
+  description: string
+  sql: string
+  category: string
+}
+
+export interface BenchmarkResult {
+  query_id: string
+  query_name: string
+  duration_ms: number
+  row_count: number
+  status: string
+  error?: string
+  timestamp: string
+}
+
+export interface BenchmarkQueriesResponse {
+  queries: BenchmarkQuery[]
+  scale_factor: string
+  tables: Record<string, number>
+}
+
+export interface BenchmarkRunResponse {
+  query_id: string
+  query_name: string
+  sql: string
+  duration_ms: number
+  row_count: number
+  columns: string[]
+  rows: Record<string, unknown>[]
+  status: string
+}
+
+// ── Bootstrap ───────────────────────────────────────────────────
+export interface ServiceStatus {
+  available: boolean
+  tables: string[]
+  error?: string
+}
+
+export interface BootstrapStatus {
+  postgres: ServiceStatus
+  minio: ServiceStatus
+  demo_jobs: number
+  demo_pipelines: number
+  demo_transforms: number
+  registered_tables: string[]
 }
 
 // ── Alert / SLA Configuration ───────────────────────────────────

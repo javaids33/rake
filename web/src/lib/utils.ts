@@ -42,6 +42,7 @@ export function truncate(str: string, len: number): string {
 }
 
 export function inferFormat(tableName: string): { format: string; variant: string } {
+  if (!tableName) return { format: 'Unknown', variant: 'unknown' }
   if (tableName.startsWith('pg_')) return { format: 'PostgreSQL', variant: 'external' }
   if (tableName.startsWith('uploads_')) return { format: 'Upload', variant: 'file' }
   if (tableName.includes('parquet')) return { format: 'Parquet', variant: 'file' }

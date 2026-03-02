@@ -20,7 +20,10 @@ mod postgres;
 mod routes;
 mod state;
 
-use state::{load_chat_messages_from_file, load_scheduled_jobs_from_file, load_user_transforms_from_file, AppState};
+use state::{
+    load_chat_messages_from_file, load_scheduled_jobs_from_file, load_user_transforms_from_file,
+    AppState, ConnectionEntry, S3Config, ScheduledJob, StreamingPipeline, UserTransform,
+};
 
 /// Pre-populate the vector index with product data from sample-data/products.csv.
 fn load_product_vectors() -> VectorIndex {
@@ -82,6 +85,290 @@ fn load_product_vectors() -> VectorIndex {
     index
 }
 
+/// Auto-bootstrap demo connections and seed data on startup.
+///
+/// Runs in a background task so it doesn't block server startup.
+/// Idempotent — skips items that already exist.
+async fn bootstrap_demo_connections(state: Arc<AppState>) {
+    let mut pg_tables = Vec::new();
+
+    // ── 1. Try connecting to Postgres (config via env vars) ─────
+    let pg_host = std::env::var("RUSTLAKE_PG_HOST").unwrap_or_else(|_| "localhost".to_string());
+    let pg_port: u16 = std::env::var("RUSTLAKE_PG_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5433);
+    let pg_db = std::env::var("RUSTLAKE_PG_DB").unwrap_or_else(|_| "rustlake_demo".to_string());
+    let pg_user = std::env::var("RUSTLAKE_PG_USER").unwrap_or_else(|_| "rustlake".to_string());
+    let pg_pass = std::env::var("RUSTLAKE_PG_PASSWORD").unwrap_or_else(|_| "rustlake".to_string());
+
+    let pg_params = postgres::PgConnParams {
+        host: pg_host.clone(),
+        port: pg_port,
+        database: pg_db.clone(),
+        username: pg_user.clone(),
+        password: pg_pass.clone(),
+    };
+
+    match postgres::connect_and_discover(&pg_params).await {
+        Ok(tables) => {
+            let entry = ConnectionEntry {
+                id: "bootstrap-postgres".to_string(),
+                name: "Docker Postgres".to_string(),
+                conn_type: "postgres".to_string(),
+                host: pg_host.clone(),
+                port: pg_port,
+                database: pg_db.clone(),
+                username: pg_user.clone(),
+                status: "connected".to_string(),
+                tables: tables.clone(),
+                created_at: chrono::Utc::now(),
+                source: "bootstrap".to_string(),
+            };
+
+            if state.seed_connection(entry, "rustlake".to_string()).await {
+                tracing::info!(
+                    source = "bootstrap",
+                    conn_type = "postgres",
+                    host = "localhost",
+                    port = 5433,
+                    database = "rustlake_demo",
+                    tables = tables.len(),
+                    "Data source added: Docker Postgres ({} tables discovered)",
+                    tables.len()
+                );
+            }
+
+            // Register each table into DataFusion
+            for table_name in &tables {
+                match postgres::fetch_table_as_arrow(&pg_params, table_name).await {
+                    Ok(batch) => {
+                        let row_count = batch.num_rows();
+                        let schema = batch.schema();
+                        match datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]) {
+                            Ok(mem_table) => {
+                                let df_name = format!("pg_{}", table_name);
+                                let ctx = state.ctx.read().await;
+                                match ctx.datafusion_ctx().register_table(&df_name, std::sync::Arc::new(mem_table)) {
+                                    Ok(_) => {
+                                        pg_tables.push(df_name.clone());
+                                        tracing::info!(table = %df_name, rows = row_count, "Bootstrap: registered Postgres table");
+                                    }
+                                    Err(e) => tracing::warn!(table = %df_name, error = %e, "Bootstrap: failed to register table"),
+                                }
+                            }
+                            Err(e) => tracing::warn!(table = %table_name, error = %e, "Bootstrap: failed to create MemTable"),
+                        }
+                    }
+                    Err(e) => tracing::warn!(table = %table_name, error = %e, "Bootstrap: failed to fetch table"),
+                }
+            }
+        }
+        Err(e) => {
+            tracing::info!(error = %e, "Bootstrap: Postgres not available (start with docker compose up -d)");
+        }
+    }
+
+    // ── 2. Seed MinIO S3 config (via env vars) ────────────────────
+    let minio_endpoint = std::env::var("RUSTLAKE_MINIO_ENDPOINT").unwrap_or_else(|_| "http://localhost:9000".to_string());
+    let minio_access = std::env::var("RUSTLAKE_MINIO_ACCESS_KEY").unwrap_or_else(|_| "rustlake".to_string());
+    let minio_secret = std::env::var("RUSTLAKE_MINIO_SECRET_KEY").unwrap_or_else(|_| "rustlake123".to_string());
+    let minio_bucket = std::env::var("RUSTLAKE_MINIO_BUCKET").unwrap_or_else(|_| "rustlake-warehouse".to_string());
+    let minio_region = std::env::var("RUSTLAKE_MINIO_REGION").unwrap_or_else(|_| "us-east-1".to_string());
+    {
+        let mut configs = state.s3_configs.write().await;
+        if !configs.iter().any(|c| c.name == "Local MinIO") {
+            configs.push(S3Config {
+                name: "Local MinIO".to_string(),
+                endpoint: minio_endpoint,
+                access_key: minio_access,
+                secret_key: minio_secret,
+                bucket: minio_bucket,
+                region: minio_region,
+                status: "configured".to_string(),
+                created_at: chrono::Utc::now(),
+            });
+            tracing::info!("Bootstrap: added Local MinIO S3 config");
+        }
+    }
+
+    // ── 3. Seed demo scheduled jobs ──────────────────────────────
+    let demo_jobs = vec![
+        ScheduledJob {
+            id: "demo-pg-snapshot".to_string(),
+            name: "Postgres Snapshot".to_string(),
+            job_type: "sql_query".to_string(),
+            cron: "*/5 * * * *".to_string(),
+            target: "SELECT count(*) FROM pg_customers".to_string(),
+            enabled: true,
+            last_run: None,
+            next_run: None,
+            last_status: None,
+            created_at: chrono::Utc::now(),
+            trigger_type: "time".to_string(),
+            event_config: None,
+            cluster: Some("default".to_string()),
+            timeout_seconds: Some(60),
+            retries: 1,
+            tags: vec!["demo".to_string(), "postgres".to_string()],
+        },
+        ScheduledJob {
+            id: "demo-quality-check".to_string(),
+            name: "Data Quality Check".to_string(),
+            job_type: "quality_check".to_string(),
+            cron: "*/15 * * * *".to_string(),
+            target: "*".to_string(),
+            enabled: true,
+            last_run: None,
+            next_run: None,
+            last_status: None,
+            created_at: chrono::Utc::now(),
+            trigger_type: "time".to_string(),
+            event_config: None,
+            cluster: Some("default".to_string()),
+            timeout_seconds: Some(120),
+            retries: 0,
+            tags: vec!["demo".to_string(), "quality".to_string()],
+        },
+        ScheduledJob {
+            id: "demo-mv-sales".to_string(),
+            name: "MV: Sales Summary".to_string(),
+            job_type: "materialized_view".to_string(),
+            cron: "*/30 * * * *".to_string(),
+            target: "SELECT product_id, SUM(amount) as total_amount FROM pg_sales GROUP BY product_id".to_string(),
+            enabled: true,
+            last_run: None,
+            next_run: None,
+            last_status: None,
+            created_at: chrono::Utc::now(),
+            trigger_type: "time".to_string(),
+            event_config: None,
+            cluster: Some("default".to_string()),
+            timeout_seconds: Some(300),
+            retries: 2,
+            tags: vec!["demo".to_string(), "materialized_view".to_string()],
+        },
+        ScheduledJob {
+            id: "demo-tpch-pricing".to_string(),
+            name: "TPC-H Q1: Pricing Summary".to_string(),
+            job_type: "sql_query".to_string(),
+            cron: "0 * * * *".to_string(),
+            target: "SELECT l_returnflag, l_linestatus, SUM(l_quantity) as sum_qty, SUM(l_extendedprice) as sum_base_price, COUNT(*) as count_order FROM pg_tpch_lineitem WHERE l_shipdate <= DATE '1998-12-01' - INTERVAL '90' DAY GROUP BY l_returnflag, l_linestatus ORDER BY l_returnflag, l_linestatus".to_string(),
+            enabled: true,
+            last_run: None,
+            next_run: None,
+            last_status: None,
+            created_at: chrono::Utc::now(),
+            trigger_type: "time".to_string(),
+            event_config: None,
+            cluster: Some("default".to_string()),
+            timeout_seconds: Some(120),
+            retries: 1,
+            tags: vec!["demo".to_string(), "tpch".to_string(), "benchmark".to_string()],
+        },
+        ScheduledJob {
+            id: "demo-tpch-etl-revenue".to_string(),
+            name: "ETL: Revenue by Nation".to_string(),
+            job_type: "etl_pipeline".to_string(),
+            cron: "0 */6 * * *".to_string(),
+            target: "SELECT n.n_name as nation, EXTRACT(YEAR FROM o.o_orderdate) as year, SUM(l.l_extendedprice * (1 - l.l_discount)) as revenue FROM pg_tpch_lineitem l JOIN pg_tpch_orders o ON l.l_orderkey = o.o_orderkey JOIN pg_tpch_customer c ON o.o_custkey = c.c_custkey JOIN pg_tpch_nation n ON c.c_nationkey = n.n_nationkey GROUP BY n.n_name, EXTRACT(YEAR FROM o.o_orderdate) ORDER BY nation, year".to_string(),
+            enabled: true,
+            last_run: None,
+            next_run: None,
+            last_status: None,
+            created_at: chrono::Utc::now(),
+            trigger_type: "time".to_string(),
+            event_config: None,
+            cluster: Some("default".to_string()),
+            timeout_seconds: Some(300),
+            retries: 2,
+            tags: vec!["demo".to_string(), "tpch".to_string(), "etl".to_string()],
+        },
+    ];
+
+    let mut jobs_seeded = 0u32;
+    for job in demo_jobs {
+        if state.seed_scheduled_job(job).await {
+            jobs_seeded += 1;
+        }
+    }
+    if jobs_seeded > 0 {
+        tracing::info!(count = jobs_seeded, "Bootstrap: seeded demo scheduled jobs");
+    }
+
+    // ── 4. Seed demo streaming pipeline ──────────────────────────
+    let demo_pipeline = StreamingPipeline {
+        id: "demo-events-ingestion".to_string(),
+        name: "Events Ingestion".to_string(),
+        source_type: "simulated".to_string(),
+        source_config: serde_json::json!({
+            "event_types": ["click", "purchase", "page_view", "signup"],
+            "rate_per_second": 10
+        }),
+        transform_sql: Some("SELECT * WHERE event_type IN ('purchase', 'signup')".to_string()),
+        sink_table: "events_stream".to_string(),
+        status: "active".to_string(),
+        events_processed: 0,
+        created_at: chrono::Utc::now(),
+    };
+
+    if state.seed_pipeline(demo_pipeline).await {
+        tracing::info!("Bootstrap: seeded demo streaming pipeline");
+    }
+
+    // ── 5. Seed demo transforms ──────────────────────────────────
+    let demo_transforms = vec![
+        UserTransform {
+            name: "customer_orders".to_string(),
+            sql: "SELECT c.name, COUNT(o.id) as order_count, SUM(o.amount) as total_spent\nFROM pg_customers c\nJOIN pg_orders o ON c.id = o.customer_id\nGROUP BY c.name\nORDER BY total_spent DESC".to_string(),
+            depends_on: vec!["pg_customers".to_string(), "pg_orders".to_string()],
+            materialization: "view".to_string(),
+            description: "Customer order summary with count and total spend".to_string(),
+            created_at: chrono::Utc::now(),
+        },
+        UserTransform {
+            name: "sales_by_product".to_string(),
+            sql: "SELECT p.name as product_name, p.category,\n  COUNT(s.id) as sale_count, SUM(s.amount) as revenue\nFROM pg_products p\nJOIN pg_sales s ON p.id = s.product_id\nGROUP BY p.name, p.category\nORDER BY revenue DESC".to_string(),
+            depends_on: vec!["pg_products".to_string(), "pg_sales".to_string()],
+            materialization: "table".to_string(),
+            description: "Product sales aggregation with revenue breakdown".to_string(),
+            created_at: chrono::Utc::now(),
+        },
+        UserTransform {
+            name: "tpch_revenue_by_nation".to_string(),
+            sql: "SELECT n.n_name as nation,\n  SUM(l.l_extendedprice * (1 - l.l_discount)) as revenue\nFROM pg_tpch_customer c\nJOIN pg_tpch_orders o ON c.c_custkey = o.o_custkey\nJOIN pg_tpch_lineitem l ON l.l_orderkey = o.o_orderkey\nJOIN pg_tpch_supplier s ON l.l_suppkey = s.s_suppkey AND c.c_nationkey = s.s_nationkey\nJOIN pg_tpch_nation n ON s.s_nationkey = n.n_nationkey\nJOIN pg_tpch_region r ON n.n_regionkey = r.r_regionkey\nWHERE r.r_name = 'ASIA'\nGROUP BY n.n_name\nORDER BY revenue DESC".to_string(),
+            depends_on: vec!["pg_tpch_customer".to_string(), "pg_tpch_orders".to_string(), "pg_tpch_lineitem".to_string(), "pg_tpch_supplier".to_string(), "pg_tpch_nation".to_string(), "pg_tpch_region".to_string()],
+            materialization: "table".to_string(),
+            description: "TPC-H Q5: Revenue by nation for Asia-Pacific suppliers".to_string(),
+            created_at: chrono::Utc::now(),
+        },
+        UserTransform {
+            name: "tpch_customer_segments".to_string(),
+            sql: "SELECT c.c_mktsegment as segment,\n  COUNT(DISTINCT c.c_custkey) as customer_count,\n  COUNT(o.o_orderkey) as order_count,\n  SUM(o.o_totalprice) as total_revenue\nFROM pg_tpch_customer c\nLEFT JOIN pg_tpch_orders o ON c.c_custkey = o.o_custkey\nGROUP BY c.c_mktsegment\nORDER BY total_revenue DESC".to_string(),
+            depends_on: vec!["pg_tpch_customer".to_string(), "pg_tpch_orders".to_string()],
+            materialization: "view".to_string(),
+            description: "Customer segmentation with order counts and revenue by market segment".to_string(),
+            created_at: chrono::Utc::now(),
+        },
+    ];
+
+    let mut transforms_seeded = 0u32;
+    for ut in demo_transforms {
+        if state.seed_user_transform(ut).await {
+            transforms_seeded += 1;
+        }
+    }
+    if transforms_seeded > 0 {
+        tracing::info!(count = transforms_seeded, "Bootstrap: seeded demo transforms");
+    }
+
+    tracing::info!(
+        pg_tables = pg_tables.len(),
+        "Bootstrap complete — {} Postgres tables registered",
+        pg_tables.len()
+    );
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -135,12 +422,24 @@ async fn main() -> anyhow::Result<()> {
         *state.scheduled_jobs.get_mut() = jobs;
     }
 
+    let state = Arc::new(state);
+
+    // Auto-bootstrap is disabled — developers start with a clean slate.
+    // Use POST /api/v1/bootstrap to connect Docker services on demand.
+    // To enable auto-bootstrap, set RUSTLAKE_AUTO_BOOTSTRAP=true.
+    if std::env::var("RUSTLAKE_AUTO_BOOTSTRAP").unwrap_or_default() == "true" {
+        let bootstrap_state = state.clone();
+        tokio::spawn(async move {
+            bootstrap_demo_connections(bootstrap_state).await;
+        });
+    }
+
     // Build the Axum router
     let app = Router::new()
         .merge(routes::api_routes())
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
-        .with_state(Arc::new(state));
+        .with_state(state);
 
     tracing::info!(
         role = ?node_role,

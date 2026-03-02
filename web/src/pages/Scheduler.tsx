@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react'
+import { useLocation } from 'react-router-dom'
 import { Card } from '../components/ui/Card'
 import { Button } from '../components/ui/Button'
 import { Badge } from '../components/ui/Badge'
@@ -9,11 +10,12 @@ import { EmptyState } from '../components/ui/EmptyState'
 import { StatusDot } from '../components/ui/StatusDot'
 import { Tooltip } from '../components/ui/Tooltip'
 import { cn, formatDuration, formatRelativeTime } from '../lib/utils'
-import { getSchedules, createSchedule, deleteSchedule, runSchedule, getScheduleRuns, getSchedulerDag } from '../api/client'
+import { getSchedules, createSchedule, updateSchedule, deleteSchedule, runSchedule, getScheduleRuns, getSchedulerDag } from '../api/client'
+import { useEditorStore } from '../stores/editor'
 import type { ScheduledJob, JobRun, DagNode, DagEdge } from '../types'
 import {
-  Clock, Plus, Play, Trash2, Calendar, ToggleRight,
-  Timer, History, CheckCircle2, XCircle, AlertCircle, Zap,
+  Clock, Plus, Play, Trash2, Calendar, ToggleRight, ToggleLeft,
+  Timer, History, CheckCircle2, XCircle, AlertCircle, Zap, BookOpen,
   Settings, Repeat, ArrowRight, Pause, RefreshCw,
   Database, HardDrive, Layers, Eye, Snowflake, Wrench,
   GitBranch, BarChart3, Shield, Copy, FileText, Network,
@@ -100,6 +102,7 @@ const TEMPLATES = [
 ]
 
 export function Scheduler() {
+  const location = useLocation()
   const [tab, setTab] = useState('jobs')
   const [jobs, setJobs] = useState<ScheduledJob[]>([])
   const [runs, setRuns] = useState<JobRun[]>([])
@@ -113,6 +116,22 @@ export function Scheduler() {
 
   const [dagNodes, setDagNodes] = useState<DagNode[]>([])
   const [dagEdges, setDagEdges] = useState<DagEdge[]>([])
+
+  // Auto-open create modal when navigated with SQL from SQL Editor
+  useEffect(() => {
+    const state = location.state as { sql?: string; name?: string; jobType?: string } | null
+    if (state?.sql) {
+      setForm(f => ({
+        ...f,
+        target: state.sql!,
+        name: state.name || '',
+        job_type: state.jobType || 'sql_query',
+      }))
+      setCreateOpen(true)
+      // Clear the location state so refreshing doesn't re-trigger
+      window.history.replaceState({}, '')
+    }
+  }, [location.state])
 
   const loadAll = () => {
     getSchedules().then(r => setJobs(r.schedules || [])).catch(() => {})
@@ -145,6 +164,16 @@ export function Scheduler() {
       loadAll()
     } catch (e) { toast.error((e as Error).message) }
   }
+
+  const handleToggleEnabled = async (job: ScheduledJob) => {
+    try {
+      await updateSchedule(job.id, { enabled: !job.enabled })
+      setJobs(js => js.map(j => j.id === job.id ? { ...j, enabled: !j.enabled } : j))
+      toast.success(job.enabled ? 'Job paused' : 'Job enabled')
+    } catch (e) { toast.error((e as Error).message) }
+  }
+
+  const savedQueries = useEditorStore(s => s.savedQueries)
 
   const applyTemplate = (t: typeof TEMPLATES[0]['items'][0]) => {
     setForm({
@@ -234,7 +263,8 @@ export function Scheduler() {
                       'w-full text-left rounded-xl border transition-all p-4',
                       selectedJob === job.id
                         ? 'bg-white/[0.04] border-amber-400/20'
-                        : 'bg-white/[0.02] border-white/[0.04] hover:bg-white/[0.03] hover:border-white/[0.06]'
+                        : 'bg-white/[0.02] border-white/[0.04] hover:bg-white/[0.03] hover:border-white/[0.06]',
+                      !job.enabled && 'opacity-50'
                     )}
                   >
                     <div className="flex items-center gap-4">
@@ -256,6 +286,17 @@ export function Scheduler() {
                         </div>
                       </div>
                       <div className="flex items-center gap-1 flex-shrink-0" onClick={e => e.stopPropagation()}>
+                        <Tooltip content={job.enabled ? 'Pause job' : 'Enable job'} position="top">
+                          <button
+                            onClick={() => handleToggleEnabled(job)}
+                            className="p-1.5 rounded-lg hover:bg-white/[0.04] transition-colors"
+                          >
+                            {job.enabled
+                              ? <ToggleRight className="w-5 h-5 text-amber-400" />
+                              : <ToggleLeft className="w-5 h-5 text-zinc-600" />
+                            }
+                          </button>
+                        </Tooltip>
                         <Button variant="ghost" size="sm" onClick={() => handleRun(job.id)} title="Run now"><Play className="w-3.5 h-3.5 text-emerald-400" /></Button>
                         <Button variant="ghost" size="sm" onClick={async () => {
                           await deleteSchedule(job.id)
@@ -383,7 +424,7 @@ export function Scheduler() {
                     const cfg = JOB_TYPE_CONFIG[job.job_type] || JOB_TYPE_CONFIG.etl_pipeline
                     const jRuns = runs.filter(r => r.job_name === job.name)
                     return (
-                      <Card key={job.id} padding="sm" className="hover:bg-white/[0.02] transition-colors">
+                      <Card key={job.id} padding="sm" className={cn('hover:bg-white/[0.02] transition-colors', !job.enabled && 'opacity-50')}>
                         <div className="flex items-center gap-4">
                           <div className={cn('w-10 h-10 rounded-lg border flex items-center justify-center', cfg.color)}>
                             <cfg.icon className="w-5 h-5" />
@@ -402,6 +443,11 @@ export function Scheduler() {
                             </div>
                           </div>
                           <div className="flex items-center gap-1">
+                            <Tooltip content={job.enabled ? 'Pause job' : 'Enable job'} position="top">
+                              <button onClick={() => handleToggleEnabled(job)} className="p-1.5 rounded-lg hover:bg-white/[0.04] transition-colors">
+                                {job.enabled ? <ToggleRight className="w-5 h-5 text-amber-400" /> : <ToggleLeft className="w-5 h-5 text-zinc-600" />}
+                              </button>
+                            </Tooltip>
                             <Button variant="ghost" size="sm" onClick={() => handleRun(job.id)}><Play className="w-3.5 h-3.5 text-emerald-400" /></Button>
                             <Button variant="ghost" size="sm" onClick={async () => {
                               await deleteSchedule(job.id)
@@ -677,12 +723,32 @@ export function Scheduler() {
 
           {/* Target SQL */}
           <div>
-            <label className="text-xs font-medium text-zinc-400 mb-1.5 block">
-              {form.job_type === 'materialized_view' ? 'View SQL Definition' :
-               form.job_type === 'etl_pipeline' ? 'ETL SQL (CREATE TABLE ... AS SELECT ...)' :
-               form.job_type === 'data_quality' ? 'Quality Check SQL' :
-               'Target SQL or Command'}
-            </label>
+            <div className="flex items-center justify-between mb-1.5">
+              <label className="text-xs font-medium text-zinc-400">
+                {form.job_type === 'materialized_view' ? 'View SQL Definition' :
+                 form.job_type === 'etl_pipeline' ? 'ETL SQL (CREATE TABLE ... AS SELECT ...)' :
+                 form.job_type === 'data_quality' ? 'Quality Check SQL' :
+                 'Target SQL or Command'}
+              </label>
+              {savedQueries.length > 0 && (
+                <div className="flex items-center gap-1.5">
+                  <BookOpen className="w-3 h-3 text-zinc-500" />
+                  <select
+                    className="text-2xs bg-white/[0.03] border border-white/[0.06] rounded-md px-2 py-1 text-zinc-400 outline-none focus:border-amber-400/30 cursor-pointer"
+                    value=""
+                    onChange={e => {
+                      const q = savedQueries.find(q => q.id === e.target.value)
+                      if (q) setForm(f => ({ ...f, target: q.sql, name: f.name || q.name }))
+                    }}
+                  >
+                    <option value="">Load saved query...</option>
+                    {savedQueries.map(q => (
+                      <option key={q.id} value={q.id}>{q.name}</option>
+                    ))}
+                  </select>
+                </div>
+              )}
+            </div>
             <Textarea
               value={form.target}
               onChange={e => setForm(f => ({ ...f, target: e.target.value }))}

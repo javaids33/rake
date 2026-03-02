@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react'
+import { useLocation } from 'react-router-dom'
 import { Card } from '../components/ui/Card'
 import { Button } from '../components/ui/Button'
 import { Badge } from '../components/ui/Badge'
@@ -19,6 +20,7 @@ import {
 import toast from 'react-hot-toast'
 
 export function Transforms() {
+  const location = useLocation()
   const [tab, setTab] = useState('models')
   const [transforms, setTransforms] = useState<UserTransform[]>([])
   const [selected, setSelected] = useState<string | null>(null)
@@ -36,6 +38,16 @@ export function Transforms() {
   const [dbtRunning, setDbtRunning] = useState(false)
 
   const [form, setForm] = useState({ name: '', sql: '', depends_on: '', materialization: 'view', description: '' })
+
+  // Auto-open create modal when navigated with SQL from SQL Editor
+  useEffect(() => {
+    const state = location.state as { sql?: string; name?: string } | null
+    if (state?.sql) {
+      setForm(f => ({ ...f, sql: state.sql!, name: state.name || '' }))
+      setCreateOpen(true)
+      window.history.replaceState({}, '')
+    }
+  }, [location.state])
 
   const loadAll = () => {
     getTransforms().then(r => setTransforms(r.transforms || [])).catch(() => {})

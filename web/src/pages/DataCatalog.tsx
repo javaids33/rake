@@ -58,7 +58,11 @@ export function DataCatalog() {
 
   const load = () => {
     setLoading(true)
-    getTables().then(r => setTables(r.tables || [])).catch(() => {}).finally(() => setLoading(false))
+    getTables().then(r => {
+      const raw = r.tables || []
+      const normalized: TableInfo[] = raw.map((t: string | TableInfo) => typeof t === 'string' ? { name: t } : t)
+      setTables(normalized)
+    }).catch(() => {}).finally(() => setLoading(false))
     getLineage().then(setLineage).catch(() => {})
   }
   useEffect(load, [])

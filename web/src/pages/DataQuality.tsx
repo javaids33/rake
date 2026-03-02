@@ -69,7 +69,8 @@ export function DataQuality() {
       ])
       setChecks(checksRes)
       setRules(rulesRes.rules || [])
-      const names = (tablesRes.tables || []).map(t => t.name)
+      const raw = tablesRes.tables || []
+      const names = raw.map((t: string | { name: string }) => typeof t === 'string' ? t : t.name)
       setTableNames(names)
       if (!selectedTable && names.length > 0) setSelectedTable(names[0])
       if (!ruleForm.table_name && names.length > 0) {

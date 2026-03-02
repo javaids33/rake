@@ -19,6 +19,24 @@ import {
 } from 'lucide-react'
 import toast from 'react-hot-toast'
 
+// Validation tier per connector — what level of testing is available
+const FULL_PROTOCOL_CONNECTORS = new Set([
+  'postgres', 'cockroachdb', 'yugabytedb', 'timescaledb', 'greenplum', 'redshift', 'cdc_postgres',
+])
+const TCP_CONNECTORS = new Set([
+  'mysql', 'mariadb', 'tidb', 'vitess', 'singlestore',
+  'mongodb', 'cdc_mongodb', 'cassandra', 'scylladb', 'redis',
+  'elasticsearch', 'opensearch', 'neo4j', 'influxdb', 'questdb',
+  'clickhouse', 'druid', 'pinot', 'starrocks', 'doris', 'trino', 'presto',
+  'oracle', 'sqlserver', 'mssql', 'db2', 'sap_hana', 'teradata', 'vertica',
+  'exasol', 'netezza', 'informix', 'kafka', 'minio', 'hbase',
+])
+function validationTier(id: string): { level: 'full' | 'tcp' | 'config'; label: string; color: string } {
+  if (FULL_PROTOCOL_CONNECTORS.has(id)) return { level: 'full', label: 'Full Verify', color: 'text-emerald-400 bg-emerald-400/10 border-emerald-400/20' }
+  if (TCP_CONNECTORS.has(id)) return { level: 'tcp', label: 'TCP Check', color: 'text-amber-400 bg-amber-400/10 border-amber-400/20' }
+  return { level: 'config', label: 'Config Only', color: 'text-zinc-400 bg-white/[0.04] border-white/[0.06]' }
+}
+
 // ─────────────────────────────────────────────────────
 // 100+ connectors — every source Trino & Databricks support
 // ─────────────────────────────────────────────────────
@@ -217,7 +235,7 @@ export function DataSources() {
       setTestResult(result)
       if (result.success) setWizardStep('done')
     } catch (e: any) {
-      setTestResult({ success: false, message: e.message || 'Test failed' })
+      setTestResult({ success: false, message: e.message || 'Test failed', validation_level: 'error', checks: [] })
     }
     setTesting(false)
   }
@@ -281,6 +299,8 @@ export function DataSources() {
 
   const activeCount = connections.length + s3Configs.length
   const availableCount = CONNECTOR_CATALOG.filter(c => c.status === 'available').length
+  const fullVerifyCount = CONNECTOR_CATALOG.filter(c => FULL_PROTOCOL_CONNECTORS.has(c.id)).length
+  const tcpCheckCount = CONNECTOR_CATALOG.filter(c => TCP_CONNECTORS.has(c.id)).length
 
   return (
     <div className="p-6 max-w-7xl mx-auto space-y-6 animate-fade-in">
@@ -290,7 +310,7 @@ export function DataSources() {
             <FolderInput className="w-5 h-5 text-amber-400" /> Data Sources
           </h1>
           <p className="text-xs text-zinc-500 mt-0.5">
-            {CONNECTOR_CATALOG.length} connectors across {Object.keys(CATEGORY_LABELS).length} categories — {availableCount} available, {CONNECTOR_CATALOG.length - availableCount} preview
+            {CONNECTOR_CATALOG.length} connectors — {fullVerifyCount} full verify, {tcpCheckCount} TCP check, {CONNECTOR_CATALOG.length - fullVerifyCount - tcpCheckCount} config only
           </p>
         </div>
         <div className="flex items-center gap-2">
@@ -370,6 +390,9 @@ export function DataSources() {
                             {connector.status === 'preview' && (
                               <Badge className="bg-amber-400/8 text-amber-400/70 border-amber-400/10 text-[9px] px-1 py-0">Preview</Badge>
                             )}
+                            <Badge className={cn('text-[9px] px-1 py-0', validationTier(connector.id).color)}>
+                              {validationTier(connector.id).label}
+                            </Badge>
                           </div>
                           <p className="text-2xs text-zinc-500 mt-0.5 leading-relaxed line-clamp-2">{connector.desc}</p>
                         </div>
@@ -524,19 +547,48 @@ export function DataSources() {
               {testing ? '\u23F3 Testing...' : '\uD83D\uDD0C Test Connection'}
             </button>
 
-            {/* Test result display */}
+            {/* Test result display with tiered checks */}
             {testResult && (
               <div style={{
-                padding: '10px 14px', borderRadius: 8, marginBottom: 8, fontSize: 12,
-                background: testResult.success ? 'rgba(34,197,94,0.1)' : 'rgba(239,68,68,0.1)',
-                border: `1px solid ${testResult.success ? 'rgba(34,197,94,0.3)' : 'rgba(239,68,68,0.3)'}`,
-                color: testResult.success ? '#22c55e' : '#ef4444',
+                padding: '12px 14px', borderRadius: 8, marginBottom: 8, fontSize: 12,
+                background: testResult.success ? 'rgba(34,197,94,0.06)' : 'rgba(239,68,68,0.06)',
+                border: `1px solid ${testResult.success ? 'rgba(34,197,94,0.2)' : 'rgba(239,68,68,0.2)'}`,
               }}>
-                <div style={{ fontWeight: 700, marginBottom: 4 }}>{testResult.success ? '\u2705 Connected' : '\u274C Failed'}</div>
-                <div style={{ color: '#94a3b8' }}>{testResult.message}</div>
-                {testResult.latency_ms && <div style={{ color: '#64748b', marginTop: 2 }}>Latency: {testResult.latency_ms}ms</div>}
-                {testResult.server_version && <div style={{ color: '#64748b', marginTop: 2 }}>Version: {testResult.server_version.split(' ').slice(0, 2).join(' ')}</div>}
-                {testResult.tables_found != null && <div style={{ color: '#64748b', marginTop: 2 }}>Tables found: {testResult.tables_found}</div>}
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+                  <span style={{ fontWeight: 700, color: testResult.success ? '#22c55e' : '#ef4444' }}>
+                    {testResult.success ? 'Connected' : 'Failed'}
+                  </span>
+                  <span style={{
+                    fontSize: 10, padding: '2px 6px', borderRadius: 4, fontWeight: 600, textTransform: 'uppercase',
+                    background: testResult.validation_level === 'full' ? 'rgba(34,197,94,0.15)' :
+                      testResult.validation_level === 'tcp' ? 'rgba(245,158,11,0.15)' : 'rgba(239,68,68,0.15)',
+                    color: testResult.validation_level === 'full' ? '#22c55e' :
+                      testResult.validation_level === 'tcp' ? '#f59e0b' : '#ef4444',
+                  }}>
+                    {testResult.validation_level === 'full' ? 'Full Verified' :
+                     testResult.validation_level === 'tcp' ? 'TCP Only' :
+                     testResult.validation_level === 'dns' ? 'DNS Failed' : 'Config Error'}
+                  </span>
+                  {testResult.latency_ms != null && (
+                    <span style={{ fontSize: 10, color: '#64748b', marginLeft: 'auto', fontFamily: 'monospace' }}>{testResult.latency_ms}ms</span>
+                  )}
+                </div>
+                <div style={{ color: '#94a3b8', marginBottom: 8 }}>{testResult.message}</div>
+                {testResult.server_version && <div style={{ color: '#64748b', marginBottom: 4 }}>Server: {testResult.server_version.split(' ').slice(0, 2).join(' ')}</div>}
+                {testResult.tables_found != null && <div style={{ color: '#64748b', marginBottom: 4 }}>Tables found: {testResult.tables_found}</div>}
+                {testResult.checks && testResult.checks.length > 0 && (
+                  <div style={{ borderTop: '1px solid rgba(255,255,255,0.04)', paddingTop: 8, marginTop: 4 }}>
+                    {testResult.checks.map((check, i) => (
+                      <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '2px 0', fontSize: 11 }}>
+                        <span style={{ color: check.passed ? '#22c55e' : '#ef4444', fontSize: 12 }}>
+                          {check.passed ? '\u2713' : '\u2717'}
+                        </span>
+                        <span style={{ color: '#94a3b8', width: 60, fontWeight: 500 }}>{check.name}</span>
+                        <span style={{ color: '#64748b', fontFamily: 'monospace', fontSize: 10 }}>{check.detail}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
             )}
 

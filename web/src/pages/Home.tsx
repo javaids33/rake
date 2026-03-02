@@ -38,7 +38,8 @@ export function Home() {
     getSystemInfo().then(setSystem).catch(() => {})
     getSystemResources().then(setResources).catch(() => {})
     getTables().then(r => {
-      const names = (r.tables || []).map((t: { name: string }) => t.name)
+      const raw = r.tables || []
+      const names = raw.map((t: string | { name: string }) => typeof t === 'string' ? t : t.name)
       setTableNames(names)
     }).catch(() => {})
     getQueryHistory(8).then(r => setRecentQueries(r.history || [])).catch(() => {})

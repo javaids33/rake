@@ -323,6 +323,17 @@ pub struct ConnectionTestResponse {
     pub server_version: Option<String>,
     /// Tables found (for database connections).
     pub tables_found: Option<usize>,
+    /// Validation level: "full" (protocol handshake), "tcp" (port reachable), "dns" (host resolves), "config" (fields valid)
+    pub validation_level: String,
+    /// Individual checks performed and their results.
+    pub checks: Vec<ConnectionCheck>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ConnectionCheck {
+    pub name: String,
+    pub passed: bool,
+    pub detail: String,
 }
 
 /// A single transform model in the transforms list.
@@ -664,6 +675,13 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/api/v1/sql/estimate", post(estimate_query))
         // Connection testing
         .route("/api/v1/connections/test", post(test_connection))
+        // Bootstrap (auto-connect demo services)
+        .route("/api/v1/bootstrap", post(run_bootstrap))
+        .route("/api/v1/bootstrap/status", get(bootstrap_status))
+        // Benchmarks (TPC-H)
+        .route("/api/v1/benchmarks/queries", get(list_benchmark_queries))
+        .route("/api/v1/benchmarks/run", post(run_benchmark_query))
+        .route("/api/v1/benchmarks/results", get(list_benchmark_results))
 }
 
 // ── Handlers ───────────────────────────────────────────────────────
@@ -2284,16 +2302,18 @@ async fn add_connection(
         id: id.clone(),
         name: req.name.clone(),
         conn_type: req.conn_type.clone(),
-        host: req.host,
+        host: req.host.clone(),
         port: req.port,
-        database: req.database,
-        username: req.username,
+        database: req.database.clone(),
+        username: req.username.clone(),
         status: "connected".to_string(),
         tables: tables.clone(),
         created_at: Utc::now(),
+        source: "user".to_string(),
     };
 
     // Store connection and password
+    let password_clone = req.password.clone();
     state.connections.write().await.push(entry.clone());
     state
         .connection_passwords
@@ -2302,17 +2322,61 @@ async fn add_connection(
         .insert(id.clone(), req.password);
 
     tracing::info!(
+        source = "user",
         id = %id,
         name = %req.name,
+        conn_type = %req.conn_type,
+        host = %req.host,
+        port = req.port,
+        database = %req.database,
         tables = tables.len(),
-        "Database connection established"
+        "Data source added: {} ({} tables discovered)",
+        req.name,
+        tables.len()
     );
+
+    // Auto-register all discovered tables into DataFusion as MemTables
+    let mut registered = Vec::new();
+    let params_for_reg = PgConnParams {
+        host: req.host.clone(),
+        port: req.port,
+        database: req.database.clone(),
+        username: req.username.clone(),
+        password: password_clone,
+    };
+    for table_name in &tables {
+        match postgres::fetch_table_as_arrow(&params_for_reg, table_name).await {
+            Ok(batch) => {
+                let schema = batch.schema();
+                let row_count = batch.num_rows();
+                match datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]) {
+                    Ok(mem_table) => {
+                        let df_name = format!("pg_{}", table_name);
+                        let ctx = state.ctx.read().await;
+                        match ctx.datafusion_ctx().register_table(
+                            &df_name,
+                            std::sync::Arc::new(mem_table),
+                        ) {
+                            Ok(_) => {
+                                tracing::info!(table = %df_name, rows = row_count, "Registered table into DataFusion");
+                                registered.push(df_name);
+                            }
+                            Err(e) => tracing::warn!(table = %df_name, error = %e, "Failed to register table"),
+                        }
+                    }
+                    Err(e) => tracing::warn!(table = %table_name, error = %e, "Failed to create MemTable"),
+                }
+            }
+            Err(e) => tracing::warn!(table = %table_name, error = %e, "Failed to fetch table"),
+        }
+    }
 
     Ok(Json(serde_json::json!({
         "status": "connected",
         "id": id,
         "name": req.name,
         "tables": tables,
+        "registered": registered,
     })))
 }
 
@@ -2332,10 +2396,15 @@ async fn delete_connection(
     Path(id): Path<String>,
 ) -> std::result::Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let mut connections = state.connections.write().await;
+
+    // Find the connection before removing so we can log details
+    let removed = connections.iter().find(|c| c.id == id).cloned();
+
     let initial_len = connections.len();
     connections.retain(|c| c.id != id);
 
     if connections.len() == initial_len {
+        tracing::warn!(id = %id, "Data source removal failed: not found");
         return Err((
             StatusCode::NOT_FOUND,
             Json(ErrorResponse {
@@ -2344,7 +2413,23 @@ async fn delete_connection(
         ));
     }
 
+    drop(connections);
     state.connection_passwords.write().await.remove(&id);
+
+    if let Some(conn) = &removed {
+        tracing::info!(
+            source = %conn.source,
+            id = %id,
+            name = %conn.name,
+            conn_type = %conn.conn_type,
+            host = %conn.host,
+            port = conn.port,
+            database = %conn.database,
+            tables = conn.tables.len(),
+            "Data source removed: {}",
+            conn.name
+        );
+    }
 
     Ok(Json(serde_json::json!({
         "status": "ok",
@@ -2434,6 +2519,543 @@ async fn register_external_table(
         "source_table": table_name,
         "row_count": row_count,
     })))
+}
+
+// ── Benchmark endpoints ────────────────────────────────────────────
+
+/// A TPC-H benchmark query definition.
+#[derive(Debug, Clone, Serialize)]
+pub struct BenchmarkQuery {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub sql: String,
+    pub category: String,
+}
+
+/// A stored benchmark run result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BenchmarkResult {
+    pub query_id: String,
+    pub query_name: String,
+    pub duration_ms: u128,
+    pub row_count: usize,
+    pub status: String,
+    pub error: Option<String>,
+    pub timestamp: DateTime<Utc>,
+}
+
+/// TPC-H queries adapted for the `pg_tpch_*` table names registered via bootstrap.
+fn tpch_queries() -> Vec<BenchmarkQuery> {
+    vec![
+        BenchmarkQuery {
+            id: "tpch-q1".into(),
+            name: "Q1: Pricing Summary".into(),
+            description: "Aggregates lineitem data by return flag and line status with sum/avg/count".into(),
+            category: "Aggregation".into(),
+            sql: r#"SELECT l_returnflag, l_linestatus, SUM(l_quantity) as sum_qty, SUM(l_extendedprice) as sum_base_price, SUM(l_extendedprice * (1 - l_discount)) as sum_disc_price, SUM(l_extendedprice * (1 - l_discount) * (1 + l_tax)) as sum_charge, AVG(l_quantity) as avg_qty, AVG(l_extendedprice) as avg_price, AVG(l_discount) as avg_disc, COUNT(*) as count_order FROM pg_tpch_lineitem WHERE l_shipdate <= DATE '1998-12-01' - INTERVAL '90' DAY GROUP BY l_returnflag, l_linestatus ORDER BY l_returnflag, l_linestatus"#.into(),
+        },
+        BenchmarkQuery {
+            id: "tpch-q3".into(),
+            name: "Q3: Shipping Priority".into(),
+            description: "Top 10 unshipped orders by revenue for BUILDING market segment before 1995-03-15".into(),
+            category: "Join + Filter".into(),
+            sql: r#"SELECT l_orderkey, SUM(l_extendedprice * (1 - l_discount)) as revenue, o_orderdate, o_shippriority FROM pg_tpch_customer c JOIN pg_tpch_orders o ON c.c_custkey = o.o_custkey JOIN pg_tpch_lineitem l ON l.l_orderkey = o.o_orderkey WHERE c.c_mktsegment = 'BUILDING' AND o.o_orderdate < DATE '1995-03-15' AND l.l_shipdate > DATE '1995-03-15' GROUP BY l_orderkey, o_orderdate, o_shippriority ORDER BY revenue DESC, o_orderdate LIMIT 10"#.into(),
+        },
+        BenchmarkQuery {
+            id: "tpch-q4".into(),
+            name: "Q4: Order Priority Checking".into(),
+            description: "Count orders by priority where at least one lineitem was received after commit date".into(),
+            category: "Subquery".into(),
+            sql: r#"SELECT o_orderpriority, COUNT(*) as order_count FROM pg_tpch_orders WHERE o_orderdate >= DATE '1993-07-01' AND o_orderdate < DATE '1993-10-01' AND EXISTS (SELECT * FROM pg_tpch_lineitem WHERE l_orderkey = o_orderkey AND l_commitdate < l_receiptdate) GROUP BY o_orderpriority ORDER BY o_orderpriority"#.into(),
+        },
+        BenchmarkQuery {
+            id: "tpch-q5".into(),
+            name: "Q5: Local Supplier Volume".into(),
+            description: "Revenue by nation for suppliers in ASIA region in 1994".into(),
+            category: "Multi-Join".into(),
+            sql: r#"SELECT n_name, SUM(l_extendedprice * (1 - l_discount)) as revenue FROM pg_tpch_customer c JOIN pg_tpch_orders o ON c.c_custkey = o.o_custkey JOIN pg_tpch_lineitem l ON l.l_orderkey = o.o_orderkey JOIN pg_tpch_supplier s ON l.l_suppkey = s.s_suppkey AND c.c_nationkey = s.s_nationkey JOIN pg_tpch_nation n ON s.s_nationkey = n.n_nationkey JOIN pg_tpch_region r ON n.n_regionkey = r.r_regionkey WHERE r.r_name = 'ASIA' AND o.o_orderdate >= DATE '1994-01-01' AND o.o_orderdate < DATE '1995-01-01' GROUP BY n_name ORDER BY revenue DESC"#.into(),
+        },
+        BenchmarkQuery {
+            id: "tpch-q6".into(),
+            name: "Q6: Forecasting Revenue Change".into(),
+            description: "Revenue from lineitems with discount between 5-7% and quantity < 24 in 1994".into(),
+            category: "Scan + Filter".into(),
+            sql: r#"SELECT SUM(l_extendedprice * l_discount) as revenue FROM pg_tpch_lineitem WHERE l_shipdate >= DATE '1994-01-01' AND l_shipdate < DATE '1995-01-01' AND l_discount BETWEEN 0.05 AND 0.07 AND l_quantity < 24"#.into(),
+        },
+        BenchmarkQuery {
+            id: "tpch-q9".into(),
+            name: "Q9: Product Type Profit".into(),
+            description: "Profit by nation and year for parts containing 'steel' in their name".into(),
+            category: "Complex Join".into(),
+            sql: r#"SELECT nation, o_year, SUM(amount) as sum_profit FROM (SELECT n.n_name as nation, EXTRACT(YEAR FROM o.o_orderdate) as o_year, l.l_extendedprice * (1 - l.l_discount) - ps.ps_supplycost * l.l_quantity as amount FROM pg_tpch_part p JOIN pg_tpch_lineitem l ON p.p_partkey = l.l_partkey JOIN pg_tpch_supplier s ON l.l_suppkey = s.s_suppkey JOIN pg_tpch_partsupp ps ON l.l_suppkey = ps.ps_suppkey AND l.l_partkey = ps.ps_partkey JOIN pg_tpch_orders o ON o.o_orderkey = l.l_orderkey JOIN pg_tpch_nation n ON s.s_nationkey = n.n_nationkey WHERE p.p_name LIKE '%steel%') as profit GROUP BY nation, o_year ORDER BY nation, o_year DESC"#.into(),
+        },
+        BenchmarkQuery {
+            id: "tpch-q10".into(),
+            name: "Q10: Returned Item Reporting".into(),
+            description: "Top 20 customers by lost revenue from returned items in Q4 1993".into(),
+            category: "Join + Aggregation".into(),
+            sql: r#"SELECT c.c_custkey, c.c_name, SUM(l.l_extendedprice * (1 - l.l_discount)) as revenue, c.c_acctbal, n.n_name, c.c_address, c.c_phone, c.c_comment FROM pg_tpch_customer c JOIN pg_tpch_orders o ON c.c_custkey = o.o_custkey JOIN pg_tpch_lineitem l ON l.l_orderkey = o.o_orderkey JOIN pg_tpch_nation n ON c.c_nationkey = n.n_nationkey WHERE o.o_orderdate >= DATE '1993-10-01' AND o.o_orderdate < DATE '1994-01-01' AND l.l_returnflag = 'R' GROUP BY c.c_custkey, c.c_name, c.c_acctbal, c.c_phone, n.n_name, c.c_address, c.c_comment ORDER BY revenue DESC LIMIT 20"#.into(),
+        },
+        BenchmarkQuery {
+            id: "tpch-q12".into(),
+            name: "Q12: Shipping Modes".into(),
+            description: "High-priority and low-priority order counts by shipping mode for 1994".into(),
+            category: "Case + Aggregation".into(),
+            sql: r#"SELECT l.l_shipmode, SUM(CASE WHEN o.o_orderpriority = '1-URGENT' OR o.o_orderpriority = '2-HIGH' THEN 1 ELSE 0 END) as high_line_count, SUM(CASE WHEN o.o_orderpriority <> '1-URGENT' AND o.o_orderpriority <> '2-HIGH' THEN 1 ELSE 0 END) as low_line_count FROM pg_tpch_orders o JOIN pg_tpch_lineitem l ON o.o_orderkey = l.l_orderkey WHERE l.l_shipmode IN ('MAIL', 'SHIP') AND l.l_commitdate < l.l_receiptdate AND l.l_shipdate < l.l_commitdate AND l.l_receiptdate >= DATE '1994-01-01' AND l.l_receiptdate < DATE '1995-01-01' GROUP BY l.l_shipmode ORDER BY l.l_shipmode"#.into(),
+        },
+        BenchmarkQuery {
+            id: "tpch-q13".into(),
+            name: "Q13: Customer Distribution".into(),
+            description: "Distribution of customers by their order count (excluding special requests)".into(),
+            category: "Left Join + Aggregation".into(),
+            sql: r#"SELECT c_count, COUNT(*) as custdist FROM (SELECT c.c_custkey, COUNT(o.o_orderkey) as c_count FROM pg_tpch_customer c LEFT OUTER JOIN pg_tpch_orders o ON c.c_custkey = o.o_custkey AND o.o_comment NOT LIKE '%special%requests%' GROUP BY c.c_custkey) as c_orders GROUP BY c_count ORDER BY custdist DESC, c_count DESC"#.into(),
+        },
+        BenchmarkQuery {
+            id: "tpch-q14".into(),
+            name: "Q14: Promotion Effect".into(),
+            description: "Percentage of revenue from promotional parts in December 1995".into(),
+            category: "Join + Conditional".into(),
+            sql: r#"SELECT 100.00 * SUM(CASE WHEN p.p_type LIKE 'PROMO%' THEN l.l_extendedprice * (1 - l.l_discount) ELSE 0 END) / SUM(l.l_extendedprice * (1 - l.l_discount)) as promo_revenue FROM pg_tpch_lineitem l JOIN pg_tpch_part p ON l.l_partkey = p.p_partkey WHERE l.l_shipdate >= DATE '1995-09-01' AND l.l_shipdate < DATE '1995-10-01'"#.into(),
+        },
+    ]
+}
+
+/// GET /api/v1/benchmarks/queries — list available TPC-H benchmark queries.
+async fn list_benchmark_queries() -> Json<serde_json::Value> {
+    let queries = tpch_queries();
+    Json(serde_json::json!({
+        "queries": queries,
+        "scale_factor": "SF0.01",
+        "tables": {
+            "lineitem": 60000,
+            "orders": 15000,
+            "customer": 1500,
+            "part": 2000,
+            "partsupp": 8000,
+            "supplier": 100,
+            "nation": 25,
+            "region": 5,
+        },
+    }))
+}
+
+/// Request to run a benchmark query.
+#[derive(Deserialize)]
+struct RunBenchmarkRequest {
+    /// Query ID (e.g., "tpch-q1").
+    query_id: String,
+}
+
+/// POST /api/v1/benchmarks/run — execute a TPC-H benchmark query.
+async fn run_benchmark_query(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<RunBenchmarkRequest>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let queries = tpch_queries();
+    let query = queries.iter().find(|q| q.id == req.query_id).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("Benchmark query '{}' not found", req.query_id),
+            }),
+        )
+    })?;
+
+    let start = Instant::now();
+    let ctx = state.ctx.read().await;
+    let df = ctx
+        .datafusion_ctx()
+        .sql(&query.sql)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Query planning failed: {}", e),
+                }),
+            )
+        })?;
+
+    let batches = df.collect().await.map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Query execution failed: {}", e),
+            }),
+        )
+    })?;
+    let duration_ms = start.elapsed().as_millis();
+
+    let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
+    let columns: Vec<String> = if let Some(batch) = batches.first() {
+        batch.schema().fields().iter().map(|f| f.name().clone()).collect()
+    } else {
+        vec![]
+    };
+
+    // Convert rows to JSON (limited to 100 for display)
+    let mut rows = Vec::new();
+    let mut buf = Vec::new();
+    {
+        let mut writer = arrow_json::ArrayWriter::new(&mut buf);
+        let limited: Vec<_> = batches.iter().take(5).cloned().collect();
+        for batch in &limited {
+            writer.write(batch).map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse { error: format!("JSON serialization failed: {}", e) }),
+                )
+            })?;
+        }
+        writer.finish().map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse { error: format!("JSON finish failed: {}", e) }),
+            )
+        })?;
+    }
+    if !buf.is_empty() {
+        if let Ok(parsed) = serde_json::from_slice::<Vec<serde_json::Value>>(&buf) {
+            rows = parsed.into_iter().take(100).collect();
+        }
+    }
+
+    // Store result
+    let result = BenchmarkResult {
+        query_id: query.id.clone(),
+        query_name: query.name.clone(),
+        duration_ms,
+        row_count,
+        status: "success".to_string(),
+        error: None,
+        timestamp: Utc::now(),
+    };
+    state.benchmark_results.write().await.push(result);
+
+    Ok(Json(serde_json::json!({
+        "query_id": query.id,
+        "query_name": query.name,
+        "sql": query.sql,
+        "duration_ms": duration_ms,
+        "row_count": row_count,
+        "columns": columns,
+        "rows": rows,
+        "status": "success",
+    })))
+}
+
+/// GET /api/v1/benchmarks/results — list stored benchmark results.
+async fn list_benchmark_results(
+    State(state): State<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    let results = state.benchmark_results.read().await;
+    Json(serde_json::json!({
+        "results": results.clone(),
+    }))
+}
+
+// ── Bootstrap endpoints ────────────────────────────────────────────
+
+/// Response for bootstrap status.
+#[derive(Serialize)]
+struct ServiceStatus {
+    available: bool,
+    tables: Vec<String>,
+    error: Option<String>,
+}
+
+/// Response for GET /api/v1/bootstrap/status.
+#[derive(Serialize)]
+struct BootstrapStatusResponse {
+    postgres: ServiceStatus,
+    minio: ServiceStatus,
+    demo_jobs: usize,
+    demo_pipelines: usize,
+    demo_transforms: usize,
+    registered_tables: Vec<String>,
+}
+
+/// GET /api/v1/bootstrap/status — check what demo data is available.
+async fn bootstrap_status(
+    State(state): State<Arc<AppState>>,
+) -> Json<BootstrapStatusResponse> {
+    // Check Postgres connection
+    let connections = state.connections.read().await;
+    let pg_conn = connections.iter().find(|c| c.conn_type == "postgres");
+    let postgres = match pg_conn {
+        Some(conn) => ServiceStatus {
+            available: conn.status == "connected",
+            tables: conn.tables.clone(),
+            error: None,
+        },
+        None => ServiceStatus {
+            available: false,
+            tables: vec![],
+            error: Some("No Postgres connection".to_string()),
+        },
+    };
+    drop(connections);
+
+    // Check MinIO S3 config
+    let s3_configs = state.s3_configs.read().await;
+    let minio = if s3_configs.iter().any(|c| c.name == "Local MinIO") {
+        ServiceStatus {
+            available: true,
+            tables: vec![],
+            error: None,
+        }
+    } else {
+        ServiceStatus {
+            available: false,
+            tables: vec![],
+            error: Some("No MinIO config".to_string()),
+        }
+    };
+    drop(s3_configs);
+
+    // Count demo items
+    let jobs = state.scheduled_jobs.read().await;
+    let demo_jobs = jobs.iter().filter(|j| j.tags.contains(&"demo".to_string())).count();
+    drop(jobs);
+
+    let pipelines = state.streaming_pipelines.read().await;
+    let demo_pipelines = pipelines.len();
+    drop(pipelines);
+
+    let transforms = state.user_transforms.read().await;
+    let demo_transforms = transforms.len();
+    drop(transforms);
+
+    // Get registered tables from DataFusion
+    let ctx = state.ctx.read().await;
+    let catalog = ctx.datafusion_ctx().catalog("datafusion");
+    let registered_tables = match catalog {
+        Some(cat) => {
+            match cat.schema("public") {
+                Some(schema) => schema.table_names(),
+                None => vec![],
+            }
+        }
+        None => vec![],
+    };
+
+    Json(BootstrapStatusResponse {
+        postgres,
+        minio,
+        demo_jobs,
+        demo_pipelines,
+        demo_transforms,
+        registered_tables,
+    })
+}
+
+/// POST /api/v1/bootstrap — re-run bootstrap on demand.
+async fn run_bootstrap(
+    State(state): State<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    let mut results = serde_json::Map::new();
+    let mut pg_tables_registered = Vec::new();
+
+    // Try Postgres (config via env vars, fallback to Docker defaults)
+    let pg_host = std::env::var("RUSTLAKE_PG_HOST").unwrap_or_else(|_| "localhost".to_string());
+    let pg_port: u16 = std::env::var("RUSTLAKE_PG_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(5433);
+    let pg_db = std::env::var("RUSTLAKE_PG_DB").unwrap_or_else(|_| "rustlake_demo".to_string());
+    let pg_user = std::env::var("RUSTLAKE_PG_USER").unwrap_or_else(|_| "rustlake".to_string());
+    let pg_pass = std::env::var("RUSTLAKE_PG_PASSWORD").unwrap_or_else(|_| "rustlake".to_string());
+
+    let pg_params = crate::postgres::PgConnParams {
+        host: pg_host.clone(),
+        port: pg_port,
+        database: pg_db.clone(),
+        username: pg_user.clone(),
+        password: pg_pass,
+    };
+
+    match crate::postgres::connect_and_discover(&pg_params).await {
+        Ok(tables) => {
+            let entry = ConnectionEntry {
+                id: "bootstrap-postgres".to_string(),
+                name: "Docker Postgres".to_string(),
+                conn_type: "postgres".to_string(),
+                host: pg_host,
+                port: pg_port,
+                database: pg_db,
+                username: pg_user,
+                status: "connected".to_string(),
+                tables: tables.clone(),
+                created_at: Utc::now(),
+                source: "bootstrap".to_string(),
+            };
+            let is_new = state.seed_connection(entry, "rustlake".to_string()).await;
+            if is_new {
+                tracing::info!(
+                    source = "bootstrap",
+                    conn_type = "postgres",
+                    host = "localhost",
+                    port = 5433,
+                    database = "rustlake_demo",
+                    tables = tables.len(),
+                    "Data source added: Docker Postgres ({} tables discovered)",
+                    tables.len()
+                );
+            }
+
+            // Register tables into DataFusion
+            for table_name in &tables {
+                match crate::postgres::fetch_table_as_arrow(&pg_params, table_name).await {
+                    Ok(batch) => {
+                        let schema = batch.schema();
+                        if let Ok(mem_table) = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]) {
+                            let df_name = format!("pg_{}", table_name);
+                            let ctx = state.ctx.read().await;
+                            if ctx.datafusion_ctx().register_table(&df_name, std::sync::Arc::new(mem_table)).is_ok() {
+                                pg_tables_registered.push(df_name);
+                            }
+                        }
+                    }
+                    Err(_) => {}
+                }
+            }
+            results.insert("postgres".to_string(), serde_json::json!({
+                "status": "connected",
+                "tables_discovered": tables.len(),
+                "tables_registered": pg_tables_registered,
+            }));
+        }
+        Err(e) => {
+            results.insert("postgres".to_string(), serde_json::json!({
+                "status": "unavailable",
+                "error": e,
+            }));
+        }
+    }
+
+    // Seed MinIO (config via env vars)
+    {
+        let minio_endpoint = std::env::var("RUSTLAKE_MINIO_ENDPOINT").unwrap_or_else(|_| "http://localhost:9000".to_string());
+        let minio_access = std::env::var("RUSTLAKE_MINIO_ACCESS_KEY").unwrap_or_else(|_| "rustlake".to_string());
+        let minio_secret = std::env::var("RUSTLAKE_MINIO_SECRET_KEY").unwrap_or_else(|_| "rustlake123".to_string());
+        let minio_bucket = std::env::var("RUSTLAKE_MINIO_BUCKET").unwrap_or_else(|_| "rustlake-warehouse".to_string());
+        let minio_region = std::env::var("RUSTLAKE_MINIO_REGION").unwrap_or_else(|_| "us-east-1".to_string());
+        let mut configs = state.s3_configs.write().await;
+        if !configs.iter().any(|c| c.name == "Local MinIO") {
+            configs.push(S3Config {
+                name: "Local MinIO".to_string(),
+                endpoint: minio_endpoint,
+                access_key: minio_access,
+                secret_key: minio_secret,
+                bucket: minio_bucket,
+                region: minio_region,
+                status: "configured".to_string(),
+                created_at: Utc::now(),
+            });
+            results.insert("minio".to_string(), serde_json::json!({ "status": "configured" }));
+        } else {
+            results.insert("minio".to_string(), serde_json::json!({ "status": "already_configured" }));
+        }
+    }
+
+    // Seed demo jobs
+    let demo_jobs = vec![
+        ScheduledJob {
+            id: "demo-pg-snapshot".to_string(),
+            name: "Postgres Snapshot".to_string(),
+            job_type: "sql_query".to_string(),
+            cron: "*/5 * * * *".to_string(),
+            target: "SELECT count(*) FROM pg_customers".to_string(),
+            enabled: true,
+            last_run: None, next_run: None, last_status: None,
+            created_at: Utc::now(),
+            trigger_type: "time".to_string(),
+            event_config: None,
+            cluster: Some("default".to_string()),
+            timeout_seconds: Some(60),
+            retries: 1,
+            tags: vec!["demo".to_string(), "postgres".to_string()],
+        },
+        ScheduledJob {
+            id: "demo-quality-check".to_string(),
+            name: "Data Quality Check".to_string(),
+            job_type: "quality_check".to_string(),
+            cron: "*/15 * * * *".to_string(),
+            target: "*".to_string(),
+            enabled: true,
+            last_run: None, next_run: None, last_status: None,
+            created_at: Utc::now(),
+            trigger_type: "time".to_string(),
+            event_config: None,
+            cluster: Some("default".to_string()),
+            timeout_seconds: Some(120),
+            retries: 0,
+            tags: vec!["demo".to_string(), "quality".to_string()],
+        },
+        ScheduledJob {
+            id: "demo-mv-sales".to_string(),
+            name: "MV: Sales Summary".to_string(),
+            job_type: "materialized_view".to_string(),
+            cron: "*/30 * * * *".to_string(),
+            target: "SELECT product_id, SUM(amount) as total_amount FROM pg_sales GROUP BY product_id".to_string(),
+            enabled: true,
+            last_run: None, next_run: None, last_status: None,
+            created_at: Utc::now(),
+            trigger_type: "time".to_string(),
+            event_config: None,
+            cluster: Some("default".to_string()),
+            timeout_seconds: Some(300),
+            retries: 2,
+            tags: vec!["demo".to_string(), "materialized_view".to_string()],
+        },
+    ];
+    let mut jobs_seeded = 0usize;
+    for job in demo_jobs {
+        if state.seed_scheduled_job(job).await { jobs_seeded += 1; }
+    }
+    results.insert("demo_jobs_seeded".to_string(), serde_json::json!(jobs_seeded));
+
+    // Seed demo pipeline
+    let pipeline_seeded = state.seed_pipeline(StreamingPipeline {
+        id: "demo-events-ingestion".to_string(),
+        name: "Events Ingestion".to_string(),
+        source_type: "simulated".to_string(),
+        source_config: serde_json::json!({
+            "event_types": ["click", "purchase", "page_view", "signup"],
+            "rate_per_second": 10
+        }),
+        transform_sql: Some("SELECT * WHERE event_type IN ('purchase', 'signup')".to_string()),
+        sink_table: "events_stream".to_string(),
+        status: "active".to_string(),
+        events_processed: 0,
+        created_at: Utc::now(),
+    }).await;
+    results.insert("demo_pipeline_seeded".to_string(), serde_json::json!(pipeline_seeded));
+
+    // Seed demo transforms
+    let demo_transforms = vec![
+        UserTransform {
+            name: "customer_orders".to_string(),
+            sql: "SELECT c.name, COUNT(o.id) as order_count, SUM(o.amount) as total_spent\nFROM pg_customers c\nJOIN pg_orders o ON c.id = o.customer_id\nGROUP BY c.name\nORDER BY total_spent DESC".to_string(),
+            depends_on: vec!["pg_customers".to_string(), "pg_orders".to_string()],
+            materialization: "view".to_string(),
+            description: "Customer order summary with count and total spend".to_string(),
+            created_at: Utc::now(),
+        },
+        UserTransform {
+            name: "sales_by_product".to_string(),
+            sql: "SELECT p.name as product_name, p.category,\n  COUNT(s.id) as sale_count, SUM(s.amount) as revenue\nFROM pg_products p\nJOIN pg_sales s ON p.id = s.product_id\nGROUP BY p.name, p.category\nORDER BY revenue DESC".to_string(),
+            depends_on: vec!["pg_products".to_string(), "pg_sales".to_string()],
+            materialization: "table".to_string(),
+            description: "Product sales aggregation with revenue breakdown".to_string(),
+            created_at: Utc::now(),
+        },
+    ];
+    let mut transforms_seeded = 0usize;
+    for ut in demo_transforms {
+        if state.seed_user_transform(ut).await { transforms_seeded += 1; }
+    }
+    results.insert("demo_transforms_seeded".to_string(), serde_json::json!(transforms_seeded));
+
+    Json(serde_json::Value::Object(results))
 }
 
 // ── Helpers ────────────────────────────────────────────────────────
@@ -3992,115 +4614,216 @@ async fn test_connection(
     Json(req): Json<ConnectionTestRequest>,
 ) -> Json<ConnectionTestResponse> {
     let start = Instant::now();
+    let mut checks: Vec<ConnectionCheck> = Vec::new();
 
+    // ── Check 1: Config validation ──
+    let default_port = default_port_for(&req.conn_type);
+    let port = req.port.unwrap_or(default_port);
+    let required_fields = required_fields_for(&req.conn_type);
+
+    let mut config_ok = true;
+    if req.host.is_empty() {
+        checks.push(ConnectionCheck { name: "host".into(), passed: false, detail: "Host is required".into() });
+        config_ok = false;
+    } else {
+        checks.push(ConnectionCheck { name: "host".into(), passed: true, detail: format!("{}", req.host) });
+    }
+    if port == 0 {
+        checks.push(ConnectionCheck { name: "port".into(), passed: false, detail: "Invalid port".into() });
+        config_ok = false;
+    } else {
+        checks.push(ConnectionCheck { name: "port".into(), passed: true, detail: format!("{}", port) });
+    }
+    for field in &required_fields {
+        let present = match field.as_str() {
+            "database" => req.database.as_ref().map_or(false, |s| !s.is_empty()),
+            "username" => req.username.as_ref().map_or(false, |s| !s.is_empty()),
+            _ => true,
+        };
+        checks.push(ConnectionCheck {
+            name: field.clone(),
+            passed: present,
+            detail: if present { "provided".into() } else { format!("{} is required for {}", field, req.conn_type) },
+        });
+        if !present { config_ok = false; }
+    }
+
+    if !config_ok {
+        return Json(ConnectionTestResponse {
+            success: false,
+            message: "Configuration validation failed".into(),
+            latency_ms: Some(start.elapsed().as_millis()),
+            server_version: None,
+            tables_found: None,
+            validation_level: "config".into(),
+            checks,
+        });
+    }
+
+    // ── Check 2: DNS resolution ──
+    let addr_str = format!("{}:{}", req.host, port);
+    let dns_ok = match tokio::net::lookup_host(&addr_str).await {
+        Ok(mut addrs) => {
+            if let Some(addr) = addrs.next() {
+                checks.push(ConnectionCheck { name: "dns".into(), passed: true, detail: format!("Resolved to {}", addr.ip()) });
+                true
+            } else {
+                checks.push(ConnectionCheck { name: "dns".into(), passed: false, detail: "No addresses returned".into() });
+                false
+            }
+        }
+        Err(e) => {
+            checks.push(ConnectionCheck { name: "dns".into(), passed: false, detail: format!("DNS lookup failed: {}", e) });
+            false
+        }
+    };
+
+    if !dns_ok {
+        return Json(ConnectionTestResponse {
+            success: false,
+            message: format!("Cannot resolve host '{}'", req.host),
+            latency_ms: Some(start.elapsed().as_millis()),
+            server_version: None,
+            tables_found: None,
+            validation_level: "dns".into(),
+            checks,
+        });
+    }
+
+    // ── Check 3: TCP reachability ──
+    let tcp_ok = match tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        tokio::net::TcpStream::connect(&addr_str),
+    ).await {
+        Ok(Ok(_)) => {
+            checks.push(ConnectionCheck { name: "tcp".into(), passed: true, detail: format!("Port {} is open", port) });
+            true
+        }
+        Ok(Err(e)) => {
+            checks.push(ConnectionCheck { name: "tcp".into(), passed: false, detail: format!("Port {} refused: {}", port, e) });
+            false
+        }
+        Err(_) => {
+            checks.push(ConnectionCheck { name: "tcp".into(), passed: false, detail: format!("Port {} timed out (3s)", port) });
+            false
+        }
+    };
+
+    if !tcp_ok {
+        return Json(ConnectionTestResponse {
+            success: false,
+            message: format!("Cannot reach {}:{}", req.host, port),
+            latency_ms: Some(start.elapsed().as_millis()),
+            server_version: None,
+            tables_found: None,
+            validation_level: "tcp".into(),
+            checks,
+        });
+    }
+
+    // ── Check 4: Protocol handshake (only for types we have client libraries) ──
     match req.conn_type.as_str() {
-        "postgres" | "postgresql" => {
-            let host = &req.host;
-            let port = req.port.unwrap_or(5432);
+        // All Postgres wire protocol compatible databases
+        "postgres" | "postgresql" | "cockroachdb" | "yugabytedb" | "timescaledb"
+        | "greenplum" | "cdc_postgres" | "redshift" => {
             let db = req.database.as_deref().unwrap_or("postgres");
             let user = req.username.as_deref().unwrap_or("postgres");
             let pass = req.password.as_deref().unwrap_or("");
-
-            let conn_str = format!(
-                "host={} port={} dbname={} user={} password={}",
-                host, port, db, user, pass
-            );
+            let conn_str = format!("host={} port={} dbname={} user={} password={}", req.host, port, db, user, pass);
 
             match tokio_postgres::connect(&conn_str, tokio_postgres::NoTls).await {
                 Ok((client, connection)) => {
                     tokio::spawn(async move { let _ = connection.await; });
-                    let latency = start.elapsed().as_millis();
 
-                    // Get server version
-                    let version = client
-                        .simple_query("SELECT version()")
-                        .await
-                        .ok()
-                        .and_then(|rows| {
-                            rows.into_iter().find_map(|msg| {
-                                if let tokio_postgres::SimpleQueryMessage::Row(row) = msg {
-                                    row.get(0).map(|v| v.to_string())
-                                } else {
-                                    None
-                                }
-                            })
-                        });
+                    let version = client.simple_query("SELECT version()").await.ok().and_then(|rows| {
+                        rows.into_iter().find_map(|msg| {
+                            if let tokio_postgres::SimpleQueryMessage::Row(row) = msg { row.get(0).map(|v| v.to_string()) } else { None }
+                        })
+                    });
+                    let table_count = client.simple_query("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'public'").await.ok().and_then(|rows| {
+                        rows.into_iter().find_map(|msg| {
+                            if let tokio_postgres::SimpleQueryMessage::Row(row) = msg { row.get(0).and_then(|v| v.parse::<usize>().ok()) } else { None }
+                        })
+                    });
 
-                    // Count tables
-                    let table_count = client
-                        .simple_query("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'public'")
-                        .await
-                        .ok()
-                        .and_then(|rows| {
-                            rows.into_iter().find_map(|msg| {
-                                if let tokio_postgres::SimpleQueryMessage::Row(row) = msg {
-                                    row.get(0).and_then(|v| v.parse::<usize>().ok())
-                                } else {
-                                    None
-                                }
-                            })
-                        });
+                    checks.push(ConnectionCheck { name: "protocol".into(), passed: true, detail: format!("{} (Postgres wire protocol) handshake OK", req.conn_type) });
+                    checks.push(ConnectionCheck { name: "auth".into(), passed: true, detail: format!("Authenticated as {}", user) });
 
                     Json(ConnectionTestResponse {
                         success: true,
-                        message: "Connection successful".to_string(),
-                        latency_ms: Some(latency),
+                        message: "Full connection verified".into(),
+                        latency_ms: Some(start.elapsed().as_millis()),
                         server_version: version,
                         tables_found: table_count,
+                        validation_level: "full".into(),
+                        checks,
                     })
                 }
                 Err(e) => {
+                    checks.push(ConnectionCheck { name: "protocol".into(), passed: false, detail: format!("Handshake failed: {}", e) });
                     Json(ConnectionTestResponse {
                         success: false,
-                        message: format!("Connection failed: {}", e),
+                        message: format!("{} auth failed: {}", req.conn_type, e),
                         latency_ms: Some(start.elapsed().as_millis()),
                         server_version: None,
                         tables_found: None,
+                        validation_level: "tcp".into(),
+                        checks,
                     })
                 }
             }
         }
         _ => {
-            // For non-Postgres types, attempt a basic TCP connection check
-            let host = &req.host;
-            let port = req.port.unwrap_or(80);
-            let addr = format!("{}:{}", host, port);
-
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                tokio::net::TcpStream::connect(&addr),
-            )
-            .await
-            {
-                Ok(Ok(_)) => {
-                    let latency = start.elapsed().as_millis();
-                    Json(ConnectionTestResponse {
-                        success: true,
-                        message: format!("TCP connection to {} successful", addr),
-                        latency_ms: Some(latency),
-                        server_version: None,
-                        tables_found: None,
-                    })
-                }
-                Ok(Err(e)) => {
-                    Json(ConnectionTestResponse {
-                        success: false,
-                        message: format!("Connection failed: {}", e),
-                        latency_ms: Some(start.elapsed().as_millis()),
-                        server_version: None,
-                        tables_found: None,
-                    })
-                }
-                Err(_) => {
-                    Json(ConnectionTestResponse {
-                        success: false,
-                        message: "Connection timed out (5s)".to_string(),
-                        latency_ms: Some(5000),
-                        server_version: None,
-                        tables_found: None,
-                    })
-                }
-            }
+            // No client library — TCP reachability is the best we can do
+            checks.push(ConnectionCheck {
+                name: "protocol".into(),
+                passed: false,
+                detail: format!("No {} client library — TCP reachability confirmed only", req.conn_type),
+            });
+            Json(ConnectionTestResponse {
+                success: true,
+                message: format!("Host reachable (TCP). Full {} protocol test not yet available.", req.conn_type),
+                latency_ms: Some(start.elapsed().as_millis()),
+                server_version: None,
+                tables_found: None,
+                validation_level: "tcp".into(),
+                checks,
+            })
         }
+    }
+}
+
+/// Default port for common connector types.
+fn default_port_for(conn_type: &str) -> u16 {
+    match conn_type {
+        "postgres" | "postgresql" | "cdc_postgres" => 5432,
+        "mysql" | "mariadb" => 3306,
+        "mongodb" | "cdc_mongodb" => 27017,
+        "redis" => 6379,
+        "clickhouse" => 8123,
+        "kafka" => 9092,
+        "elasticsearch" | "opensearch" => 9200,
+        "cassandra" | "scylladb" => 9042,
+        "minio" => 9000,
+        "neo4j" => 7687,
+        "cockroachdb" => 26257,
+        "mssql" | "sqlserver" => 1433,
+        "oracle" => 1521,
+        "snowflake" => 443,
+        "bigquery" | "redshift" | "databricks" | "s3" | "gcs" | "azure_blob"
+        | "salesforce" | "hubspot" | "stripe" | "shopify" | "github"
+        | "rest_api" | "graphql" => 443,
+        _ => 443,
+    }
+}
+
+/// Required fields beyond host/port for a given connector type.
+fn required_fields_for(conn_type: &str) -> Vec<String> {
+    match conn_type {
+        "postgres" | "postgresql" | "mysql" | "mariadb" | "mssql" | "sqlserver"
+        | "oracle" | "cockroachdb" | "cdc_postgres" => vec!["database".into(), "username".into()],
+        "mongodb" | "cdc_mongodb" => vec!["database".into()],
+        "clickhouse" | "neo4j" | "cassandra" | "scylladb" => vec!["username".into()],
+        _ => vec![],
     }
 }
