@@ -48,6 +48,10 @@ pub enum RustLakeError {
     #[error("TOML parse error: {0}")]
     TomlParse(#[from] toml::de::Error),
 
+    /// Error from the DuckDB OLAP engine.
+    #[error("DuckDB error: {0}")]
+    DuckDb(String),
+
     /// Catch-all for errors that don't fit other variants.
     #[error("{0}")]
     Other(String),

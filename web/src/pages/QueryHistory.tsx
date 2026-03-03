@@ -17,6 +17,7 @@ import toast from 'react-hot-toast'
 export function QueryHistory() {
   const [entries, setEntries] = useState<QueryHistoryEntry[]>([])
   const [filter, setFilter] = useState('all')
+  const [engineFilter, setEngineFilter] = useState<string>('all')
   const [search, setSearch] = useState('')
   const navigate = useNavigate()
   const { updateTabSql, activeTabId } = useEditorStore()
@@ -29,6 +30,11 @@ export function QueryHistory() {
     if (filter === 'success' && e.status !== 'success') return false
     if (filter === 'error' && e.status !== 'error') return false
     if (filter !== 'all' && filter !== 'success' && filter !== 'error' && e.query_type !== filter) return false
+    if (engineFilter !== 'all') {
+      const entryEngine = e.engine || 'DataFusion'
+      if (engineFilter === 'datafusion' && entryEngine !== 'DataFusion') return false
+      if (engineFilter === 'duckdb' && entryEngine !== 'DuckDB') return false
+    }
     if (search && !e.sql.toLowerCase().includes(search.toLowerCase())) return false
     return true
   })
@@ -89,6 +95,26 @@ export function QueryHistory() {
           active={filter}
           onChange={setFilter}
         />
+        <div className="flex gap-1 p-1 bg-navy-950/60 rounded-lg border border-white/[0.04]">
+          {[
+            { id: 'all', label: 'All Engines' },
+            { id: 'datafusion', label: 'DataFusion' },
+            { id: 'duckdb', label: 'DuckDB' },
+          ].map(eng => (
+            <button
+              key={eng.id}
+              onClick={() => setEngineFilter(eng.id)}
+              className={cn(
+                'px-3 py-1.5 text-xs font-medium rounded-md transition-all duration-200',
+                engineFilter === eng.id
+                  ? 'bg-white/[0.06] text-zinc-100 shadow-sm border border-white/[0.05]'
+                  : 'text-zinc-500 hover:text-zinc-300'
+              )}
+            >
+              {eng.label}
+            </button>
+          ))}
+        </div>
         <div className="relative flex-1 max-w-xs">
           <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-zinc-600" />
           <input
@@ -117,6 +143,9 @@ export function QueryHistory() {
                     <code className="text-xs font-mono text-zinc-300 block truncate">{entry.sql}</code>
                     <div className="flex items-center gap-2 mt-1.5">
                       <Badge className={QUERY_TYPE_COLORS[entry.query_type] || 'bg-white/[0.04] text-zinc-400 border-white/[0.06]'}>{entry.query_type}</Badge>
+                      <Badge className={(entry.engine || 'DataFusion') === 'DuckDB' ? 'bg-emerald-400/10 text-emerald-400 border-emerald-400/20' : 'bg-amber-400/10 text-amber-400 border-amber-400/20'}>
+                        {(entry.engine || 'DataFusion') === 'DuckDB' ? 'DK' : 'DF'}
+                      </Badge>
                       <span className="text-2xs font-mono text-zinc-500 flex items-center gap-1"><Zap className="w-3 h-3" />{formatDuration(entry.duration_ms)}</span>
                       <span className="text-2xs font-mono text-zinc-500 flex items-center gap-1"><Rows3 className="w-3 h-3" />{formatNumber(entry.row_count)}</span>
                       <span className="text-2xs text-zinc-600">{formatRelativeTime(entry.timestamp)}</span>

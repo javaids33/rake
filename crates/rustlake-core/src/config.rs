@@ -32,6 +32,9 @@ pub struct RustLakeConfig {
     /// Kubernetes-specific discovery settings (only used when `cluster.discovery` is `Kubernetes`).
     #[serde(default)]
     pub k8s: K8sDiscoveryConfig,
+    /// DuckDB OLAP accelerator settings.
+    #[serde(default)]
+    pub duckdb: DuckDbEngineConfig,
 }
 
 impl RustLakeConfig {
@@ -363,6 +366,36 @@ pub enum DiscoveryMethod {
 impl Default for DiscoveryMethod {
     fn default() -> Self {
         Self::Register
+    }
+}
+
+/// DuckDB OLAP accelerator configuration.
+///
+/// When enabled, heavy analytical queries (GROUP BY, JOINs, full scans) can be
+/// routed to DuckDB for execution. Both engines output Arrow RecordBatch, so
+/// the API layer is unchanged.
+///
+/// Env overrides: `RUSTLAKE_DUCKDB__ENABLED=true`, `RUSTLAKE_DUCKDB__MEMORY_LIMIT=4GB`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DuckDbEngineConfig {
+    /// Whether the DuckDB engine is enabled. Defaults to `false`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Memory limit for DuckDB (e.g., "4GB"). None means DuckDB default (80% of RAM).
+    #[serde(default)]
+    pub memory_limit: Option<String>,
+    /// Number of threads DuckDB should use. None means DuckDB default (all cores).
+    #[serde(default)]
+    pub threads: Option<usize>,
+}
+
+impl Default for DuckDbEngineConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            memory_limit: None,
+            threads: None,
+        }
     }
 }
 

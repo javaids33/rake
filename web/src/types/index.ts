@@ -7,10 +7,12 @@ export interface SqlResponse {
   duration_ms: number
   parse_ms?: number
   exec_ms?: number
+  engine: string
 }
 
 export interface SqlRequest {
   sql: string
+  engine?: string
 }
 
 export interface ColumnSchema {
@@ -61,6 +63,7 @@ export interface QueryHistoryEntry {
   timestamp: string
   status: string
   error?: string
+  engine?: string
 }
 
 export interface HealthResponse {
@@ -459,6 +462,7 @@ export interface BenchmarkResult {
   status: string
   error?: string
   timestamp: string
+  engine?: string
 }
 
 export interface BenchmarkQueriesResponse {
@@ -476,6 +480,7 @@ export interface BenchmarkRunResponse {
   columns: string[]
   rows: Record<string, unknown>[]
   status: string
+  engine?: string
 }
 
 // ── Bootstrap ───────────────────────────────────────────────────
@@ -506,4 +511,26 @@ export interface AlertRule {
   threshold: number
   channel: string
   enabled: boolean
+}
+
+// ── Engine Info ──────────────────────────────────────────────────
+export interface EngineInfo {
+  name: string
+  version: string
+  status: string
+  default: boolean
+  description: string
+}
+
+export interface EnginesResponse {
+  engines: EngineInfo[]
+}
+
+export interface BenchmarkCompareResponse {
+  query_id: string
+  query_name: string
+  datafusion: { duration_ms: number; row_count: number; status: string; error?: string }
+  duckdb: { duration_ms: number; row_count: number; status: string; error?: string }
+  speedup: number
+  winner: string
 }

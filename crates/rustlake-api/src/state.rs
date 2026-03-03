@@ -48,6 +48,13 @@ pub struct QueryHistoryEntry {
     /// Error message, if the query failed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Which engine executed this query ("DataFusion" or "DuckDB").
+    #[serde(default = "default_engine_name")]
+    pub engine: String,
+}
+
+fn default_engine_name() -> String {
+    "DataFusion".to_string()
 }
 
 /// A chat message in the feedback channel.
@@ -243,6 +250,9 @@ pub struct S3Config {
 pub struct AppState {
     /// The query engine context shared across all requests.
     pub ctx: RwLock<RustLakeContext>,
+    /// Optional DuckDB OLAP accelerator engine.
+    #[cfg(feature = "duckdb")]
+    pub duckdb_engine: Option<rustlake_engine::duckdb_engine::DuckDbEngine>,
     /// Live metrics from the Arrow Flight gRPC server (None if Flight is disabled).
     pub flight_metrics: Option<rustlake_flight::server::FlightMetrics>,
     /// Coordinator handle for cluster management (None if not a coordinator).
@@ -292,12 +302,26 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Whether DuckDB is available as an OLAP accelerator.
+    pub fn duckdb_available(&self) -> bool {
+        #[cfg(feature = "duckdb")]
+        {
+            self.duckdb_engine.is_some()
+        }
+        #[cfg(not(feature = "duckdb"))]
+        {
+            false
+        }
+    }
+
     /// Create a new AppState with an empty vector index.
     #[allow(dead_code)]
     pub fn new(ctx: RustLakeContext) -> Self {
         let embedding_generator = SimpleEmbeddingGenerator::new(128);
         Self {
             ctx: RwLock::new(ctx),
+            #[cfg(feature = "duckdb")]
+            duckdb_engine: None,
             flight_metrics: None,
             coordinator: None,
             query_history: RwLock::new(Vec::new()),
@@ -330,6 +354,8 @@ impl AppState {
         let embedding_generator = SimpleEmbeddingGenerator::new(dimensions);
         Self {
             ctx: RwLock::new(ctx),
+            #[cfg(feature = "duckdb")]
+            duckdb_engine: None,
             flight_metrics: None,
             coordinator: None,
             query_history: RwLock::new(Vec::new()),

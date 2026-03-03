@@ -5,5 +5,7 @@
 //! configuration from [`RustLakeConfig`](rustlake_core::RustLakeConfig).
 
 mod context;
+#[cfg(feature = "duckdb")]
+pub mod duckdb_engine;
 
 pub use context::RustLakeContext;

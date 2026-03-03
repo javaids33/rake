@@ -517,6 +517,54 @@ async fn bootstrap_demo_connections(state: Arc<AppState>) {
     );
 }
 
+/// Sync all registered DataFusion tables into DuckDB for OLAP acceleration.
+#[cfg(feature = "duckdb")]
+async fn sync_tables_to_duckdb(state: &AppState) {
+    let Some(ref duckdb_engine) = state.duckdb_engine else {
+        return;
+    };
+
+    let ctx = state.ctx.read().await;
+    let tables = match ctx.list_tables().await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(error = %e, "DuckDB sync: failed to list tables");
+            return;
+        }
+    };
+
+    let mut sync_data = Vec::new();
+    for table_name in &tables {
+        // Read all data from DataFusion table
+        let sql = format!("SELECT * FROM \"{}\"", table_name);
+        match ctx.datafusion_ctx().sql(&sql).await {
+            Ok(df) => match df.collect().await {
+                Ok(batches) if !batches.is_empty() => {
+                    sync_data.push((table_name.clone(), batches));
+                }
+                Ok(_) => {} // empty table, skip
+                Err(e) => {
+                    tracing::debug!(table = %table_name, error = %e, "DuckDB sync: skip table (read error)");
+                }
+            },
+            Err(e) => {
+                tracing::debug!(table = %table_name, error = %e, "DuckDB sync: skip table (sql error)");
+            }
+        }
+    }
+    drop(ctx);
+
+    let table_count = sync_data.len();
+    match duckdb_engine.sync_tables(sync_data).await {
+        Ok(synced) => {
+            tracing::info!(synced, total = table_count, "DuckDB: table sync complete");
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "DuckDB: table sync failed");
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
@@ -548,6 +596,46 @@ async fn main() -> anyhow::Result<()> {
     let vector_index = load_product_vectors();
     let mut state = AppState::with_vector_index(ctx, vector_index);
 
+    // Initialize DuckDB engine if compiled and enabled
+    #[cfg(feature = "duckdb")]
+    {
+        let duckdb_enabled = std::env::var("RUSTLAKE_DUCKDB__ENABLED")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(config.duckdb.enabled);
+
+        if duckdb_enabled {
+            let mut duckdb_config = config.duckdb.clone();
+            duckdb_config.enabled = true;
+            // Allow env overrides
+            if let Ok(mem) = std::env::var("RUSTLAKE_DUCKDB__MEMORY_LIMIT") {
+                duckdb_config.memory_limit = Some(mem);
+            }
+            if let Ok(threads) = std::env::var("RUSTLAKE_DUCKDB__THREADS") {
+                if let Ok(n) = threads.parse::<usize>() {
+                    duckdb_config.threads = Some(n);
+                }
+            }
+
+            match rustlake_engine::duckdb_engine::DuckDbEngine::new(&duckdb_config) {
+                Ok(engine) => {
+                    let version = engine.version();
+                    tracing::info!(
+                        version = %version,
+                        memory_limit = ?duckdb_config.memory_limit,
+                        threads = ?duckdb_config.threads,
+                        "DuckDB engine initialized"
+                    );
+                    state.duckdb_engine = Some(engine);
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "Failed to initialize DuckDB engine");
+                }
+            }
+        } else {
+            tracing::info!("DuckDB engine disabled — enable with RUSTLAKE_DUCKDB__ENABLED=true");
+        }
+    }
+
     let flight_metrics = FlightMetrics::default();
     state.flight_metrics = Some(flight_metrics.clone());
 
@@ -578,7 +666,15 @@ async fn main() -> anyhow::Result<()> {
     if std::env::var("RUSTLAKE_AUTO_BOOTSTRAP").unwrap_or_default() == "true" {
         let bootstrap_state = state.clone();
         tokio::spawn(async move {
-            bootstrap_demo_connections(bootstrap_state).await;
+            bootstrap_demo_connections(bootstrap_state.clone()).await;
+
+            // Sync all registered tables to DuckDB after bootstrap
+            #[cfg(feature = "duckdb")]
+            {
+                if bootstrap_state.duckdb_available() {
+                    sync_tables_to_duckdb(&bootstrap_state).await;
+                }
+            }
         });
     }
 

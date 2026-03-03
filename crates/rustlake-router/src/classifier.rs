@@ -35,10 +35,56 @@ impl std::fmt::Display for QueryType {
     }
 }
 
+/// Target execution engine for a classified query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngineTarget {
+    /// Must run on DataFusion (DDL, DML, streaming, ML extensions).
+    DataFusion,
+    /// Should run on DuckDB for optimal OLAP performance.
+    DuckDb,
+    /// Either engine works — defaults to DataFusion.
+    Either,
+}
+
+impl std::fmt::Display for EngineTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::DataFusion => write!(f, "DataFusion"),
+            Self::DuckDb => write!(f, "DuckDB"),
+            Self::Either => write!(f, "Either"),
+        }
+    }
+}
+
+/// Combined classification result with query type and recommended engine.
+#[derive(Debug, Clone)]
+pub struct ClassificationResult {
+    /// The classified query type.
+    pub query_type: QueryType,
+    /// The recommended engine target.
+    pub engine: EngineTarget,
+}
+
 /// Classifies SQL queries to route them to the appropriate execution engine.
 pub struct QueryClassifier;
 
 impl QueryClassifier {
+    /// Classify a SQL string into a QueryType and recommended engine target.
+    pub fn classify_with_engine(sql: &str) -> Result<ClassificationResult> {
+        let query_type = Self::classify(sql)?;
+        let engine = match query_type {
+            // Heavy scans, aggregations, joins → DuckDB excels
+            QueryType::Olap => EngineTarget::DuckDb,
+            // DDL/DML must go through DataFusion (owns the catalog)
+            QueryType::Ddl | QueryType::Dml => EngineTarget::DataFusion,
+            // Streaming and ML have DataFusion-specific extensions
+            QueryType::Streaming | QueryType::MachineLearning => EngineTarget::DataFusion,
+            // Interactive and Utility can run on either
+            QueryType::Interactive | QueryType::Utility => EngineTarget::Either,
+        };
+        Ok(ClassificationResult { query_type, engine })
+    }
+
     /// Classify a SQL string into a QueryType.
     pub fn classify(sql: &str) -> Result<QueryType> {
         let statements = DFParser::parse_sql(sql)

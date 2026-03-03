@@ -3,12 +3,21 @@ name = "rustlake-engine"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+duckdb = ["dep:duckdb", "dep:duckdb-ipc"]
+
 [dependencies]
+duckdb = { workspace = true, optional = true }
+# arrow-ipc at DuckDB's arrow version (v56) for the IPC bridge between arrow versions.
+# Cargo unifies this with duckdb's arrow-array/arrow-schema v56 dependencies.
+duckdb-ipc = { package = "arrow-ipc", version = "56", optional = true }
 rustlake-core = { workspace = true }
 rustlake-storage = { workspace = true }
 rustlake-catalog = { workspace = true }
 datafusion = { workspace = true }
 arrow = { workspace = true }
+arrow-ipc = { workspace = true }
 arrow-json = { workspace = true }
 arrow-cast = { workspace = true }
 object_store = { workspace = true }

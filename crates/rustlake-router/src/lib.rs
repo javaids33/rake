@@ -5,4 +5,4 @@
 
 mod classifier;
 
-pub use classifier::{QueryClassifier, QueryType};
+pub use classifier::{ClassificationResult, EngineTarget, QueryClassifier, QueryType};

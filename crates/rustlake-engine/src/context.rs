@@ -21,7 +21,16 @@ impl RustLakeContext {
         df_config = df_config.with_information_schema(true);
         df_config.options_mut().catalog.has_header = true;
 
-        let df_ctx = SessionContext::new_with_config(df_config);
+        // Configure memory pool only when explicitly set (avoids tracking overhead on small queries)
+        let df_ctx = if let Some(memory_limit) = config.engine.memory_limit {
+            let runtime_env = datafusion::execution::runtime_env::RuntimeEnvBuilder::new()
+                .with_memory_limit(memory_limit, 1.0)
+                .build_arc()
+                .map_err(|e| RustLakeError::Engine(format!("Failed to create runtime: {}", e)))?;
+            SessionContext::new_with_config_rt(df_config, runtime_env)
+        } else {
+            SessionContext::new_with_config(df_config)
+        };
 
         Ok(Self { df_ctx, config })
     }

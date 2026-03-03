@@ -7,11 +7,11 @@ import { cn, formatDuration, formatNumber, formatRelativeTime, inferFormat, FORM
 import {
   getSystemInfo, getSystemResources, getTables, getQueryHistory,
   getStreamStatus, getVectorStatus, getTransforms, getSchedules,
-  getScheduleRuns, getPipelines, getConnections,
+  getScheduleRuns, getPipelines, getConnections, getEngines,
 } from '../api/client'
 import type {
   SystemInfoResponse, SystemResourcesResponse, QueryHistoryEntry,
-  StreamingMetrics, VectorStatusResponse, JobRun,
+  StreamingMetrics, VectorStatusResponse, JobRun, EngineInfo,
 } from '../types'
 import {
   Database, Terminal, Radio, Search, Clock, Activity,
@@ -32,6 +32,7 @@ export function Home() {
   const [jobRuns, setJobRuns] = useState<JobRun[]>([])
   const [pipelineCount, setPipelineCount] = useState(0)
   const [connectionCount, setConnectionCount] = useState(0)
+  const [engineList, setEngineList] = useState<EngineInfo[]>([])
 
   useEffect(() => {
     getSystemInfo().then(setSystem).catch(() => {})
@@ -49,6 +50,7 @@ export function Home() {
     getScheduleRuns().then(r => setJobRuns(r.runs || [])).catch(() => {})
     getPipelines().then(r => setPipelineCount(r.pipelines?.length || 0)).catch(() => {})
     getConnections().then(r => setConnectionCount(r.connections?.length || 0)).catch(() => {})
+    getEngines().then(r => setEngineList(r.engines)).catch(() => {})
   }, [])
 
   // Compute alerts
@@ -65,8 +67,10 @@ export function Home() {
   const errorCount = alerts.filter(a => a.severity === 'error').length
 
   // Engine statuses
+  const duckdbRunning = engineList.some(e => e.name === 'DuckDB' && e.status === 'running')
   const engines = [
-    { label: 'SQL Engine', up: !!system, icon: Terminal, color: 'text-amber-400' },
+    { label: 'DataFusion', up: !!system, icon: Terminal, color: 'text-amber-400' },
+    { label: 'DuckDB', up: duckdbRunning, icon: Database, color: 'text-emerald-400' },
     { label: 'Streaming', up: !!streamMetrics, icon: Radio, color: 'text-cyan-400' },
     { label: 'Vector', up: (vectorStatus?.document_count ?? 0) > 0, icon: Search, color: 'text-rose-400' },
     { label: 'Transforms', up: transformCount > 0, icon: Activity, color: 'text-violet-400' },
@@ -98,7 +102,7 @@ export function Home() {
           {/* Right: status summary */}
           <div className="flex items-center gap-4">
             <div className="flex items-center gap-3 text-2xs font-mono text-zinc-500">
-              <span>{enginesUp}/4 engines</span>
+              <span>{enginesUp}/5 engines</span>
               <span className="text-zinc-700">|</span>
               <span>{tableCount} tables</span>
               <span className="text-zinc-700">|</span>
@@ -251,7 +255,7 @@ export function Home() {
           <div className="px-5 pt-3 pb-2 border-b border-amber-400/[0.04]">
             <h2 className="text-xs font-display font-semibold text-zinc-300 flex items-center gap-2">
               <Cpu className="w-3.5 h-3.5 text-amber-400/50" /> Engines
-              <span className="text-2xs font-mono text-zinc-600 ml-auto">{enginesUp}/4 active</span>
+              <span className="text-2xs font-mono text-zinc-600 ml-auto">{enginesUp}/5 active</span>
             </h2>
           </div>
           <div className="px-5 py-3 grid grid-cols-2 gap-x-6 gap-y-2">

@@ -3,6 +3,10 @@ name = "rustlake-api"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = ["duckdb"]
+duckdb = ["rustlake-engine/duckdb"]
+
 [dependencies]
 rustlake-core = { workspace = true }
 rustlake-engine = { workspace = true }

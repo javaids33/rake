@@ -36,6 +36,7 @@ object_store = { version = "0.12", features = ["aws"] }
 
 # Table formats
 deltalake = "0.24"
+duckdb = { version = "1.4", features = ["bundled", "appender-arrow"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

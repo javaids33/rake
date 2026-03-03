@@ -5,8 +5,8 @@ import { Tabs } from '../components/ui/Tabs'
 import { StatusDot } from '../components/ui/StatusDot'
 import { Tooltip } from '../components/ui/Tooltip'
 import { cn } from '../lib/utils'
-import { getSystemInfo, getFlightInfo, getClusters } from '../api/client'
-import type { SystemInfoResponse, FlightInfoResponse, AlertRule } from '../types'
+import { getSystemInfo, getFlightInfo, getClusters, getEngines } from '../api/client'
+import type { SystemInfoResponse, FlightInfoResponse, AlertRule, EngineInfo } from '../types'
 import {
   Settings as SettingsIcon, Cpu, Activity, Plane,
   Server, Network, Shield, Route, Gauge, Zap,
@@ -56,6 +56,7 @@ export function Settings() {
   const [system, setSystem] = useState<SystemInfoResponse | null>(null)
   const [flight, setFlight] = useState<FlightInfoResponse | null>(null)
   const [clusters, setClusters] = useState<Array<{ id: string; name: string; status: string; workers: number }>>([])
+  const [engines, setEngines] = useState<EngineInfo[]>([])
   const [showAdvanced, setShowAdvanced] = useState(false)
   const [alerts, setAlerts] = useState<AlertRule[]>(loadAlerts)
   const [showNewAlert, setShowNewAlert] = useState(false)
@@ -67,6 +68,7 @@ export function Settings() {
     getSystemInfo().then(setSystem).catch(() => {})
     getFlightInfo().then(setFlight).catch(() => {})
     getClusters().then(r => setClusters(r.clusters || [])).catch(() => {})
+    getEngines().then(r => setEngines(r.engines)).catch(() => {})
   }, [])
 
   useEffect(() => { saveAlerts(alerts) }, [alerts])
@@ -228,6 +230,76 @@ export function Settings() {
 
           {tab === 'flight' && (
             <>
+              <Card>
+                <h3 className="text-sm font-display font-semibold text-zinc-200 mb-4 flex items-center gap-2">
+                  <Cpu className="w-4 h-4 text-amber-400" /> Query Engines
+                </h3>
+                <div className="space-y-2 mb-5">
+                  {(() => {
+                    const df = engines.find(e => e.name === 'DataFusion')
+                    const dk = engines.find(e => e.name === 'DuckDB')
+                    const rows: Array<{ name: string; version: string; status: string; role: string }> = [
+                      { name: 'DataFusion', version: df?.version || 'v51', status: df?.status || 'running', role: 'Primary engine' },
+                      { name: 'DuckDB', version: dk?.version || '-', status: dk?.status || 'not_compiled', role: 'OLAP accelerator' },
+                    ]
+                    return (
+                      <table className="w-full text-xs">
+                        <thead>
+                          <tr className="border-b border-white/[0.04]">
+                            <th className="text-left text-zinc-500 font-medium pb-2">Name</th>
+                            <th className="text-left text-zinc-500 font-medium pb-2">Version</th>
+                            <th className="text-left text-zinc-500 font-medium pb-2">Status</th>
+                            <th className="text-left text-zinc-500 font-medium pb-2">Role</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {rows.map(r => (
+                            <tr key={r.name} className="border-b border-white/[0.02]">
+                              <td className="py-2.5 text-zinc-200 font-semibold">{r.name}</td>
+                              <td className="py-2.5 text-zinc-300 font-mono">{r.version}</td>
+                              <td className="py-2.5">
+                                <Badge className={cn(
+                                  r.status === 'running' && 'bg-emerald-400/10 text-emerald-400 border-emerald-400/20',
+                                  r.status === 'disabled' && 'bg-zinc-400/10 text-zinc-400 border-zinc-400/20',
+                                  r.status === 'not_compiled' && 'bg-red-400/10 text-red-400 border-red-400/20',
+                                )}>{r.status.replace('_', ' ')}</Badge>
+                              </td>
+                              <td className="py-2.5 text-zinc-500">{r.role}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    )
+                  })()}
+                </div>
+
+                <h4 className="text-xs font-display font-semibold text-zinc-300 mb-3 flex items-center gap-2">
+                  <Route className="w-3.5 h-3.5 text-zinc-500" /> Engine Routing Rules
+                </h4>
+                <table className="w-full text-xs">
+                  <thead>
+                    <tr className="border-b border-white/[0.04]">
+                      <th className="text-left text-zinc-500 font-medium pb-2">Query Type</th>
+                      <th className="text-left text-zinc-500 font-medium pb-2">Engine</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {[
+                      { type: 'OLAP', engine: 'DuckDB (when available)', note: true },
+                      { type: 'DDL / DML', engine: 'DataFusion', note: false },
+                      { type: 'Streaming / ML', engine: 'DataFusion', note: false },
+                      { type: 'Interactive', engine: 'Either (defaults to DataFusion)', note: false },
+                      { type: 'Utility', engine: 'Either', note: false },
+                    ].map(r => (
+                      <tr key={r.type} className="border-b border-white/[0.02]">
+                        <td className="py-2 text-zinc-200 font-mono">{r.type}</td>
+                        <td className="py-2 text-zinc-400">{r.engine}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </Card>
+
               {flight && (
                 <Card>
                   <h3 className="text-sm font-display font-semibold text-zinc-200 mb-4 flex items-center gap-2">

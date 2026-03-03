@@ -57,6 +57,7 @@ export function SqlEditorPage() {
   const [renamingTabId, setRenamingTabId] = useState<string | null>(null)
   const [renameValue, setRenameValue] = useState('')
   const [editorHeight, setEditorHeight] = useState(45) // percentage
+  const [engineChoice, setEngineChoice] = useState<string>('auto')
   const resizing = useRef(false)
   const containerRef = useRef<HTMLDivElement>(null)
   const workflowRef = useRef<HTMLDivElement>(null)
@@ -130,7 +131,7 @@ export function SqlEditorPage() {
     store.setLoading(store.activeTabId, true)
     store.setError(store.activeTabId, null)
     try {
-      const res = await executeSql(sql)
+      const res = await executeSql(sql, engineChoice)
       store.setResult(store.activeTabId, res)
     } catch (e) {
       store.setError(store.activeTabId, (e as Error).message)
@@ -138,7 +139,7 @@ export function SqlEditorPage() {
     } finally {
       store.setLoading(store.activeTabId, false)
     }
-  }, [activeTab, store])
+  }, [activeTab, store, engineChoice])
 
   const runExplain = useCallback(async () => {
     const sql = activeTab.sql.trim()
@@ -355,6 +356,15 @@ export function SqlEditorPage() {
           <Button variant="ghost" size="sm" icon={<Gauge className="w-3.5 h-3.5 text-amber-400" />} onClick={handleEstimate} loading={estimating}>
             <span className="text-amber-400">Estimate</span>
           </Button>
+          <select
+            value={engineChoice}
+            onChange={(e) => setEngineChoice(e.target.value)}
+            className="h-7 px-2 text-2xs font-medium rounded-md border border-zinc-700/50 bg-surface-3 text-zinc-300 outline-none focus:border-amber-500/50 cursor-pointer"
+          >
+            <option value="auto">Auto (recommended)</option>
+            <option value="datafusion">DataFusion</option>
+            <option value="duckdb">DuckDB</option>
+          </select>
           <Button variant="primary" size="sm" icon={<Play className="w-3.5 h-3.5" />} onClick={runQuery} loading={loading}>
             Run
           </Button>
@@ -467,6 +477,18 @@ export function SqlEditorPage() {
                       <span className="flex items-center gap-1 text-2xs font-mono text-zinc-600">
                         <Clock className="w-3 h-3" /> exec {formatDuration(result.exec_ms)}
                       </span>
+                    )}
+                    {result.engine && (
+                      <Tooltip content={`Query executed by ${result.engine} engine`} position="bottom">
+                        <span className={cn(
+                          'inline-flex items-center px-2 py-0.5 rounded-md text-2xs font-medium border',
+                          result.engine.toLowerCase() === 'duckdb'
+                            ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30'
+                            : 'bg-amber-500/10 text-amber-400 border-amber-500/30'
+                        )}>
+                          {result.engine}
+                        </span>
+                      </Tooltip>
                     )}
                   </div>
                 </div>

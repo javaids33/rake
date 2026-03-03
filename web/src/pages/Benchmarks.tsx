@@ -6,10 +6,10 @@ import { DataTable } from '../components/ui/DataTable'
 import { cn, formatDuration } from '../lib/utils'
 import {
   Timer, Play, Database, BarChart3, CheckCircle2,
-  Loader2, AlertCircle, Zap, Layers, Clock, RefreshCw,
+  Loader2, AlertCircle, Zap, Layers, Clock, RefreshCw, ArrowLeftRight,
 } from 'lucide-react'
-import { getBenchmarkQueries, runBenchmark, getBenchmarkResults, getBootstrapStatus } from '../api/client'
-import type { BenchmarkQuery, BenchmarkResult, BenchmarkRunResponse, BootstrapStatus } from '../types'
+import { getBenchmarkQueries, runBenchmark, getBenchmarkResults, getBootstrapStatus, compareBenchmark } from '../api/client'
+import type { BenchmarkQuery, BenchmarkResult, BenchmarkRunResponse, BenchmarkCompareResponse, BootstrapStatus } from '../types'
 import toast from 'react-hot-toast'
 
 const CATEGORY_COLORS: Record<string, string> = {
@@ -34,6 +34,9 @@ export function Benchmarks() {
   const [tables, setTables] = useState<Record<string, number>>({})
   const [scaleFactor, setScaleFactor] = useState('')
   const [bootstrap, setBootstrap] = useState<BootstrapStatus | null>(null)
+  const [compareResults, setCompareResults] = useState<Record<string, BenchmarkCompareResponse>>({})
+  const [comparing, setComparing] = useState<string | null>(null)
+  const [compareAll, setCompareAll] = useState(false)
 
   const fetchData = useCallback(async () => {
     try {
@@ -109,6 +112,33 @@ export function Benchmarks() {
     toast.success('All benchmarks complete')
   }
 
+  const handleCompare = async (queryId: string) => {
+    setComparing(queryId)
+    try {
+      const res = await compareBenchmark(queryId)
+      setCompareResults(prev => ({ ...prev, [queryId]: res }))
+      toast.success(`${res.query_name}: ${res.winner} wins (${res.speedup.toFixed(1)}x)`)
+    } catch (e: unknown) {
+      toast.error(`Compare failed: ${e instanceof Error ? e.message : 'Unknown error'}`)
+    } finally {
+      setComparing(null)
+    }
+  }
+
+  const handleCompareAll = async () => {
+    setCompareAll(true)
+    for (const q of queries) {
+      setComparing(q.id)
+      try {
+        const res = await compareBenchmark(q.id)
+        setCompareResults(prev => ({ ...prev, [q.id]: res }))
+      } catch { /* continue */ }
+    }
+    setComparing(null)
+    setCompareAll(false)
+    toast.success('All comparisons complete')
+  }
+
   const totalRows = Object.values(tables).reduce((a, b) => a + b, 0)
   const completedCount = queries.filter(q => results.has(q.id)).length
   const avgMs = completedCount > 0
@@ -135,6 +165,15 @@ export function Benchmarks() {
           </div>
           <div className="flex items-center gap-2">
             <Button variant="ghost" size="sm" icon={<RefreshCw className="w-3.5 h-3.5" />} onClick={fetchData}>Refresh</Button>
+            <Button
+              variant="ghost"
+              size="sm"
+              icon={compareAll ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ArrowLeftRight className="w-3.5 h-3.5" />}
+              onClick={handleCompareAll}
+              disabled={compareAll || runAll || !hasTpchTables}
+            >
+              Compare All Engines
+            </Button>
             <Button
               variant="primary"
               size="sm"
@@ -206,6 +245,8 @@ export function Benchmarks() {
             {queries.map(q => {
               const result = results.get(q.id)
               const isRunning = running === q.id
+              const isComparing = comparing === q.id
+              const compare = compareResults[q.id]
               return (
                 <Card key={q.id} padding="md" className="group">
                   <div className="flex items-start justify-between gap-4">
@@ -223,6 +264,11 @@ export function Benchmarks() {
                             {result.duration_ms}ms
                           </Badge>
                         )}
+                        {result?.engine && (
+                          <Badge className="bg-blue-400/10 text-blue-400 border-blue-400/20">
+                            {result.engine}
+                          </Badge>
+                        )}
                       </div>
                       <p className="text-2xs text-zinc-500 mb-2">{q.description}</p>
                       <details className="group/sql">
@@ -233,11 +279,41 @@ export function Benchmarks() {
                           {q.sql}
                         </pre>
                       </details>
+                      {compare && (
+                        <div className="mt-2 flex items-center gap-3 p-2 rounded-lg bg-white/[0.02] border border-white/[0.04]">
+                          <span className={cn(
+                            'text-2xs font-mono px-2 py-0.5 rounded',
+                            compare.winner === 'datafusion' ? 'bg-emerald-400/10 text-emerald-400' : 'text-zinc-400'
+                          )}>
+                            DataFusion: {compare.datafusion.duration_ms}ms
+                          </span>
+                          <span className="text-2xs text-zinc-600">|</span>
+                          <span className={cn(
+                            'text-2xs font-mono px-2 py-0.5 rounded',
+                            compare.winner === 'duckdb' ? 'bg-emerald-400/10 text-emerald-400' : 'text-zinc-400'
+                          )}>
+                            DuckDB: {compare.duckdb.duration_ms}ms
+                          </span>
+                          <span className="text-2xs text-zinc-600">|</span>
+                          <Badge className="bg-amber-400/10 text-amber-400 border-amber-400/20">
+                            Winner: {compare.winner} ({compare.speedup.toFixed(1)}x)
+                          </Badge>
+                        </div>
+                      )}
                     </div>
                     <div className="flex items-center gap-2 flex-shrink-0">
                       {result && (
                         <span className="text-2xs text-zinc-500">{result.row_count} rows</span>
                       )}
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        icon={isComparing ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <ArrowLeftRight className="w-3.5 h-3.5" />}
+                        onClick={() => handleCompare(q.id)}
+                        disabled={isComparing || isRunning || runAll || compareAll || !hasTpchTables}
+                      >
+                        {isComparing ? 'Comparing' : 'Compare'}
+                      </Button>
                       <Button
                         variant="ghost"
                         size="sm"

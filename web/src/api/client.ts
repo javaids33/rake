@@ -8,6 +8,7 @@ import type {
   SchedulerDagResponse, DbtProject, DbtModel, DbtSource, DbtRunResponse, DbtRunAllResponse,
   SystemMetricsResponse, QueryEstimateResponse, ConnectionTestRequest, ConnectionTestResponse,
   BootstrapStatus, BenchmarkQueriesResponse, BenchmarkRunResponse, BenchmarkResult,
+  EnginesResponse, BenchmarkCompareResponse,
 } from '../types'
 
 const BASE = ''
@@ -32,8 +33,8 @@ export const getFlightStatus = () => request<FlightStatusResponse>('/api/v1/flig
 export const getSystemResources = () => request<SystemResourcesResponse>('/api/v1/system/resources')
 
 // SQL Execution
-export const executeSql = (sql: string) =>
-  request<SqlResponse>('/api/v1/sql', { method: 'POST', body: JSON.stringify({ sql } as SqlRequest) })
+export const executeSql = (sql: string, engine = 'auto') =>
+  request<SqlResponse>('/api/v1/sql', { method: 'POST', body: JSON.stringify({ sql, engine } as SqlRequest) })
 
 // Tables
 export const getTables = () => request<{ tables: TableInfo[] }>('/api/v1/tables')
@@ -167,3 +168,8 @@ export const getBenchmarkQueries = () => request<BenchmarkQueriesResponse>('/api
 export const runBenchmark = (queryId: string) =>
   request<BenchmarkRunResponse>('/api/v1/benchmarks/run', { method: 'POST', body: JSON.stringify({ query_id: queryId }) })
 export const getBenchmarkResults = () => request<{ results: BenchmarkResult[] }>('/api/v1/benchmarks/results')
+export const compareBenchmark = (queryId: string) =>
+  request<BenchmarkCompareResponse>('/api/v1/benchmarks/compare', { method: 'POST', body: JSON.stringify({ query_id: queryId }) })
+
+// Engines
+export const getEngines = () => request<EnginesResponse>('/api/v1/engines')

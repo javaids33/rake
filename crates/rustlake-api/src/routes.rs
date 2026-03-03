@@ -11,7 +11,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use rustlake_router::{QueryClassifier, QueryType};
+use rustlake_router::{EngineTarget, QueryClassifier, QueryType};
 use rustlake_stream::connector::SimulatedSource;
 use rustlake_stream::StreamingMetricsSnapshot;
 use rustlake_transform::{Model, ModelConfig, SqlCompiler};
@@ -29,6 +29,13 @@ use crate::state::{
 pub struct SqlRequest {
     /// The SQL query string to execute.
     pub sql: String,
+    /// Target engine: "auto" (default), "datafusion", or "duckdb".
+    #[serde(default = "default_engine_choice")]
+    pub engine: String,
+}
+
+fn default_engine_choice() -> String {
+    "auto".to_string()
 }
 
 /// Response body for the SQL execution endpoint.
@@ -52,6 +59,8 @@ pub struct SqlResponse {
     /// Time spent executing the query (ms).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exec_ms: Option<u128>,
+    /// Which engine executed the query ("DataFusion" or "DuckDB").
+    pub engine: String,
 }
 
 /// JSON error response body returned for failed requests.
@@ -682,6 +691,9 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/api/v1/benchmarks/queries", get(list_benchmark_queries))
         .route("/api/v1/benchmarks/run", post(run_benchmark_query))
         .route("/api/v1/benchmarks/results", get(list_benchmark_results))
+        .route("/api/v1/benchmarks/compare", post(compare_benchmark))
+        // Engine info
+        .route("/api/v1/engines", get(list_engines))
 }
 
 // ── Handlers ───────────────────────────────────────────────────────
@@ -709,13 +721,18 @@ async fn execute_sql(
     let query_id = Uuid::new_v4();
     let start = Instant::now();
 
-    tracing::info!(sql = %req.sql, %query_id, "Received SQL request");
+    tracing::info!(sql = %req.sql, %query_id, engine_choice = %req.engine, "Received SQL request");
 
     // Classify the query (parse + classify timing)
     let parse_start = Instant::now();
-    let query_type = QueryClassifier::classify(&req.sql).unwrap_or(QueryType::Olap);
+    let classification = QueryClassifier::classify_with_engine(&req.sql)
+        .unwrap_or(rustlake_router::ClassificationResult {
+            query_type: QueryType::Olap,
+            engine: EngineTarget::Either,
+        });
+    let query_type = classification.query_type;
     let parse_ms = parse_start.elapsed().as_millis();
-    tracing::info!(query_type = %query_type, parse_ms, "Query classified");
+    tracing::info!(query_type = %query_type, recommended_engine = %classification.engine, parse_ms, "Query classified");
 
     // Handle CTAS: CREATE TABLE <name> AS SELECT ...
     let sql_upper = req.sql.trim().to_uppercase();
@@ -723,10 +740,18 @@ async fn execute_sql(
         return handle_ctas(state, req.sql, query_id, query_type, parse_ms, start).await;
     }
 
-    // Execute via DataFusion
+    // Determine target engine: explicit override > classifier recommendation
+    let use_duckdb = determine_use_duckdb(&state, &req.engine, &classification.engine);
+    let engine_name = if use_duckdb { "DuckDB" } else { "DataFusion" };
+
+    // Execute via the selected engine
     let exec_start = Instant::now();
-    let ctx = state.ctx.read().await;
-    let result = ctx.sql(&req.sql).await;
+    let result = if use_duckdb {
+        execute_via_duckdb(&state, &req.sql).await
+    } else {
+        let ctx = state.ctx.read().await;
+        ctx.sql(&req.sql).await.map_err(|e| e.to_string())
+    };
     let exec_ms = exec_start.elapsed().as_millis();
     let duration_ms = start.elapsed().as_millis();
 
@@ -736,9 +761,45 @@ async fn execute_sql(
     let batches = match result {
         Ok(batches) => batches,
         Err(e) => {
-            tracing::error!(error = %e, "Query execution failed");
+            // If DuckDB failed, try fallback to DataFusion
+            if use_duckdb {
+                tracing::warn!(error = %e, "DuckDB execution failed, falling back to DataFusion");
+                let fallback_start = Instant::now();
+                let ctx = state.ctx.read().await;
+                match ctx.sql(&req.sql).await {
+                    Ok(batches) => {
+                        let fallback_ms = fallback_start.elapsed().as_millis();
+                        let duration_ms = start.elapsed().as_millis();
+                        return finish_sql_response(
+                            &state, query_id, &req.sql, query_type, "DataFusion",
+                            batches, parse_ms, fallback_ms, duration_ms,
+                        ).await;
+                    }
+                    Err(fallback_err) => {
+                        tracing::error!(error = %fallback_err, "DataFusion fallback also failed");
+                        let duration_ms = start.elapsed().as_millis();
+                        state
+                            .record_query(QueryHistoryEntry {
+                                query_id,
+                                sql: req.sql.clone(),
+                                query_type: query_type.to_string(),
+                                row_count: 0,
+                                duration_ms,
+                                timestamp: Utc::now(),
+                                status: "error".to_string(),
+                                error: Some(fallback_err.to_string()),
+                                engine: "DataFusion".to_string(),
+                            })
+                            .await;
+                        return Err((
+                            StatusCode::BAD_REQUEST,
+                            Json(ErrorResponse { error: fallback_err.to_string() }),
+                        ));
+                    }
+                }
+            }
 
-            // Record failed query in history
+            tracing::error!(error = %e, "Query execution failed");
             state
                 .record_query(QueryHistoryEntry {
                     query_id,
@@ -749,26 +810,63 @@ async fn execute_sql(
                     timestamp: Utc::now(),
                     status: "error".to_string(),
                     error: Some(e.to_string()),
+                    engine: engine_name.to_string(),
                 })
                 .await;
 
             return Err((
                 StatusCode::BAD_REQUEST,
-                Json(ErrorResponse {
-                    error: e.to_string(),
-                }),
+                Json(ErrorResponse { error: e.to_string() }),
             ));
         }
     };
 
-    // Convert to JSON
+    finish_sql_response(
+        &state, query_id, &req.sql, query_type, engine_name,
+        batches, parse_ms, exec_ms, duration_ms,
+    ).await
+}
+
+/// Determine whether to use DuckDB for this query.
+fn determine_use_duckdb(state: &AppState, engine_choice: &str, recommended: &EngineTarget) -> bool {
+    if !state.duckdb_available() {
+        return false;
+    }
+    match engine_choice.to_lowercase().as_str() {
+        "duckdb" => true,
+        "datafusion" => false,
+        _ => matches!(recommended, EngineTarget::DuckDb),
+    }
+}
+
+/// Execute SQL via DuckDB engine, returning batches or error string.
+async fn execute_via_duckdb(
+    state: &AppState,
+    sql: &str,
+) -> std::result::Result<Vec<RecordBatch>, String> {
+    #[cfg(feature = "duckdb")]
+    {
+        if let Some(ref engine) = state.duckdb_engine {
+            return engine.sql(sql).await.map_err(|e| e.to_string());
+        }
+    }
+    Err("DuckDB engine not available".to_string())
+}
+
+/// Shared response builder for execute_sql (avoids duplication with fallback path).
+async fn finish_sql_response(
+    state: &AppState,
+    query_id: Uuid,
+    sql: &str,
+    query_type: QueryType,
+    engine_name: &str,
+    batches: Vec<RecordBatch>,
+    parse_ms: u128,
+    exec_ms: u128,
+    duration_ms: u128,
+) -> std::result::Result<Json<SqlResponse>, (StatusCode, Json<ErrorResponse>)> {
     let columns = if let Some(batch) = batches.first() {
-        batch
-            .schema()
-            .fields()
-            .iter()
-            .map(|f| f.name().clone())
-            .collect()
+        batch.schema().fields().iter().map(|f| f.name().clone()).collect()
     } else {
         vec![]
     };
@@ -784,17 +882,17 @@ async fn execute_sql(
 
     let row_count = rows.len();
 
-    // Record successful query in history
     state
         .record_query(QueryHistoryEntry {
             query_id,
-            sql: req.sql.clone(),
+            sql: sql.to_string(),
             query_type: query_type.to_string(),
             row_count,
             duration_ms,
             timestamp: Utc::now(),
             status: "success".to_string(),
             error: None,
+            engine: engine_name.to_string(),
         })
         .await;
 
@@ -807,6 +905,7 @@ async fn execute_sql(
         duration_ms,
         parse_ms: Some(parse_ms),
         exec_ms: Some(exec_ms),
+        engine: engine_name.to_string(),
     }))
 }
 
@@ -890,6 +989,7 @@ async fn handle_ctas(
             timestamp: Utc::now(),
             status: "success".to_string(),
             error: None,
+            engine: "DataFusion".to_string(),
         })
         .await;
 
@@ -902,6 +1002,7 @@ async fn handle_ctas(
         duration_ms,
         parse_ms: Some(parse_ms),
         exec_ms: Some(exec_ms),
+        engine: "DataFusion".to_string(),
     }))
 }
 
@@ -2543,6 +2644,7 @@ pub struct BenchmarkResult {
     pub status: String,
     pub error: Option<String>,
     pub timestamp: DateTime<Utc>,
+    pub engine: String,
 }
 
 /// TPC-H queries adapted for the `pg_tpch_*` table names registered via bootstrap.
@@ -2730,6 +2832,7 @@ async fn run_benchmark_query(
         status: "success".to_string(),
         error: None,
         timestamp: Utc::now(),
+        engine: "DataFusion".to_string(),
     };
     state.benchmark_results.write().await.push(result);
 
@@ -2742,6 +2845,7 @@ async fn run_benchmark_query(
         "columns": columns,
         "rows": rows,
         "status": "success",
+        "engine": "DataFusion",
     })))
 }
 
@@ -4988,4 +5092,152 @@ fn required_fields_for(conn_type: &str) -> Vec<String> {
         "clickhouse" | "neo4j" | "cassandra" | "scylladb" => vec!["username".into()],
         _ => vec![],
     }
+}
+
+// ── Engine info endpoints ──────────────────────────────────────────
+
+/// GET /api/v1/engines — list available query engines with status.
+async fn list_engines(
+    State(state): State<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    let mut engines = vec![
+        serde_json::json!({
+            "name": "DataFusion",
+            "version": "51",
+            "status": "running",
+            "default": true,
+            "description": "Primary SQL engine — planning, optimization, catalog management"
+        }),
+    ];
+
+    #[cfg(feature = "duckdb")]
+    {
+        if let Some(ref engine) = state.duckdb_engine {
+            let version = engine.version();
+            engines.push(serde_json::json!({
+                "name": "DuckDB",
+                "version": version,
+                "status": "running",
+                "default": false,
+                "description": "OLAP accelerator — heavy scans, aggregations, joins"
+            }));
+        } else {
+            engines.push(serde_json::json!({
+                "name": "DuckDB",
+                "version": "1.2",
+                "status": "disabled",
+                "default": false,
+                "description": "OLAP accelerator — enable with RUSTLAKE_DUCKDB__ENABLED=true"
+            }));
+        }
+    }
+
+    #[cfg(not(feature = "duckdb"))]
+    {
+        let _ = &state; // suppress unused warning
+        engines.push(serde_json::json!({
+            "name": "DuckDB",
+            "version": "N/A",
+            "status": "not_compiled",
+            "default": false,
+            "description": "Compile with --features duckdb to enable"
+        }));
+    }
+
+    Json(serde_json::json!({ "engines": engines }))
+}
+
+/// Request for benchmark comparison.
+#[derive(Deserialize)]
+struct CompareBenchmarkRequest {
+    query_id: String,
+}
+
+/// POST /api/v1/benchmarks/compare — run a benchmark query on BOTH engines.
+async fn compare_benchmark(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CompareBenchmarkRequest>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let queries = tpch_queries();
+    let query = queries.iter().find(|q| q.id == req.query_id).ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("Benchmark query '{}' not found", req.query_id),
+            }),
+        )
+    })?;
+
+    // Run on DataFusion
+    let df_start = Instant::now();
+    let ctx = state.ctx.read().await;
+    let df_result = match ctx.datafusion_ctx().sql(&query.sql).await {
+        Ok(df) => match df.collect().await {
+            Ok(batches) => {
+                let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
+                let duration_ms = df_start.elapsed().as_millis();
+                serde_json::json!({
+                    "duration_ms": duration_ms,
+                    "row_count": row_count,
+                    "status": "success"
+                })
+            }
+            Err(e) => serde_json::json!({
+                "duration_ms": df_start.elapsed().as_millis(),
+                "row_count": 0,
+                "status": "error",
+                "error": e.to_string()
+            }),
+        },
+        Err(e) => serde_json::json!({
+            "duration_ms": df_start.elapsed().as_millis(),
+            "row_count": 0,
+            "status": "error",
+            "error": e.to_string()
+        }),
+    };
+    drop(ctx);
+
+    // Run on DuckDB
+    let duck_result = if state.duckdb_available() {
+        let duck_start = Instant::now();
+        match execute_via_duckdb(&state, &query.sql).await {
+            Ok(batches) => {
+                let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
+                let duration_ms = duck_start.elapsed().as_millis();
+                serde_json::json!({
+                    "duration_ms": duration_ms,
+                    "row_count": row_count,
+                    "status": "success"
+                })
+            }
+            Err(e) => serde_json::json!({
+                "duration_ms": duck_start.elapsed().as_millis(),
+                "row_count": 0,
+                "status": "error",
+                "error": e.to_string()
+            }),
+        }
+    } else {
+        serde_json::json!({
+            "duration_ms": 0,
+            "row_count": 0,
+            "status": "unavailable"
+        })
+    };
+
+    // Calculate speedup
+    let df_ms = df_result["duration_ms"].as_f64().unwrap_or(1.0);
+    let dk_ms = duck_result["duration_ms"].as_f64().unwrap_or(1.0);
+    let speedup = if dk_ms > 0.0 { df_ms / dk_ms } else { 1.0 };
+    let winner = if df_ms <= dk_ms { "DataFusion" } else { "DuckDB" };
+
+    Ok(Json(serde_json::json!({
+        "query_id": query.id,
+        "query_name": query.name,
+        "datafusion": df_result,
+        "duckdb": duck_result,
+        "speedup": speedup,
+        "winner": winner,
+    })))
 }
