@@ -16,6 +16,7 @@ rustlake-core = { workspace = true }
 rustlake-storage = { workspace = true }
 rustlake-catalog = { workspace = true }
 datafusion = { workspace = true }
+datafusion-federation = { workspace = true }
 arrow = { workspace = true }
 arrow-ipc = { workspace = true }
 arrow-json = { workspace = true }

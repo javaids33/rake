@@ -234,6 +234,14 @@ export interface ConnectionEntry {
   status: string
   tables: string[]
   created_at: string
+  mode: 'federated' | 'snapshot'
+}
+
+export interface ProviderInfo {
+  name: string
+  enabled: boolean
+  connections: number
+  tables: number
 }
 
 export interface S3Config {

@@ -4,8 +4,14 @@ version.workspace = true
 edition.workspace = true
 
 [features]
-default = ["duckdb"]
+default = ["duckdb", "postgres", "mysql", "sqlite"]
 duckdb = ["rustlake-engine/duckdb"]
+postgres = ["datafusion-table-providers/postgres-federation"]
+mysql = ["datafusion-table-providers/mysql-federation", "dep:mysql_async"]
+sqlite = ["datafusion-table-providers/sqlite-federation", "datafusion-table-providers/sqlite-bundled", "dep:rusqlite"]
+clickhouse = ["datafusion-table-providers/clickhouse-federation"]
+odbc = ["datafusion-table-providers/odbc-federation"]
+flight-sql-client = ["datafusion-table-providers/flight"]
 
 [dependencies]
 rustlake-core = { workspace = true }
@@ -29,11 +35,13 @@ arrow-json = { workspace = true }
 arrow-cast = { workspace = true }
 arrow-schema = { workspace = true }
 datafusion = { workspace = true }
+datafusion-table-providers = { workspace = true, optional = true }
+datafusion-federation = { workspace = true }
 anyhow = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 tokio-postgres = { workspace = true }
-rust_decimal = { workspace = true }
-mysql_async = { workspace = true }
+mysql_async = { workspace = true, optional = true }
+rusqlite = { workspace = true, optional = true }
 mongodb = { workspace = true }
 futures = { workspace = true }

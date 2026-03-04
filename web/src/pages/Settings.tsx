@@ -5,7 +5,7 @@ import { Tabs } from '../components/ui/Tabs'
 import { StatusDot } from '../components/ui/StatusDot'
 import { Tooltip } from '../components/ui/Tooltip'
 import { cn } from '../lib/utils'
-import { getSystemInfo, getFlightInfo, getClusters, getEngines } from '../api/client'
+import { getSystemInfo, getFlightInfo, getClusters, getEngines, getProviders } from '../api/client'
 import type { SystemInfoResponse, FlightInfoResponse, AlertRule, EngineInfo } from '../types'
 import {
   Settings as SettingsIcon, Cpu, Activity, Plane,
@@ -57,6 +57,7 @@ export function Settings() {
   const [flight, setFlight] = useState<FlightInfoResponse | null>(null)
   const [clusters, setClusters] = useState<Array<{ id: string; name: string; status: string; workers: number }>>([])
   const [engines, setEngines] = useState<EngineInfo[]>([])
+  const [providers, setProviders] = useState<Array<{ name: string; enabled: boolean; connections: number; tables: number }>>([])
   const [showAdvanced, setShowAdvanced] = useState(false)
   const [alerts, setAlerts] = useState<AlertRule[]>(loadAlerts)
   const [showNewAlert, setShowNewAlert] = useState(false)
@@ -69,6 +70,7 @@ export function Settings() {
     getFlightInfo().then(setFlight).catch(() => {})
     getClusters().then(r => setClusters(r.clusters || [])).catch(() => {})
     getEngines().then(r => setEngines(r.engines)).catch(() => {})
+    getProviders().then(r => setProviders(r.providers || [])).catch(() => {})
   }, [])
 
   useEffect(() => { saveAlerts(alerts) }, [alerts])
@@ -203,6 +205,44 @@ export function Settings() {
                     </Tooltip>
                   ))}
                 </div>
+              </Card>
+
+              <Card>
+                <h3 className="text-sm font-display font-semibold text-zinc-200 mb-4 flex items-center gap-2">
+                  <Database className="w-4 h-4 text-violet-400" /> Data Providers
+                </h3>
+                <p className="text-xs text-zinc-500 mb-4">Federated providers query source databases on demand with predicate and projection pushdown — no eager snapshots.</p>
+                <table className="w-full text-xs">
+                  <thead>
+                    <tr className="border-b border-white/[0.04]">
+                      <th className="text-left text-zinc-500 font-medium pb-2">Provider</th>
+                      <th className="text-left text-zinc-500 font-medium pb-2">Status</th>
+                      <th className="text-left text-zinc-500 font-medium pb-2">Connections</th>
+                      <th className="text-left text-zinc-500 font-medium pb-2">Tables</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {(providers.length > 0 ? providers : [
+                      { name: 'PostgreSQL', enabled: true, connections: 0, tables: 0 },
+                      { name: 'MySQL', enabled: true, connections: 0, tables: 0 },
+                      { name: 'SQLite', enabled: true, connections: 0, tables: 0 },
+                      { name: 'ClickHouse', enabled: false, connections: 0, tables: 0 },
+                      { name: 'ODBC', enabled: false, connections: 0, tables: 0 },
+                      { name: 'Flight SQL', enabled: false, connections: 0, tables: 0 },
+                    ]).map(p => (
+                      <tr key={p.name} className="border-b border-white/[0.02]">
+                        <td className="py-2.5 text-zinc-200 font-semibold">{p.name}</td>
+                        <td className="py-2.5">
+                          <Badge className={cn(
+                            p.enabled ? 'bg-emerald-400/10 text-emerald-400 border-emerald-400/20' : 'bg-zinc-400/10 text-zinc-400 border-zinc-400/20'
+                          )}>{p.enabled ? 'enabled' : 'disabled'}</Badge>
+                        </td>
+                        <td className="py-2.5 text-zinc-400 font-mono">{p.connections}</td>
+                        <td className="py-2.5 text-zinc-400 font-mono">{p.tables}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
               </Card>
             </>
           )}

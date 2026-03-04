@@ -250,6 +250,8 @@ pub struct S3Config {
 pub struct AppState {
     /// The query engine context shared across all requests.
     pub ctx: RwLock<RustLakeContext>,
+    /// Federated data provider registry (Postgres, MySQL, SQLite, etc.).
+    pub provider_registry: crate::providers::ProviderRegistry,
     /// Optional DuckDB OLAP accelerator engine.
     #[cfg(feature = "duckdb")]
     pub duckdb_engine: Option<rustlake_engine::duckdb_engine::DuckDbEngine>,
@@ -320,6 +322,7 @@ impl AppState {
         let embedding_generator = SimpleEmbeddingGenerator::new(128);
         Self {
             ctx: RwLock::new(ctx),
+            provider_registry: crate::providers::ProviderRegistry::new(),
             #[cfg(feature = "duckdb")]
             duckdb_engine: None,
             flight_metrics: None,
@@ -354,6 +357,7 @@ impl AppState {
         let embedding_generator = SimpleEmbeddingGenerator::new(dimensions);
         Self {
             ctx: RwLock::new(ctx),
+            provider_registry: crate::providers::ProviderRegistry::new(),
             #[cfg(feature = "duckdb")]
             duckdb_engine: None,
             flight_metrics: None,

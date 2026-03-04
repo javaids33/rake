@@ -34,6 +34,10 @@ parquet = { version = "57", features = ["arrow"] }
 datafusion = "51"
 object_store = { version = "0.12", features = ["aws"] }
 
+# Federation — live table providers with predicate/projection pushdown
+datafusion-table-providers = { version = "=0.9.3", default-features = false }
+datafusion-federation = { version = "0.4", features = ["sql"] }
+
 # Table formats
 deltalake = "0.24"
 duckdb = { version = "1.4", features = ["bundled", "appender-arrow"] }
@@ -63,13 +67,16 @@ mysql_async = { version = "0.34", default-features = false, features = ["default
 # MongoDB
 mongodb = "2.8"
 
+# SQLite (for discovery queries; bundled via datafusion-table-providers)
+rusqlite = { version = "0.37", features = ["bundled"] }
+
 # Error handling
 thiserror = "2"
 anyhow = "1"
 
 # Logging & Observability
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json", "chrono"] }
 
 # CLI
 clap = { version = "4", features = ["derive"] }

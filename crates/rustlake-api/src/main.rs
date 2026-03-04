@@ -3,7 +3,9 @@ use std::sync::Arc;
 use axum::Router;
 use tokio::net::TcpListener;
 use tower_http::cors::CorsLayer;
-use tower_http::trace::TraceLayer;
+use tower_http::trace::{DefaultOnRequest, DefaultOnResponse, TraceLayer};
+use tracing::Level;
+use tracing_subscriber::fmt::time::ChronoLocal;
 use tracing_subscriber::EnvFilter;
 
 use rustlake_core::config::NodeRole;
@@ -17,8 +19,7 @@ use rustlake_vector::embedding::SimpleEmbeddingGenerator;
 use rustlake_vector::search::VectorIndex;
 
 mod mongodb_conn;
-mod mysql_conn;
-mod postgres;
+mod providers;
 mod routes;
 mod state;
 
@@ -92,159 +93,111 @@ fn load_product_vectors() -> VectorIndex {
 /// Runs in a background task so it doesn't block server startup.
 /// Idempotent — skips items that already exist.
 async fn bootstrap_demo_connections(state: Arc<AppState>) {
-    let mut pg_tables = Vec::new();
+    // ── 1. Try connecting to Postgres (federated provider) ──────
+    #[cfg(feature = "postgres")]
+    {
+        let pg_host = std::env::var("RUSTLAKE_PG_HOST").unwrap_or_else(|_| "localhost".to_string());
+        let pg_port: u16 = std::env::var("RUSTLAKE_PG_PORT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(5433);
+        let pg_db = std::env::var("RUSTLAKE_PG_DB").unwrap_or_else(|_| "rustlake_demo".to_string());
+        let pg_user = std::env::var("RUSTLAKE_PG_USER").unwrap_or_else(|_| "rustlake".to_string());
+        let pg_pass = std::env::var("RUSTLAKE_PG_PASSWORD").unwrap_or_else(|_| "rustlake".to_string());
 
-    // ── 1. Try connecting to Postgres (config via env vars) ─────
-    let pg_host = std::env::var("RUSTLAKE_PG_HOST").unwrap_or_else(|_| "localhost".to_string());
-    let pg_port: u16 = std::env::var("RUSTLAKE_PG_PORT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(5433);
-    let pg_db = std::env::var("RUSTLAKE_PG_DB").unwrap_or_else(|_| "rustlake_demo".to_string());
-    let pg_user = std::env::var("RUSTLAKE_PG_USER").unwrap_or_else(|_| "rustlake".to_string());
-    let pg_pass = std::env::var("RUSTLAKE_PG_PASSWORD").unwrap_or_else(|_| "rustlake".to_string());
-
-    let pg_params = postgres::PgConnParams {
-        host: pg_host.clone(),
-        port: pg_port,
-        database: pg_db.clone(),
-        username: pg_user.clone(),
-        password: pg_pass.clone(),
-    };
-
-    match postgres::connect_and_discover(&pg_params).await {
-        Ok(tables) => {
-            let entry = ConnectionEntry {
-                id: "bootstrap-postgres".to_string(),
-                name: "Docker Postgres".to_string(),
-                conn_type: "postgres".to_string(),
-                host: pg_host.clone(),
-                port: pg_port,
-                database: pg_db.clone(),
-                username: pg_user.clone(),
-                status: "connected".to_string(),
-                tables: tables.clone(),
-                created_at: chrono::Utc::now(),
-                source: "bootstrap".to_string(),
-            };
-
-            if state.seed_connection(entry, "rustlake".to_string()).await {
-                tracing::info!(
-                    source = "bootstrap",
-                    conn_type = "postgres",
-                    host = "localhost",
-                    port = 5433,
-                    database = "rustlake_demo",
-                    tables = tables.len(),
-                    "Data source added: Docker Postgres ({} tables discovered)",
-                    tables.len()
-                );
+        let ctx = state.ctx.read().await;
+        match state
+            .provider_registry
+            .register_postgres(
+                "bootstrap-postgres",
+                &pg_host,
+                pg_port,
+                &pg_db,
+                &pg_user,
+                &pg_pass,
+                "pg",
+                ctx.datafusion_ctx(),
+            )
+            .await
+        {
+            Ok(tables) => {
+                drop(ctx);
+                let entry = ConnectionEntry {
+                    id: "bootstrap-postgres".to_string(),
+                    name: "Docker Postgres".to_string(),
+                    conn_type: "postgres".to_string(),
+                    host: pg_host,
+                    port: pg_port,
+                    database: pg_db,
+                    username: pg_user,
+                    status: "connected".to_string(),
+                    tables: tables.clone(),
+                    created_at: chrono::Utc::now(),
+                    source: "bootstrap".to_string(),
+                };
+                state.seed_connection(entry, pg_pass).await;
+                tracing::info!(count = tables.len(), "Bootstrap: Postgres tables registered (federated)");
             }
-
-            // Register each table into DataFusion
-            for table_name in &tables {
-                match postgres::fetch_table_as_arrow(&pg_params, table_name).await {
-                    Ok(batch) => {
-                        let row_count = batch.num_rows();
-                        let schema = batch.schema();
-                        match datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]) {
-                            Ok(mem_table) => {
-                                let df_name = format!("pg_{}", table_name);
-                                let ctx = state.ctx.read().await;
-                                match ctx.datafusion_ctx().register_table(&df_name, std::sync::Arc::new(mem_table)) {
-                                    Ok(_) => {
-                                        pg_tables.push(df_name.clone());
-                                        tracing::info!(table = %df_name, rows = row_count, "Bootstrap: registered Postgres table");
-                                    }
-                                    Err(e) => tracing::warn!(table = %df_name, error = %e, "Bootstrap: failed to register table"),
-                                }
-                            }
-                            Err(e) => tracing::warn!(table = %table_name, error = %e, "Bootstrap: failed to create MemTable"),
-                        }
-                    }
-                    Err(e) => tracing::warn!(table = %table_name, error = %e, "Bootstrap: failed to fetch table"),
-                }
+            Err(e) => {
+                drop(ctx);
+                tracing::info!(error = %e, "Bootstrap: Postgres not available (start with docker compose up -d)");
             }
-        }
-        Err(e) => {
-            tracing::info!(error = %e, "Bootstrap: Postgres not available (start with docker compose up -d)");
         }
     }
 
-    // ── 2. Try connecting to MySQL ──────────────────────────────────
-    let mysql_host = std::env::var("RUSTLAKE_MYSQL_HOST").unwrap_or_else(|_| "localhost".to_string());
-    let mysql_port: u16 = std::env::var("RUSTLAKE_MYSQL_PORT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(3307);
-    let mysql_db = std::env::var("RUSTLAKE_MYSQL_DB").unwrap_or_else(|_| "rustlake_demo".to_string());
-    let mysql_user = std::env::var("RUSTLAKE_MYSQL_USER").unwrap_or_else(|_| "rustlake".to_string());
-    let mysql_pass = std::env::var("RUSTLAKE_MYSQL_PASSWORD").unwrap_or_else(|_| "rustlake".to_string());
+    // ── 2. Try connecting to MySQL (federated provider) ─────────
+    #[cfg(feature = "mysql")]
+    {
+        let mysql_host = std::env::var("RUSTLAKE_MYSQL_HOST").unwrap_or_else(|_| "localhost".to_string());
+        let mysql_port: u16 = std::env::var("RUSTLAKE_MYSQL_PORT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3307);
+        let mysql_db = std::env::var("RUSTLAKE_MYSQL_DB").unwrap_or_else(|_| "rustlake_demo".to_string());
+        let mysql_user = std::env::var("RUSTLAKE_MYSQL_USER").unwrap_or_else(|_| "rustlake".to_string());
+        let mysql_pass = std::env::var("RUSTLAKE_MYSQL_PASSWORD").unwrap_or_else(|_| "rustlake".to_string());
 
-    let mysql_params = mysql_conn::MysqlConnParams {
-        host: mysql_host.clone(),
-        port: mysql_port,
-        database: mysql_db.clone(),
-        username: mysql_user.clone(),
-        password: mysql_pass.clone(),
-    };
-
-    match mysql_conn::connect_and_discover(&mysql_params).await {
-        Ok(tables) => {
-            let entry = ConnectionEntry {
-                id: "bootstrap-mysql".to_string(),
-                name: "Docker MySQL".to_string(),
-                conn_type: "mysql".to_string(),
-                host: mysql_host.clone(),
-                port: mysql_port,
-                database: mysql_db.clone(),
-                username: mysql_user.clone(),
-                status: "connected".to_string(),
-                tables: tables.clone(),
-                created_at: chrono::Utc::now(),
-                source: "bootstrap".to_string(),
-            };
-
-            if state.seed_connection(entry, mysql_pass.clone()).await {
-                tracing::info!(
-                    source = "bootstrap",
-                    conn_type = "mysql",
-                    tables = tables.len(),
-                    "Data source added: Docker MySQL ({} tables discovered)",
-                    tables.len()
-                );
+        let ctx = state.ctx.read().await;
+        match state
+            .provider_registry
+            .register_mysql(
+                "bootstrap-mysql",
+                &mysql_host,
+                mysql_port,
+                &mysql_db,
+                &mysql_user,
+                &mysql_pass,
+                "mysql",
+                ctx.datafusion_ctx(),
+            )
+            .await
+        {
+            Ok(tables) => {
+                drop(ctx);
+                let entry = ConnectionEntry {
+                    id: "bootstrap-mysql".to_string(),
+                    name: "Docker MySQL".to_string(),
+                    conn_type: "mysql".to_string(),
+                    host: mysql_host,
+                    port: mysql_port,
+                    database: mysql_db,
+                    username: mysql_user,
+                    status: "connected".to_string(),
+                    tables: tables.clone(),
+                    created_at: chrono::Utc::now(),
+                    source: "bootstrap".to_string(),
+                };
+                state.seed_connection(entry, mysql_pass).await;
+                tracing::info!(count = tables.len(), "Bootstrap: MySQL tables registered (federated)");
             }
-
-            // Register each table into DataFusion
-            for table_name in &tables {
-                match mysql_conn::fetch_table_as_arrow(&mysql_params, table_name).await {
-                    Ok(batch) => {
-                        let row_count = batch.num_rows();
-                        let schema = batch.schema();
-                        match datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]) {
-                            Ok(mem_table) => {
-                                let df_name = format!("mysql_{}", table_name);
-                                let ctx = state.ctx.read().await;
-                                match ctx.datafusion_ctx().register_table(&df_name, std::sync::Arc::new(mem_table)) {
-                                    Ok(_) => {
-                                        tracing::info!(table = %df_name, rows = row_count, "Bootstrap: registered MySQL table");
-                                    }
-                                    Err(e) => tracing::warn!(table = %df_name, error = %e, "Bootstrap: failed to register MySQL table"),
-                                }
-                            }
-                            Err(e) => tracing::warn!(table = %table_name, error = %e, "Bootstrap: failed to create MySQL MemTable"),
-                        }
-                    }
-                    Err(e) => tracing::warn!(table = %table_name, error = %e, "Bootstrap: failed to fetch MySQL table"),
-                }
+            Err(e) => {
+                drop(ctx);
+                tracing::info!(error = %e, "Bootstrap: MySQL not available (start with docker compose up -d)");
             }
-        }
-        Err(e) => {
-            tracing::info!(error = %e, "Bootstrap: MySQL not available (start with docker compose up -d)");
         }
     }
 
-    // ── 3. Try connecting to MongoDB ─────────────────────────────────
+    // ── 3. Try connecting to MongoDB (snapshot — no provider available) ──
     let mongo_host = std::env::var("RUSTLAKE_MONGO_HOST").unwrap_or_else(|_| "localhost".to_string());
     let mongo_port: u16 = std::env::var("RUSTLAKE_MONGO_PORT")
         .ok()
@@ -510,11 +463,7 @@ async fn bootstrap_demo_connections(state: Arc<AppState>) {
         tracing::info!(count = transforms_seeded, "Bootstrap: seeded demo transforms");
     }
 
-    tracing::info!(
-        pg_tables = pg_tables.len(),
-        "Bootstrap complete — {} Postgres tables registered",
-        pg_tables.len()
-    );
+    tracing::info!("Bootstrap complete");
 }
 
 /// Sync all registered DataFusion tables into DuckDB for OLAP acceleration.
@@ -569,8 +518,15 @@ async fn sync_tables_to_duckdb(state: &AppState) {
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                EnvFilter::new("info,rustlake_api=debug,rustlake_engine=debug,rustlake_router=debug,tower_http=debug")
+            }),
         )
+        .with_target(true)
+        .with_thread_ids(false)
+        .with_level(true)
+        .with_ansi(true)
+        .with_timer(ChronoLocal::new("%H:%M:%S%.3f".to_string()))
         .init();
 
     // Load config (from file if provided, otherwise defaults)
@@ -678,19 +634,23 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    tracing::info!("╔══════════════════════════════════════════════════════════╗");
+    tracing::info!("║              RustLake Data Platform v0.1.0               ║");
+    tracing::info!("╚══════════════════════════════════════════════════════════╝");
+    tracing::info!(role = ?node_role, bind = %bind_addr, "HTTP API server starting");
+    tracing::info!(flight = flight_enabled, duckdb = state.duckdb_available(), "Engine status");
+    tracing::debug!("RUST_LOG={}", std::env::var("RUST_LOG").unwrap_or_else(|_| "info,rustlake_*=debug,tower_http=debug".to_string()));
+
     // Build the Axum router
     let app = Router::new()
         .merge(routes::api_routes())
         .layer(CorsLayer::permissive())
-        .layer(TraceLayer::new_for_http())
+        .layer(
+            TraceLayer::new_for_http()
+                .on_request(DefaultOnRequest::new().level(Level::DEBUG))
+                .on_response(DefaultOnResponse::new().level(Level::DEBUG).latency_unit(tower_http::LatencyUnit::Millis)),
+        )
         .with_state(state);
-
-    tracing::info!(
-        role = ?node_role,
-        "RustLake API server starting on {}",
-        bind_addr
-    );
-    tracing::info!("Try: curl -X POST http://{}/api/v1/sql -H 'Content-Type: application/json' -d '{{\"sql\": \"SELECT 1 + 1 AS result\"}}'", bind_addr);
 
     let listener = TcpListener::bind(&bind_addr).await?;
 

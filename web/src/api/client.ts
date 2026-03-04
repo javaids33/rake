@@ -104,7 +104,7 @@ export const getClusters = () => request<ClusterInfo>('/api/v1/clusters')
 
 // Connections
 export const getConnections = () => request<{ connections: ConnectionEntry[] }>('/api/v1/connections')
-export const addConnection = (c: { name: string; host: string; port: number; database: string; username: string; password?: string }) =>
+export const addConnection = (c: { name: string; conn_type?: string; host: string; port: number; database: string; username: string; password?: string }) =>
   request<{ status: string }>('/api/v1/connections', { method: 'POST', body: JSON.stringify(c) })
 export const deleteConnection = (id: string) =>
   request<{ status: string }>(`/api/v1/connections/${id}`, { method: 'DELETE' })
@@ -173,3 +173,6 @@ export const compareBenchmark = (queryId: string) =>
 
 // Engines
 export const getEngines = () => request<EnginesResponse>('/api/v1/engines')
+
+// Providers
+export const getProviders = () => request<{ providers: Array<{ name: string; enabled: boolean; connections: number; tables: number }> }>('/api/v1/providers')

@@ -16,7 +16,6 @@ use rustlake_stream::connector::SimulatedSource;
 use rustlake_stream::StreamingMetricsSnapshot;
 use rustlake_transform::{Model, ModelConfig, SqlCompiler};
 
-use crate::postgres::{self, PgConnParams};
 use crate::state::{
     AppState, ChatMessage, ConnectionEntry, EventConfig, JobRunEntry, QueryHistoryEntry, S3Config,
     ScheduledJob, StreamingPipeline, UserTransform,
@@ -694,6 +693,8 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/api/v1/benchmarks/compare", post(compare_benchmark))
         // Engine info
         .route("/api/v1/engines", get(list_engines))
+        // Provider info
+        .route("/api/v1/providers", get(list_providers))
 }
 
 // ── Handlers ───────────────────────────────────────────────────────
@@ -743,6 +744,13 @@ async fn execute_sql(
     // Determine target engine: explicit override > classifier recommendation
     let use_duckdb = determine_use_duckdb(&state, &req.engine, &classification.engine);
     let engine_name = if use_duckdb { "DuckDB" } else { "DataFusion" };
+
+    tracing::debug!(
+        %query_id,
+        engine = engine_name,
+        duckdb_available = state.duckdb_available(),
+        "Engine selected"
+    );
 
     // Execute via the selected engine
     let exec_start = Instant::now();
@@ -881,6 +889,16 @@ async fn finish_sql_response(
     })?;
 
     let row_count = rows.len();
+
+    tracing::info!(
+        %query_id,
+        engine = engine_name,
+        query_type = %query_type,
+        row_count,
+        exec_ms,
+        duration_ms,
+        "Query complete"
+    );
 
     state
         .record_query(QueryHistoryEntry {
@@ -1059,6 +1077,7 @@ async fn register_table(
     };
 
     result.map_err(|e| {
+        tracing::warn!(table = %req.name, path = %req.path, error = %e, "Table registration failed");
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
@@ -1066,6 +1085,8 @@ async fn register_table(
             }),
         )
     })?;
+
+    tracing::info!(table = %req.name, path = %req.path, format, "Table registered");
 
     Ok(Json(serde_json::json!({
         "status": "ok",
@@ -2382,23 +2403,84 @@ async fn add_connection(
     State(state): State<Arc<AppState>>,
     Json(req): Json<AddConnectionRequest>,
 ) -> std::result::Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let params = PgConnParams {
-        host: req.host.clone(),
-        port: req.port,
-        database: req.database.clone(),
-        username: req.username.clone(),
-        password: req.password.clone(),
+    let id = Uuid::new_v4().to_string();
+    let prefix = match req.conn_type.as_str() {
+        "postgres" | "postgresql" => "pg",
+        "mysql" | "mariadb" => "mysql",
+        "sqlite" => "sqlite",
+        "mongodb" => "mongo",
+        _ => &req.conn_type,
     };
 
-    // Test connection and discover tables
-    let tables = postgres::connect_and_discover(&params).await.map_err(|e| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse { error: e }),
-        )
-    })?;
+    let ctx = state.ctx.read().await;
+    let df_ctx = ctx.datafusion_ctx();
 
-    let id = Uuid::new_v4().to_string();
+    // Dispatch to the appropriate federated provider or snapshot connector
+    let registered: Vec<String> = match req.conn_type.as_str() {
+        #[cfg(feature = "postgres")]
+        "postgres" | "postgresql" => {
+            state.provider_registry.register_postgres(
+                &id, &req.host, req.port, &req.database, &req.username, &req.password,
+                prefix, df_ctx,
+            ).await.map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e })))?
+        }
+        #[cfg(feature = "mysql")]
+        "mysql" | "mariadb" => {
+            state.provider_registry.register_mysql(
+                &id, &req.host, req.port, &req.database, &req.username, &req.password,
+                prefix, df_ctx,
+            ).await.map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e })))?
+        }
+        #[cfg(feature = "sqlite")]
+        "sqlite" => {
+            // For SQLite, host is the file path
+            drop(ctx);
+            let ctx2 = state.ctx.read().await;
+            state.provider_registry.register_sqlite(
+                &id, &req.host, prefix, ctx2.datafusion_ctx(),
+            ).await.map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e })))?
+        }
+        "mongodb" => {
+            drop(ctx);
+            // MongoDB: keep snapshot approach (no provider available)
+            let mongo_params = crate::mongodb_conn::MongoConnParams {
+                host: req.host.clone(),
+                port: req.port,
+                database: req.database.clone(),
+                username: req.username.clone(),
+                password: req.password.clone(),
+            };
+            let collections = crate::mongodb_conn::connect_and_discover(&mongo_params)
+                .await
+                .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e })))?;
+            let ctx2 = state.ctx.read().await;
+            let mut mongo_registered = Vec::new();
+            for coll_name in &collections {
+                if let Ok(batch) = crate::mongodb_conn::fetch_collection_as_arrow(&mongo_params, coll_name).await {
+                    let schema = batch.schema();
+                    if let Ok(mem_table) = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]) {
+                        let df_name = format!("mongo_{}", coll_name);
+                        if ctx2.datafusion_ctx().register_table(&df_name, std::sync::Arc::new(mem_table)).is_ok() {
+                            mongo_registered.push(df_name);
+                        }
+                    }
+                }
+            }
+            mongo_registered
+        }
+        other => {
+            drop(ctx);
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: format!("Unsupported connection type: {}", other),
+                }),
+            ));
+        }
+    };
+
+    let tables = registered.clone();
+
     let entry = ConnectionEntry {
         id: id.clone(),
         name: req.name.clone(),
@@ -2413,64 +2495,19 @@ async fn add_connection(
         source: "user".to_string(),
     };
 
-    // Store connection and password
-    let password_clone = req.password.clone();
-    state.connections.write().await.push(entry.clone());
-    state
-        .connection_passwords
-        .write()
-        .await
-        .insert(id.clone(), req.password);
+    state.connections.write().await.push(entry);
+    state.connection_passwords.write().await.insert(id.clone(), req.password);
 
     tracing::info!(
         source = "user",
         id = %id,
         name = %req.name,
         conn_type = %req.conn_type,
-        host = %req.host,
-        port = req.port,
-        database = %req.database,
         tables = tables.len(),
-        "Data source added: {} ({} tables discovered)",
+        "Data source added: {} ({} tables registered)",
         req.name,
         tables.len()
     );
-
-    // Auto-register all discovered tables into DataFusion as MemTables
-    let mut registered = Vec::new();
-    let params_for_reg = PgConnParams {
-        host: req.host.clone(),
-        port: req.port,
-        database: req.database.clone(),
-        username: req.username.clone(),
-        password: password_clone,
-    };
-    for table_name in &tables {
-        match postgres::fetch_table_as_arrow(&params_for_reg, table_name).await {
-            Ok(batch) => {
-                let schema = batch.schema();
-                let row_count = batch.num_rows();
-                match datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]) {
-                    Ok(mem_table) => {
-                        let df_name = format!("pg_{}", table_name);
-                        let ctx = state.ctx.read().await;
-                        match ctx.datafusion_ctx().register_table(
-                            &df_name,
-                            std::sync::Arc::new(mem_table),
-                        ) {
-                            Ok(_) => {
-                                tracing::info!(table = %df_name, rows = row_count, "Registered table into DataFusion");
-                                registered.push(df_name);
-                            }
-                            Err(e) => tracing::warn!(table = %df_name, error = %e, "Failed to register table"),
-                        }
-                    }
-                    Err(e) => tracing::warn!(table = %table_name, error = %e, "Failed to create MemTable"),
-                }
-            }
-            Err(e) => tracing::warn!(table = %table_name, error = %e, "Failed to fetch table"),
-        }
-    }
 
     Ok(Json(serde_json::json!({
         "status": "connected",
@@ -2538,12 +2575,14 @@ async fn delete_connection(
     })))
 }
 
-/// POST /api/v1/connections/:id/register/:table — snapshot a PG table into DataFusion as a MemTable.
+/// POST /api/v1/connections/:id/register/:table — register a table from an external database.
+///
+/// For federated providers (Postgres, MySQL, SQLite), creates a live `TableProvider`
+/// with predicate/projection pushdown. For MongoDB, falls back to a MemTable snapshot.
 async fn register_external_table(
     State(state): State<Arc<AppState>>,
     Path((id, table_name)): Path<(String, String)>,
 ) -> std::result::Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    // Look up connection
     let connections = state.connections.read().await;
     let conn = connections.iter().find(|c| c.id == id).ok_or_else(|| {
         (
@@ -2553,72 +2592,109 @@ async fn register_external_table(
             }),
         )
     })?;
+    let conn_type = conn.conn_type.clone();
+    let conn_host = conn.host.clone();
+    let conn_port = conn.port;
+    let conn_database = conn.database.clone();
+    let conn_username = conn.username.clone();
+    drop(connections);
 
     let passwords = state.connection_passwords.read().await;
     let password = passwords.get(&id).cloned().unwrap_or_default();
-
-    let params = PgConnParams {
-        host: conn.host.clone(),
-        port: conn.port,
-        database: conn.database.clone(),
-        username: conn.username.clone(),
-        password,
-    };
-
-    drop(connections);
     drop(passwords);
 
-    // Fetch the table as an Arrow RecordBatch
-    let batch = postgres::fetch_table_as_arrow(&params, &table_name)
-        .await
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse { error: e }),
-            )
-        })?;
+    let prefix = match conn_type.as_str() {
+        "postgres" | "postgresql" => "pg",
+        "mysql" | "mariadb" => "mysql",
+        "sqlite" => "sqlite",
+        "mongodb" => "mongo",
+        _ => &conn_type,
+    };
+    let df_table_name = format!("{}_{}", prefix, table_name);
 
-    let row_count = batch.num_rows();
-    let schema = batch.schema();
+    match conn_type.as_str() {
+        #[cfg(feature = "postgres")]
+        "postgres" | "postgresql" => {
+            use datafusion::common::TableReference;
+            use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
+            use datafusion_table_providers::postgres::PostgresTableFactory;
+            use datafusion_table_providers::util::secrets::to_secret_map;
 
-    // Register as a MemTable in DataFusion
-    let mem_table = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]).map_err(
-        |e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("Failed to create MemTable: {}", e),
-                }),
-            )
-        },
-    )?;
+            let mut opts = std::collections::HashMap::new();
+            opts.insert("host".to_string(), conn_host);
+            opts.insert("port".to_string(), conn_port.to_string());
+            opts.insert("db".to_string(), conn_database);
+            opts.insert("user".to_string(), conn_username);
+            opts.insert("pass".to_string(), password);
+            opts.insert("sslmode".to_string(), "disable".to_string());
 
-    // Prefix with "pg_" to distinguish from local tables
-    let df_table_name = format!("pg_{}", table_name);
+            let pool = Arc::new(
+                PostgresConnectionPool::new(to_secret_map(opts)).await
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: format!("Pool error: {}", e) })))?,
+            );
+            let factory = PostgresTableFactory::new(pool);
+            let provider = factory.table_provider(TableReference::partial("public", table_name.as_str())).await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: format!("Provider error: {}", e) })))?;
 
-    let ctx = state.ctx.read().await;
-    ctx.datafusion_ctx()
-        .register_table(&df_table_name, std::sync::Arc::new(mem_table))
-        .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("Failed to register table: {}", e),
-                }),
-            )
-        })?;
+            let ctx = state.ctx.read().await;
+            ctx.datafusion_ctx().register_table(&df_table_name, provider)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: format!("Register error: {}", e) })))?;
+        }
+        #[cfg(feature = "mysql")]
+        "mysql" | "mariadb" => {
+            use datafusion::common::TableReference;
+            use datafusion_table_providers::sql::db_connection_pool::mysqlpool::MySQLConnectionPool;
+            use datafusion_table_providers::mysql::MySQLTableFactory;
+            use datafusion_table_providers::util::secrets::to_secret_map;
 
-    tracing::info!(
-        table = %df_table_name,
-        rows = row_count,
-        "External Postgres table registered in DataFusion"
-    );
+            let mut opts = std::collections::HashMap::new();
+            opts.insert("host".to_string(), conn_host);
+            opts.insert("tcp_port".to_string(), conn_port.to_string());
+            opts.insert("db".to_string(), conn_database.clone());
+            opts.insert("user".to_string(), conn_username);
+            opts.insert("pass".to_string(), password);
+            opts.insert("sslmode".to_string(), "disabled".to_string());
+
+            let pool = Arc::new(
+                MySQLConnectionPool::new(to_secret_map(opts)).await
+                    .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: format!("Pool error: {}", e) })))?,
+            );
+            let factory = MySQLTableFactory::new(pool);
+            let provider = factory.table_provider(TableReference::partial(&*conn_database, table_name.as_str())).await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: format!("Provider error: {}", e) })))?;
+
+            let ctx = state.ctx.read().await;
+            ctx.datafusion_ctx().register_table(&df_table_name, provider)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: format!("Register error: {}", e) })))?;
+        }
+        "mongodb" => {
+            // MongoDB: snapshot approach (no provider available)
+            let mongo_params = crate::mongodb_conn::MongoConnParams {
+                host: conn_host, port: conn_port, database: conn_database,
+                username: conn_username, password,
+            };
+            let batch = crate::mongodb_conn::fetch_collection_as_arrow(&mongo_params, &table_name).await
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e })))?;
+            let schema = batch.schema();
+            let mem_table = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]])
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: format!("MemTable error: {}", e) })))?;
+            let ctx = state.ctx.read().await;
+            ctx.datafusion_ctx().register_table(&df_table_name, std::sync::Arc::new(mem_table))
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: format!("Register error: {}", e) })))?;
+        }
+        other => {
+            return Err((StatusCode::BAD_REQUEST, Json(ErrorResponse {
+                error: format!("Unsupported connection type for table registration: {}", other),
+            })));
+        }
+    }
+
+    tracing::info!(table = %df_table_name, "External table registered");
 
     Ok(Json(serde_json::json!({
         "status": "ok",
         "table": df_table_name,
         "source_table": table_name,
-        "row_count": row_count,
     })))
 }
 
@@ -2993,79 +3069,47 @@ async fn run_bootstrap(
     State(state): State<Arc<AppState>>,
 ) -> Json<serde_json::Value> {
     let mut results = serde_json::Map::new();
-    let mut pg_tables_registered = Vec::new();
 
-    // Try Postgres (config via env vars, fallback to Docker defaults)
-    let pg_host = std::env::var("RUSTLAKE_PG_HOST").unwrap_or_else(|_| "localhost".to_string());
-    let pg_port: u16 = std::env::var("RUSTLAKE_PG_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(5433);
-    let pg_db = std::env::var("RUSTLAKE_PG_DB").unwrap_or_else(|_| "rustlake_demo".to_string());
-    let pg_user = std::env::var("RUSTLAKE_PG_USER").unwrap_or_else(|_| "rustlake".to_string());
-    let pg_pass = std::env::var("RUSTLAKE_PG_PASSWORD").unwrap_or_else(|_| "rustlake".to_string());
+    // Try Postgres (federated provider)
+    #[cfg(feature = "postgres")]
+    {
+        let pg_host = std::env::var("RUSTLAKE_PG_HOST").unwrap_or_else(|_| "localhost".to_string());
+        let pg_port: u16 = std::env::var("RUSTLAKE_PG_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(5433);
+        let pg_db = std::env::var("RUSTLAKE_PG_DB").unwrap_or_else(|_| "rustlake_demo".to_string());
+        let pg_user = std::env::var("RUSTLAKE_PG_USER").unwrap_or_else(|_| "rustlake".to_string());
+        let pg_pass = std::env::var("RUSTLAKE_PG_PASSWORD").unwrap_or_else(|_| "rustlake".to_string());
 
-    let pg_params = crate::postgres::PgConnParams {
-        host: pg_host.clone(),
-        port: pg_port,
-        database: pg_db.clone(),
-        username: pg_user.clone(),
-        password: pg_pass,
-    };
-
-    match crate::postgres::connect_and_discover(&pg_params).await {
-        Ok(tables) => {
-            let entry = ConnectionEntry {
-                id: "bootstrap-postgres".to_string(),
-                name: "Docker Postgres".to_string(),
-                conn_type: "postgres".to_string(),
-                host: pg_host,
-                port: pg_port,
-                database: pg_db,
-                username: pg_user,
-                status: "connected".to_string(),
-                tables: tables.clone(),
-                created_at: Utc::now(),
-                source: "bootstrap".to_string(),
-            };
-            let is_new = state.seed_connection(entry, "rustlake".to_string()).await;
-            if is_new {
-                tracing::info!(
-                    source = "bootstrap",
-                    conn_type = "postgres",
-                    host = "localhost",
-                    port = 5433,
-                    database = "rustlake_demo",
-                    tables = tables.len(),
-                    "Data source added: Docker Postgres ({} tables discovered)",
-                    tables.len()
-                );
+        let ctx = state.ctx.read().await;
+        match state.provider_registry.register_postgres(
+            "bootstrap-postgres", &pg_host, pg_port, &pg_db, &pg_user, &pg_pass,
+            "pg", ctx.datafusion_ctx(),
+        ).await {
+            Ok(tables) => {
+                drop(ctx);
+                let entry = ConnectionEntry {
+                    id: "bootstrap-postgres".to_string(),
+                    name: "Docker Postgres".to_string(),
+                    conn_type: "postgres".to_string(),
+                    host: pg_host, port: pg_port, database: pg_db, username: pg_user,
+                    status: "connected".to_string(),
+                    tables: tables.clone(),
+                    created_at: Utc::now(),
+                    source: "bootstrap".to_string(),
+                };
+                state.seed_connection(entry, pg_pass).await;
+                results.insert("postgres".to_string(), serde_json::json!({
+                    "status": "connected",
+                    "mode": "federated",
+                    "tables_registered": tables,
+                }));
             }
-
-            // Register tables into DataFusion
-            for table_name in &tables {
-                match crate::postgres::fetch_table_as_arrow(&pg_params, table_name).await {
-                    Ok(batch) => {
-                        let schema = batch.schema();
-                        if let Ok(mem_table) = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]) {
-                            let df_name = format!("pg_{}", table_name);
-                            let ctx = state.ctx.read().await;
-                            if ctx.datafusion_ctx().register_table(&df_name, std::sync::Arc::new(mem_table)).is_ok() {
-                                pg_tables_registered.push(df_name);
-                            }
-                        }
-                    }
-                    Err(_) => {}
-                }
+            Err(e) => {
+                drop(ctx);
+                results.insert("postgres".to_string(), serde_json::json!({
+                    "status": "unavailable",
+                    "error": e,
+                }));
             }
-            results.insert("postgres".to_string(), serde_json::json!({
-                "status": "connected",
-                "tables_discovered": tables.len(),
-                "tables_registered": pg_tables_registered,
-            }));
-        }
-        Err(e) => {
-            results.insert("postgres".to_string(), serde_json::json!({
-                "status": "unavailable",
-                "error": e,
-            }));
         }
     }
 
@@ -3094,67 +3138,46 @@ async fn run_bootstrap(
         }
     }
 
-    // Try MySQL (config via env vars, fallback to Docker defaults)
-    let mysql_host = std::env::var("RUSTLAKE_MYSQL_HOST").unwrap_or_else(|_| "localhost".to_string());
-    let mysql_port: u16 = std::env::var("RUSTLAKE_MYSQL_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(3307);
-    let mysql_db = std::env::var("RUSTLAKE_MYSQL_DB").unwrap_or_else(|_| "rustlake_demo".to_string());
-    let mysql_user = std::env::var("RUSTLAKE_MYSQL_USER").unwrap_or_else(|_| "rustlake".to_string());
-    let mysql_pass = std::env::var("RUSTLAKE_MYSQL_PASSWORD").unwrap_or_else(|_| "rustlake".to_string());
+    // Try MySQL (federated provider)
+    #[cfg(feature = "mysql")]
+    {
+        let mysql_host = std::env::var("RUSTLAKE_MYSQL_HOST").unwrap_or_else(|_| "localhost".to_string());
+        let mysql_port: u16 = std::env::var("RUSTLAKE_MYSQL_PORT").ok().and_then(|s| s.parse().ok()).unwrap_or(3307);
+        let mysql_db = std::env::var("RUSTLAKE_MYSQL_DB").unwrap_or_else(|_| "rustlake_demo".to_string());
+        let mysql_user = std::env::var("RUSTLAKE_MYSQL_USER").unwrap_or_else(|_| "rustlake".to_string());
+        let mysql_pass = std::env::var("RUSTLAKE_MYSQL_PASSWORD").unwrap_or_else(|_| "rustlake".to_string());
 
-    let mysql_params = crate::mysql_conn::MysqlConnParams {
-        host: mysql_host.clone(),
-        port: mysql_port,
-        database: mysql_db.clone(),
-        username: mysql_user.clone(),
-        password: mysql_pass,
-    };
-
-    match crate::mysql_conn::connect_and_discover(&mysql_params).await {
-        Ok(tables) => {
-            let entry = ConnectionEntry {
-                id: "bootstrap-mysql".to_string(),
-                name: "Docker MySQL".to_string(),
-                conn_type: "mysql".to_string(),
-                host: mysql_host,
-                port: mysql_port,
-                database: mysql_db,
-                username: mysql_user,
-                status: "connected".to_string(),
-                tables: tables.clone(),
-                created_at: Utc::now(),
-                source: "bootstrap".to_string(),
-            };
-            state.seed_connection(entry, "rustlake".to_string()).await;
-
-            let mut mysql_tables_registered = Vec::new();
-            for table_name in &tables {
-                match crate::mysql_conn::fetch_table_as_arrow(&mysql_params, table_name).await {
-                    Ok(batch) => {
-                        let schema = batch.schema();
-                        if let Ok(mem_table) = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]) {
-                            let df_name = format!("mysql_{}", table_name);
-                            let ctx = state.ctx.read().await;
-                            if ctx.datafusion_ctx().register_table(&df_name, std::sync::Arc::new(mem_table)).is_ok() {
-                                mysql_tables_registered.push(df_name);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!(table = table_name, error = %e, "Bootstrap: failed to fetch MySQL table");
-                    }
-                }
+        let ctx = state.ctx.read().await;
+        match state.provider_registry.register_mysql(
+            "bootstrap-mysql", &mysql_host, mysql_port, &mysql_db, &mysql_user, &mysql_pass,
+            "mysql", ctx.datafusion_ctx(),
+        ).await {
+            Ok(tables) => {
+                drop(ctx);
+                let entry = ConnectionEntry {
+                    id: "bootstrap-mysql".to_string(),
+                    name: "Docker MySQL".to_string(),
+                    conn_type: "mysql".to_string(),
+                    host: mysql_host, port: mysql_port, database: mysql_db, username: mysql_user,
+                    status: "connected".to_string(),
+                    tables: tables.clone(),
+                    created_at: Utc::now(),
+                    source: "bootstrap".to_string(),
+                };
+                state.seed_connection(entry, mysql_pass).await;
+                results.insert("mysql".to_string(), serde_json::json!({
+                    "status": "connected",
+                    "mode": "federated",
+                    "tables_registered": tables,
+                }));
             }
-            results.insert("mysql".to_string(), serde_json::json!({
-                "status": "connected",
-                "tables_discovered": tables.len(),
-                "tables_registered": mysql_tables_registered,
-            }));
-        }
-        Err(e) => {
-            results.insert("mysql".to_string(), serde_json::json!({
-                "status": "unavailable",
-                "error": e,
-            }));
+            Err(e) => {
+                drop(ctx);
+                results.insert("mysql".to_string(), serde_json::json!({
+                    "status": "unavailable",
+                    "error": e,
+                }));
+            }
         }
     }
 
@@ -5240,4 +5263,102 @@ async fn compare_benchmark(
         "speedup": speedup,
         "winner": winner,
     })))
+}
+
+// ── Provider endpoints ─────────────────────────────────────────────
+
+/// GET /api/v1/providers — list enabled federated data providers and their status.
+async fn list_providers(
+    State(state): State<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    let entries = state.provider_registry.list_entries().await;
+
+    let mut providers = Vec::new();
+
+    // Report compiled-in providers
+    #[cfg(feature = "postgres")]
+    providers.push(serde_json::json!({
+        "name": "PostgreSQL",
+        "id": "postgres",
+        "enabled": true,
+        "mode": "federated",
+        "description": "Live queries with predicate/projection pushdown via bb8 pool",
+    }));
+    #[cfg(not(feature = "postgres"))]
+    providers.push(serde_json::json!({
+        "name": "PostgreSQL",
+        "id": "postgres",
+        "enabled": false,
+        "mode": "disabled",
+        "description": "Enable with --features postgres",
+    }));
+
+    #[cfg(feature = "mysql")]
+    providers.push(serde_json::json!({
+        "name": "MySQL",
+        "id": "mysql",
+        "enabled": true,
+        "mode": "federated",
+        "description": "Live queries with predicate/projection pushdown via mysql_async pool",
+    }));
+    #[cfg(not(feature = "mysql"))]
+    providers.push(serde_json::json!({
+        "name": "MySQL",
+        "id": "mysql",
+        "enabled": false,
+        "mode": "disabled",
+        "description": "Enable with --features mysql",
+    }));
+
+    #[cfg(feature = "sqlite")]
+    providers.push(serde_json::json!({
+        "name": "SQLite",
+        "id": "sqlite",
+        "enabled": true,
+        "mode": "federated",
+        "description": "Bundled SQLite engine with pushdown support",
+    }));
+    #[cfg(not(feature = "sqlite"))]
+    providers.push(serde_json::json!({
+        "name": "SQLite",
+        "id": "sqlite",
+        "enabled": false,
+        "mode": "disabled",
+        "description": "Enable with --features sqlite",
+    }));
+
+    // MongoDB always available (snapshot mode)
+    providers.push(serde_json::json!({
+        "name": "MongoDB",
+        "id": "mongodb",
+        "enabled": true,
+        "mode": "snapshot",
+        "description": "MemTable snapshot — no provider available for federated mode",
+    }));
+
+    #[cfg(feature = "clickhouse")]
+    providers.push(serde_json::json!({
+        "name": "ClickHouse",
+        "id": "clickhouse",
+        "enabled": true,
+        "mode": "federated",
+        "description": "HTTP-based ClickHouse federation",
+    }));
+
+    // Active connections using providers
+    let active_connections: Vec<serde_json::Value> = entries
+        .iter()
+        .map(|(id, entry)| {
+            serde_json::json!({
+                "connection_id": id,
+                "conn_type": entry.conn_type,
+                "tables": entry.tables,
+            })
+        })
+        .collect();
+
+    Json(serde_json::json!({
+        "providers": providers,
+        "active_connections": active_connections,
+    }))
 }

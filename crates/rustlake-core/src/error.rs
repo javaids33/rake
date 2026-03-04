@@ -52,6 +52,10 @@ pub enum RustLakeError {
     #[error("DuckDB error: {0}")]
     DuckDb(String),
 
+    /// Error from a federated data provider (Postgres, MySQL, SQLite, etc.).
+    #[error("Provider error: {0}")]
+    Provider(String),
+
     /// Catch-all for errors that don't fit other variants.
     #[error("{0}")]
     Other(String),

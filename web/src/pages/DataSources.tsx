@@ -22,14 +22,16 @@ import toast from 'react-hot-toast'
 // Validation tier per connector — what level of testing is available
 const FULL_PROTOCOL_CONNECTORS = new Set([
   'postgres', 'cockroachdb', 'yugabytedb', 'timescaledb', 'greenplum', 'redshift', 'cdc_postgres',
+  'mysql', 'mariadb',
 ])
 const TCP_CONNECTORS = new Set([
-  'mysql', 'mariadb', 'tidb', 'vitess', 'singlestore',
+  'tidb', 'vitess', 'singlestore',
   'mongodb', 'cdc_mongodb', 'cassandra', 'scylladb', 'redis',
   'elasticsearch', 'opensearch', 'neo4j', 'influxdb', 'questdb',
   'clickhouse', 'druid', 'pinot', 'starrocks', 'doris', 'trino', 'presto',
   'oracle', 'sqlserver', 'mssql', 'db2', 'sap_hana', 'teradata', 'vertica',
   'exasol', 'netezza', 'informix', 'kafka', 'minio', 'hbase',
+  'sqlite',
 ])
 function validationTier(id: string): { level: 'full' | 'tcp' | 'config'; label: string; color: string } {
   if (FULL_PROTOCOL_CONNECTORS.has(id)) return { level: 'full', label: 'Full Verify', color: 'text-emerald-400 bg-emerald-400/10 border-emerald-400/20' }
@@ -257,6 +259,7 @@ export function DataSources() {
       } else if (DB_LIKE_CATEGORIES.includes(selectedConnector.category) && configValues.host) {
         await addConnection({
           name: connName,
+          conn_type: selectedConnector.id,
           host: configValues.host || 'localhost',
           port: parseInt(configValues.port || '5432'),
           database: configValues.database || configValues.keyspace || '',
@@ -427,6 +430,11 @@ export function DataSources() {
                       <h3 className="text-sm font-semibold text-zinc-200">{c.name}</h3>
                       <StatusDot status={c.status === 'connected' ? 'healthy' : 'error'} />
                       <Badge className="bg-cyan-400/8 text-cyan-400/80 border-cyan-400/10">{c.conn_type}</Badge>
+                      {['postgres', 'mysql', 'sqlite', 'clickhouse'].includes(c.conn_type) ? (
+                        <Badge className="bg-violet-400/8 text-violet-400/80 border-violet-400/10 text-2xs">Federated</Badge>
+                      ) : (
+                        <Badge className="bg-zinc-400/8 text-zinc-400/80 border-zinc-400/10 text-2xs">Snapshot</Badge>
+                      )}
                       <Badge className="bg-emerald-400/8 text-emerald-400/80 border-emerald-400/10 text-2xs">Connected</Badge>
                     </div>
                     <p className="text-2xs font-mono text-zinc-500 mt-0.5">{c.host}:{c.port}/{c.database}</p>

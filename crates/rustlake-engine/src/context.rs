@@ -1,6 +1,10 @@
+use std::sync::Arc;
+
 use arrow::array::RecordBatch;
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::options::{CsvReadOptions, NdJsonReadOptions, ParquetReadOptions};
+use datafusion::execution::session_state::SessionStateBuilder;
+use datafusion_federation::{FederatedQueryPlanner, FederationOptimizerRule};
 use rustlake_core::config::RustLakeConfig;
 use rustlake_core::{Result, RustLakeError};
 
@@ -13,6 +17,11 @@ pub struct RustLakeContext {
 
 impl RustLakeContext {
     /// Create a new context with default in-memory catalog.
+    ///
+    /// Installs the `datafusion-federation` optimizer rule and query planner so that
+    /// federated `TableProvider` implementations (e.g. from `datafusion-table-providers`)
+    /// can push predicates and projections down to the source database. For non-provider
+    /// tables (Parquet, CSV, MemTable), the rule is a transparent no-op pass-through.
     pub async fn new(config: RustLakeConfig) -> Result<Self> {
         let mut df_config = datafusion::execution::context::SessionConfig::new()
             .with_batch_size(config.engine.batch_size)
@@ -21,16 +30,24 @@ impl RustLakeContext {
         df_config = df_config.with_information_schema(true);
         df_config.options_mut().catalog.has_header = true;
 
+        // Build SessionState with federation support for cross-source query optimization.
+        let mut state_builder = SessionStateBuilder::new()
+            .with_config(df_config)
+            .with_default_features()
+            .with_optimizer_rule(Arc::new(FederationOptimizerRule::new()))
+            .with_query_planner(Arc::new(FederatedQueryPlanner::new()));
+
         // Configure memory pool only when explicitly set (avoids tracking overhead on small queries)
-        let df_ctx = if let Some(memory_limit) = config.engine.memory_limit {
+        if let Some(memory_limit) = config.engine.memory_limit {
             let runtime_env = datafusion::execution::runtime_env::RuntimeEnvBuilder::new()
                 .with_memory_limit(memory_limit, 1.0)
                 .build_arc()
                 .map_err(|e| RustLakeError::Engine(format!("Failed to create runtime: {}", e)))?;
-            SessionContext::new_with_config_rt(df_config, runtime_env)
-        } else {
-            SessionContext::new_with_config(df_config)
-        };
+            state_builder = state_builder.with_runtime_env(runtime_env);
+        }
+
+        let state = state_builder.build();
+        let df_ctx = SessionContext::new_with_state(state);
 
         Ok(Self { df_ctx, config })
     }
