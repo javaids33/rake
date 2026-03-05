@@ -3,10 +3,15 @@
 //! Manages live `TableProvider` connections via `datafusion-table-providers`.
 //! Each registered provider enables on-demand query execution with predicate and
 //! projection pushdown to the source database — no eager `SELECT *` snapshots.
+//!
+//! Tables are registered under per-source DataFusion schemas (e.g., `pg`, `mysql`)
+//! so that the registered name matches the physical source table name. This ensures
+//! correct column qualifier resolution during predicate pushdown.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use datafusion::catalog::MemorySchemaProvider;
 use datafusion::execution::context::SessionContext;
 use tokio::sync::RwLock;
 
@@ -88,14 +93,17 @@ impl ProviderRegistry {
 
         let factory = PostgresTableFactory::new(pool);
 
-        // 3. Register each table as a federated TableProvider
+        // 3. Register each table in a per-source schema so the registered name
+        //    matches the physical table name (required for correct WHERE pushdown).
+        let schema_provider = ensure_schema(ctx, prefix)?;
+
         let mut registered = Vec::new();
         for table_name in &table_names {
             let table_ref = TableReference::partial("public", table_name.as_str());
             match factory.table_provider(table_ref).await {
                 Ok(provider) => {
-                    let df_name = format!("{}_{}", prefix, table_name);
-                    match ctx.register_table(&df_name, provider) {
+                    let df_name = format!("{}.{}", prefix, table_name);
+                    match schema_provider.register_table(table_name.clone(), provider) {
                         Ok(_) => {
                             tracing::info!(table = %df_name, "Federated provider registered");
                             registered.push(df_name);
@@ -160,14 +168,17 @@ impl ProviderRegistry {
 
         let factory = MySQLTableFactory::new(pool);
 
-        // 3. Register each table as a federated TableProvider
+        // 3. Register each table in a per-source schema so the registered name
+        //    matches the physical table name (required for correct WHERE pushdown).
+        let schema_provider = ensure_schema(ctx, prefix)?;
+
         let mut registered = Vec::new();
         for table_name in &table_names {
             let table_ref = TableReference::partial(database, table_name.as_str());
             match factory.table_provider(table_ref).await {
                 Ok(provider) => {
-                    let df_name = format!("{}_{}", prefix, table_name);
-                    match ctx.register_table(&df_name, provider) {
+                    let df_name = format!("{}.{}", prefix, table_name);
+                    match schema_provider.register_table(table_name.clone(), provider) {
                         Ok(_) => {
                             tracing::info!(table = %df_name, "Federated provider registered");
                             registered.push(df_name);
@@ -220,13 +231,15 @@ impl ProviderRegistry {
         // Discover tables from sqlite_master using rusqlite directly
         let table_names = discover_sqlite_tables(db_path)?;
 
+        let schema_provider = ensure_schema(ctx, prefix)?;
+
         let mut registered = Vec::new();
         for table_name in &table_names {
             let table_ref = TableReference::bare(table_name.as_str());
             match factory.table_provider(table_ref).await {
                 Ok(provider) => {
-                    let df_name = format!("{}_{}", prefix, table_name);
-                    match ctx.register_table(&df_name, provider) {
+                    let df_name = format!("{}.{}", prefix, table_name);
+                    match schema_provider.register_table(table_name.clone(), provider) {
                         Ok(_) => {
                             tracing::info!(table = %df_name, "Federated SQLite provider registered");
                             registered.push(df_name);
@@ -252,6 +265,34 @@ impl ProviderRegistry {
 
         Ok(registered)
     }
+}
+
+/// Ensure a named schema exists in the default DataFusion catalog.
+///
+/// Creates a `MemorySchemaProvider` under the default "datafusion" catalog so
+/// that federated tables can be registered as `schema.table` — keeping the
+/// registered name identical to the physical source table name. This is required
+/// for correct column qualifier resolution during predicate pushdown.
+pub fn ensure_schema(
+    ctx: &SessionContext,
+    schema_name: &str,
+) -> Result<Arc<dyn datafusion::catalog::SchemaProvider>, String> {
+    let catalog = ctx
+        .catalog("datafusion")
+        .ok_or_else(|| "Default catalog 'datafusion' not found".to_string())?;
+
+    // If the schema already exists, return it
+    if let Some(existing) = catalog.schema(schema_name) {
+        return Ok(existing);
+    }
+
+    let schema: Arc<dyn datafusion::catalog::SchemaProvider> =
+        Arc::new(MemorySchemaProvider::new());
+    catalog
+        .register_schema(schema_name, schema.clone())
+        .map_err(|e| format!("Failed to register schema '{}': {}", schema_name, e))?;
+
+    Ok(schema)
 }
 
 /// Discover public table names from Postgres via a lightweight raw connection.

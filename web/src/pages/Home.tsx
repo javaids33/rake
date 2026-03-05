@@ -68,10 +68,12 @@ export function Home() {
 
   // Engine statuses
   const duckdbRunning = engineList.some(e => e.name === 'DuckDB' && e.status === 'running')
+  const polarsRunning = engineList.some(e => e.name === 'Polars' && e.status === 'running')
   const engines = [
     { label: 'DataFusion', up: !!system, icon: Terminal, color: 'text-amber-400' },
     { label: 'DuckDB', up: duckdbRunning, icon: Database, color: 'text-emerald-400' },
-    { label: 'Streaming', up: !!streamMetrics, icon: Radio, color: 'text-cyan-400' },
+    { label: 'Polars', up: polarsRunning, icon: Cpu, color: 'text-cyan-400' },
+    { label: 'Streaming', up: !!streamMetrics, icon: Radio, color: 'text-sky-400' },
     { label: 'Vector', up: (vectorStatus?.document_count ?? 0) > 0, icon: Search, color: 'text-rose-400' },
     { label: 'Transforms', up: transformCount > 0, icon: Activity, color: 'text-violet-400' },
   ]

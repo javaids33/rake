@@ -97,12 +97,12 @@ const TEMPLATES = [
     icon: ArrowRight,
     color: 'text-amber-400',
     items: [
-      { name: 'Postgres → Iceberg (Full Sync)', type: 'etl_pipeline', cron: '0 0 * * *', target: 'CREATE TABLE iceberg.warehouse.customers AS SELECT * FROM pg_customers', desc: 'Full nightly sync from Postgres into Iceberg table', tags: 'etl,postgres,iceberg' },
-      { name: 'Postgres → Iceberg (Incremental)', type: 'etl_pipeline', cron: '0 * * * *', target: 'INSERT INTO iceberg.warehouse.orders SELECT * FROM pg_orders WHERE updated_at > NOW() - INTERVAL \'1 hour\'', desc: 'Hourly incremental load using updated_at watermark', tags: 'etl,incremental,iceberg' },
-      { name: 'MySQL → Iceberg (Full Sync)', type: 'etl_pipeline', cron: '0 2 * * *', target: 'CREATE TABLE iceberg.warehouse.products AS SELECT * FROM mysql_products', desc: 'Daily sync from MySQL to Iceberg at 2 AM', tags: 'etl,mysql,iceberg' },
+      { name: 'Postgres → Iceberg (Full Sync)', type: 'etl_pipeline', cron: '0 0 * * *', target: 'CREATE TABLE iceberg.warehouse.customers AS SELECT * FROM pg.customers', desc: 'Full nightly sync from Postgres into Iceberg table', tags: 'etl,postgres,iceberg' },
+      { name: 'Postgres → Iceberg (Incremental)', type: 'etl_pipeline', cron: '0 * * * *', target: 'INSERT INTO iceberg.warehouse.orders SELECT * FROM pg.orders WHERE updated_at > NOW() - INTERVAL \'1 hour\'', desc: 'Hourly incremental load using updated_at watermark', tags: 'etl,incremental,iceberg' },
+      { name: 'MySQL → Iceberg (Full Sync)', type: 'etl_pipeline', cron: '0 2 * * *', target: 'CREATE TABLE iceberg.warehouse.products AS SELECT * FROM mysql.products', desc: 'Daily sync from MySQL to Iceberg at 2 AM', tags: 'etl,mysql,iceberg' },
       { name: 'S3 CSV → Iceberg (Auto Loader)', type: 'etl_pipeline', cron: '*/15 * * * *', target: 'INSERT INTO iceberg.landing.events SELECT * FROM \'s3://data-lake/incoming/*.csv\'', desc: 'Auto-load new CSV files from S3 every 15 min', tags: 'etl,s3,auto-loader' },
-      { name: 'MongoDB → Iceberg (Documents)', type: 'etl_pipeline', cron: '0 3 * * *', target: 'CREATE TABLE iceberg.warehouse.user_profiles AS SELECT * FROM mongo_users', desc: 'Flatten MongoDB documents into Iceberg at 3 AM', tags: 'etl,mongodb,iceberg' },
-      { name: 'Cross-Source Join → Iceberg', type: 'etl_pipeline', cron: '0 1 * * *', target: 'CREATE TABLE iceberg.analytics.enriched_orders AS SELECT o.*, c.name, c.email FROM pg_orders o JOIN mongo_customers c ON o.customer_id = c.id', desc: 'Join Postgres orders with MongoDB customers nightly', tags: 'etl,cross-source,iceberg' },
+      { name: 'MongoDB → Iceberg (Documents)', type: 'etl_pipeline', cron: '0 3 * * *', target: 'CREATE TABLE iceberg.warehouse.user_profiles AS SELECT * FROM mongo.users', desc: 'Flatten MongoDB documents into Iceberg at 3 AM', tags: 'etl,mongodb,iceberg' },
+      { name: 'Cross-Source Join → Iceberg', type: 'etl_pipeline', cron: '0 1 * * *', target: 'CREATE TABLE iceberg.analytics.enriched_orders AS SELECT o.*, c.name, c.email FROM pg.orders o JOIN mongo.customers c ON o.customer_id = c.id', desc: 'Join Postgres orders with MongoDB customers nightly', tags: 'etl,cross-source,iceberg' },
     ]
   },
   {
@@ -150,7 +150,7 @@ export function Scheduler() {
   const [form, setForm] = useState({
     name: '', job_type: 'etl_pipeline', cron: '0 * * * *', target: '',
     retries: '3', tags: '', timeout: '3600', sla_minutes: '60',
-    source: '', sink: 'iceberg', write_mode: 'append',
+    source: '', sink: 'iceberg', write_mode: 'append', engine: 'auto',
   })
 
   const [dagNodes, setDagNodes] = useState<DagNode[]>([])
@@ -207,12 +207,13 @@ export function Scheduler() {
         job_type: form.job_type,
         cron: form.cron,
         target: form.target,
+        engine: form.engine,
         retries: parseInt(form.retries) || 3,
         tags: form.tags ? form.tags.split(',').map(s => s.trim()) : [],
       })
       toast.success('Job created')
       setCreateOpen(false)
-      setForm({ name: '', job_type: 'etl_pipeline', cron: '0 * * * *', target: '', retries: '3', tags: '', timeout: '3600', sla_minutes: '60', source: '', sink: 'iceberg', write_mode: 'append' })
+      setForm({ name: '', job_type: 'etl_pipeline', cron: '0 * * * *', target: '', retries: '3', tags: '', timeout: '3600', sla_minutes: '60', source: '', sink: 'iceberg', write_mode: 'append', engine: 'auto' })
       loadAll()
     } catch (e) { toast.error((e as Error).message) }
   }
@@ -1077,10 +1078,20 @@ export function Scheduler() {
             />
           </div>
 
-          <div className="grid grid-cols-4 gap-3">
+          <div className="grid grid-cols-5 gap-3">
             <Input label="Max Retries" type="number" value={form.retries} onChange={e => setForm(f => ({ ...f, retries: e.target.value }))} />
             <Input label="Timeout (sec)" type="number" value={form.timeout} onChange={e => setForm(f => ({ ...f, timeout: e.target.value }))} />
             <Input label="SLA (minutes)" type="number" value={form.sla_minutes} onChange={e => setForm(f => ({ ...f, sla_minutes: e.target.value }))} placeholder="60" />
+            <div>
+              <span className="text-xs font-medium text-zinc-400 mb-1 block">Engine</span>
+              <select value={form.engine} onChange={e => setForm(f => ({ ...f, engine: e.target.value }))}
+                className="w-full h-9 px-2 text-xs rounded-lg border border-white/[0.06] bg-white/[0.03] text-zinc-300 outline-none focus:border-amber-500/50 cursor-pointer">
+                <option value="auto">Auto</option>
+                <option value="datafusion">DataFusion</option>
+                <option value="duckdb">DuckDB</option>
+                <option value="polars">Polars</option>
+              </select>
+            </div>
             <Input label="Tags" value={form.tags} onChange={e => setForm(f => ({ ...f, tags: e.target.value }))} placeholder="etl,prod" />
           </div>
 

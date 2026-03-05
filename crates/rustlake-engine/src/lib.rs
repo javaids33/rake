@@ -7,5 +7,7 @@
 mod context;
 #[cfg(feature = "duckdb")]
 pub mod duckdb_engine;
+#[cfg(feature = "polars")]
+pub mod polars_engine;
 
 pub use context::RustLakeContext;

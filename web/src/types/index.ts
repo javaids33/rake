@@ -203,6 +203,7 @@ export interface ScheduledJob {
   enabled: boolean
   last_run?: string
   next_run?: string
+  engine?: string
   trigger_type: string
   event_config?: Record<string, unknown>
   cluster?: string
@@ -539,6 +540,7 @@ export interface BenchmarkCompareResponse {
   query_name: string
   datafusion: { duration_ms: number; row_count: number; status: string; error?: string }
   duckdb: { duration_ms: number; row_count: number; status: string; error?: string }
+  polars?: { duration_ms: number; row_count: number; status: string; error?: string }
   speedup: number
   winner: string
 }

@@ -183,15 +183,15 @@ export function SqlEditorPage() {
     })
   }
 
-  // Build mapping: connection raw table name → registered table name (e.g. "customers" → "pg_customers")
+  // Build mapping: connection raw table name → registered table name (e.g. "customers" → "pg.customers")
   const resolveRegistered = useCallback((connTableName: string, connType?: string) => {
     // Direct match first
     if (tables.includes(connTableName)) return connTableName
-    // Try common prefixes based on connection type
-    const prefixes = connType === 'mysql' ? ['mysql_'] : connType === 'mongodb' ? ['mongo_'] : ['pg_', 'mysql_', 'mongo_']
-    for (const prefix of prefixes) {
-      const prefixed = `${prefix}${connTableName}`
-      if (tables.includes(prefixed)) return prefixed
+    // Try schema-qualified names (pg.table, mysql.table, mongo.table) and legacy prefixes
+    const schemas = connType === 'mysql' ? ['mysql.', 'mysql_'] : connType === 'mongodb' ? ['mongo.', 'mongo_'] : ['pg.', 'mysql.', 'mongo.', 'pg_', 'mysql_', 'mongo_']
+    for (const prefix of schemas) {
+      const qualified = `${prefix}${connTableName}`
+      if (tables.includes(qualified)) return qualified
     }
     return null
   }, [tables])
@@ -271,8 +271,8 @@ export function SqlEditorPage() {
         <div className="flex items-center gap-2 flex-shrink-0">
           <Button variant="ghost" size="sm" icon={<Save className="w-3.5 h-3.5" />} onClick={() => setSaveOpen(true)}>Save</Button>
 
-          {/* Demo queries dropdown — visible when pg_ tables detected */}
-          {tables.some(t => t.startsWith('pg_')) && (
+          {/* Demo queries dropdown — visible when pg. tables detected */}
+          {tables.some(t => t.startsWith('pg.') || t.startsWith('pg_')) && (
             <div ref={demoRef} className="relative">
               <Button
                 variant="ghost"
@@ -286,9 +286,9 @@ export function SqlEditorPage() {
               {demoOpen && (
                 <div className="absolute right-0 top-full mt-1 w-72 rounded-lg border border-white/[0.06] bg-navy-950/95 backdrop-blur-xl shadow-2xl z-50 py-1 animate-fade-in">
                   {[
-                    { label: 'Customer Orders', sql: 'SELECT c.name, COUNT(*) as order_count\nFROM pg_customers c\nJOIN pg_orders o ON c.customer_id = o.customer_id\nGROUP BY c.name\nORDER BY order_count DESC' },
-                    { label: 'Sales by Product', sql: 'SELECT p.name, p.category, SUM(s.amount) as revenue\nFROM pg_products p\nJOIN pg_sales s ON p.product_id = s.product_id\nGROUP BY p.name, p.category\nORDER BY revenue DESC' },
-                    { label: 'Cross-Source Join', sql: 'SELECT pg.name as pg_name, my.c_name as mysql_name\nFROM pg_tpch_customer pg\nJOIN mysql_tpch_customer my ON pg.c_custkey = my.c_custkey\nLIMIT 20' },
+                    { label: 'Customer Orders', sql: 'SELECT c.name, COUNT(*) as order_count\nFROM pg.customers c\nJOIN pg.orders o ON c.customer_id = o.customer_id\nGROUP BY c.name\nORDER BY order_count DESC' },
+                    { label: 'Sales by Product', sql: 'SELECT p.name, p.category, SUM(s.amount) as revenue\nFROM pg.products p\nJOIN pg.sales s ON p.product_id = s.product_id\nGROUP BY p.name, p.category\nORDER BY revenue DESC' },
+                    { label: 'Cross-Source Join', sql: 'SELECT pg.name as pg_name, my.c_name as mysql_name\nFROM pg.tpch_customer pg\nJOIN mysql.tpch_customer my ON pg.c_custkey = my.c_custkey\nLIMIT 20' },
                     { label: 'All Tables', sql: 'SHOW TABLES' },
                   ].map(q => (
                     <button
@@ -364,6 +364,7 @@ export function SqlEditorPage() {
             <option value="auto">Auto (recommended)</option>
             <option value="datafusion">DataFusion</option>
             <option value="duckdb">DuckDB</option>
+            <option value="polars">Polars</option>
           </select>
           <Button variant="primary" size="sm" icon={<Play className="w-3.5 h-3.5" />} onClick={runQuery} loading={loading}>
             Run
@@ -484,7 +485,9 @@ export function SqlEditorPage() {
                           'inline-flex items-center px-2 py-0.5 rounded-md text-2xs font-medium border',
                           result.engine.toLowerCase() === 'duckdb'
                             ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/30'
-                            : 'bg-amber-500/10 text-amber-400 border-amber-500/30'
+                            : result.engine.toLowerCase() === 'polars'
+                              ? 'bg-cyan-500/10 text-cyan-400 border-cyan-500/30'
+                              : 'bg-amber-500/10 text-amber-400 border-amber-500/30'
                         )}>
                           {result.engine}
                         </span>

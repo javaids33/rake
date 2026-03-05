@@ -456,8 +456,8 @@ export function DataCatalog() {
 
                         // If no lineage data, show all tables as a simple graph
                         if (dagEdges.length === 0) {
-                          // Show upstream sources (pg_ prefix) connecting to this table
-                          const sources = tables.filter(t => t.name.startsWith('pg_') && t.name !== selected).slice(0, 3)
+                          // Show upstream sources (pg. or pg_ prefix) connecting to this table
+                          const sources = tables.filter(t => (t.name.startsWith('pg.') || t.name.startsWith('pg_')) && t.name !== selected).slice(0, 3)
                           const targets = tables.filter(t => t.name.startsWith('uploads_') && t.name !== selected).slice(0, 2)
 
                           for (const src of sources) {

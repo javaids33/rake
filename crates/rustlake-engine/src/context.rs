@@ -234,18 +234,36 @@ impl RustLakeContext {
         }
     }
 
-    /// List all registered tables.
+    /// List all registered tables across all schemas.
+    ///
+    /// Tables in the default "public" schema are returned as bare names.
+    /// Tables in custom schemas (pg, mysql, mongo, etc.) are returned as
+    /// `schema.table` qualified names.
     pub async fn list_tables(&self) -> Result<Vec<String>> {
         let catalog = self
             .df_ctx
             .catalog("datafusion")
             .ok_or_else(|| RustLakeError::Catalog("Default catalog not found".into()))?;
 
-        let schema = catalog
-            .schema("public")
-            .ok_or_else(|| RustLakeError::Catalog("Default schema not found".into()))?;
+        let mut all_tables = Vec::new();
 
-        Ok(schema.table_names())
+        for schema_name in catalog.schema_names() {
+            if schema_name == "information_schema" {
+                continue;
+            }
+            if let Some(schema) = catalog.schema(&schema_name) {
+                for table_name in schema.table_names() {
+                    if schema_name == "public" {
+                        all_tables.push(table_name);
+                    } else {
+                        all_tables.push(format!("{}.{}", schema_name, table_name));
+                    }
+                }
+            }
+        }
+
+        all_tables.sort();
+        Ok(all_tables)
     }
 
     /// Get a reference to the underlying DataFusion context.

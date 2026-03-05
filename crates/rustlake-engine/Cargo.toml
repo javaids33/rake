@@ -6,6 +6,9 @@ edition.workspace = true
 [features]
 default = []
 duckdb = ["dep:duckdb", "dep:duckdb-ipc"]
+# Polars engine shim — routes queries through DataFusion with Polars-compatible execution semantics.
+# When polars 0.54+ resolves the chrono conflict with DataFusion 51, this will switch to real Polars.
+polars = []
 
 [dependencies]
 duckdb = { workspace = true, optional = true }

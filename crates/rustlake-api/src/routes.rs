@@ -28,7 +28,7 @@ use crate::state::{
 pub struct SqlRequest {
     /// The SQL query string to execute.
     pub sql: String,
-    /// Target engine: "auto" (default), "datafusion", or "duckdb".
+    /// Target engine: "auto" (default), "datafusion", "duckdb", or "polars".
     #[serde(default = "default_engine_choice")]
     pub engine: String,
 }
@@ -742,23 +742,25 @@ async fn execute_sql(
     }
 
     // Determine target engine: explicit override > classifier recommendation
-    let use_duckdb = determine_use_duckdb(&state, &req.engine, &classification.engine);
-    let engine_name = if use_duckdb { "DuckDB" } else { "DataFusion" };
+    let engine_name = determine_engine(&state, &req.engine, &classification.engine);
 
     tracing::debug!(
         %query_id,
         engine = engine_name,
         duckdb_available = state.duckdb_available(),
+        polars_available = state.polars_available(),
         "Engine selected"
     );
 
     // Execute via the selected engine
     let exec_start = Instant::now();
-    let result = if use_duckdb {
-        execute_via_duckdb(&state, &req.sql).await
-    } else {
-        let ctx = state.ctx.read().await;
-        ctx.sql(&req.sql).await.map_err(|e| e.to_string())
+    let result = match engine_name {
+        "DuckDB" => execute_via_duckdb(&state, &req.sql).await,
+        "Polars" => execute_via_polars(&state, &req.sql).await,
+        _ => {
+            let ctx = state.ctx.read().await;
+            ctx.sql(&req.sql).await.map_err(|e| e.to_string())
+        }
     };
     let exec_ms = exec_start.elapsed().as_millis();
     let duration_ms = start.elapsed().as_millis();
@@ -769,9 +771,9 @@ async fn execute_sql(
     let batches = match result {
         Ok(batches) => batches,
         Err(e) => {
-            // If DuckDB failed, try fallback to DataFusion
-            if use_duckdb {
-                tracing::warn!(error = %e, "DuckDB execution failed, falling back to DataFusion");
+            // If an alternative engine failed, try fallback to DataFusion
+            if engine_name != "DataFusion" {
+                tracing::warn!(engine = engine_name, error = %e, "Engine failed, falling back to DataFusion");
                 let fallback_start = Instant::now();
                 let ctx = state.ctx.read().await;
                 match ctx.sql(&req.sql).await {
@@ -835,15 +837,20 @@ async fn execute_sql(
     ).await
 }
 
-/// Determine whether to use DuckDB for this query.
-fn determine_use_duckdb(state: &AppState, engine_choice: &str, recommended: &EngineTarget) -> bool {
-    if !state.duckdb_available() {
-        return false;
-    }
+/// Determine which engine to use for this query.
+/// Returns an engine name: "DataFusion", "DuckDB", or "Polars".
+fn determine_engine(state: &AppState, engine_choice: &str, recommended: &EngineTarget) -> &'static str {
     match engine_choice.to_lowercase().as_str() {
-        "duckdb" => true,
-        "datafusion" => false,
-        _ => matches!(recommended, EngineTarget::DuckDb),
+        "duckdb" if state.duckdb_available() => "DuckDB",
+        "polars" if state.polars_available() => "Polars",
+        "datafusion" => "DataFusion",
+        "auto" | _ => {
+            if state.duckdb_available() && matches!(recommended, EngineTarget::DuckDb) {
+                "DuckDB"
+            } else {
+                "DataFusion"
+            }
+        }
     }
 }
 
@@ -859,6 +866,20 @@ async fn execute_via_duckdb(
         }
     }
     Err("DuckDB engine not available".to_string())
+}
+
+/// Execute SQL via Polars engine, returning batches or error string.
+async fn execute_via_polars(
+    state: &AppState,
+    sql: &str,
+) -> std::result::Result<Vec<RecordBatch>, String> {
+    #[cfg(feature = "polars")]
+    {
+        if let Some(ref engine) = state.polars_engine {
+            return engine.sql(sql).await.map_err(|e| e.to_string());
+        }
+    }
+    Err("Polars engine not available".to_string())
 }
 
 /// Shared response builder for execute_sql (avoids duplication with fallback path).
@@ -2454,13 +2475,15 @@ async fn add_connection(
                 .await
                 .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e })))?;
             let ctx2 = state.ctx.read().await;
+            let mongo_schema = crate::providers::ensure_schema(ctx2.datafusion_ctx(), "mongo")
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e })))?;
             let mut mongo_registered = Vec::new();
             for coll_name in &collections {
                 if let Ok(batch) = crate::mongodb_conn::fetch_collection_as_arrow(&mongo_params, coll_name).await {
                     let schema = batch.schema();
                     if let Ok(mem_table) = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]) {
-                        let df_name = format!("mongo_{}", coll_name);
-                        if ctx2.datafusion_ctx().register_table(&df_name, std::sync::Arc::new(mem_table)).is_ok() {
+                        let df_name = format!("mongo.{}", coll_name);
+                        if mongo_schema.register_table(coll_name.clone(), std::sync::Arc::new(mem_table)).is_ok() {
                             mongo_registered.push(df_name);
                         }
                     }
@@ -2610,7 +2633,7 @@ async fn register_external_table(
         "mongodb" => "mongo",
         _ => &conn_type,
     };
-    let df_table_name = format!("{}_{}", prefix, table_name);
+    let df_table_name = format!("{}.{}", prefix, table_name);
 
     match conn_type.as_str() {
         #[cfg(feature = "postgres")]
@@ -2637,7 +2660,9 @@ async fn register_external_table(
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: format!("Provider error: {}", e) })))?;
 
             let ctx = state.ctx.read().await;
-            ctx.datafusion_ctx().register_table(&df_table_name, provider)
+            let schema_prov = crate::providers::ensure_schema(ctx.datafusion_ctx(), prefix)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e })))?;
+            schema_prov.register_table(table_name.clone(), provider)
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: format!("Register error: {}", e) })))?;
         }
         #[cfg(feature = "mysql")]
@@ -2664,11 +2689,13 @@ async fn register_external_table(
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: format!("Provider error: {}", e) })))?;
 
             let ctx = state.ctx.read().await;
-            ctx.datafusion_ctx().register_table(&df_table_name, provider)
+            let schema_prov = crate::providers::ensure_schema(ctx.datafusion_ctx(), prefix)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e })))?;
+            schema_prov.register_table(table_name.clone(), provider)
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: format!("Register error: {}", e) })))?;
         }
         "mongodb" => {
-            // MongoDB: snapshot approach (no provider available)
+            // MongoDB: snapshot approach in "mongo" schema (no provider available)
             let mongo_params = crate::mongodb_conn::MongoConnParams {
                 host: conn_host, port: conn_port, database: conn_database,
                 username: conn_username, password,
@@ -2679,7 +2706,9 @@ async fn register_external_table(
             let mem_table = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]])
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: format!("MemTable error: {}", e) })))?;
             let ctx = state.ctx.read().await;
-            ctx.datafusion_ctx().register_table(&df_table_name, std::sync::Arc::new(mem_table))
+            let schema_prov = crate::providers::ensure_schema(ctx.datafusion_ctx(), prefix)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e })))?;
+            schema_prov.register_table(table_name.clone(), std::sync::Arc::new(mem_table))
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: format!("Register error: {}", e) })))?;
         }
         other => {
@@ -3214,15 +3243,23 @@ async fn run_bootstrap(
             state.seed_connection(entry, "rustlake".to_string()).await;
 
             let mut mongo_tables_registered = Vec::new();
+            {
+                let ctx = state.ctx.read().await;
+                let _ = crate::providers::ensure_schema(ctx.datafusion_ctx(), "mongo");
+            }
             for coll_name in &collections {
                 match crate::mongodb_conn::fetch_collection_as_arrow(&mongo_params, coll_name).await {
                     Ok(batch) => {
                         let schema = batch.schema();
                         if let Ok(mem_table) = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]) {
-                            let df_name = format!("mongo_{}", coll_name);
+                            let df_name = format!("mongo.{}", coll_name);
                             let ctx = state.ctx.read().await;
-                            if ctx.datafusion_ctx().register_table(&df_name, std::sync::Arc::new(mem_table)).is_ok() {
-                                mongo_tables_registered.push(df_name);
+                            if let Some(catalog) = ctx.datafusion_ctx().catalog("datafusion") {
+                                if let Some(schema_prov) = catalog.schema("mongo") {
+                                    if schema_prov.register_table(coll_name.clone(), std::sync::Arc::new(mem_table)).is_ok() {
+                                        mongo_tables_registered.push(df_name);
+                                    }
+                                }
                             }
                         }
                     }
@@ -3256,6 +3293,7 @@ async fn run_bootstrap(
             enabled: true,
             last_run: None, next_run: None, last_status: None,
             created_at: Utc::now(),
+            engine: "auto".to_string(),
             trigger_type: "time".to_string(),
             event_config: None,
             cluster: Some("default".to_string()),
@@ -3272,6 +3310,7 @@ async fn run_bootstrap(
             enabled: true,
             last_run: None, next_run: None, last_status: None,
             created_at: Utc::now(),
+            engine: "auto".to_string(),
             trigger_type: "time".to_string(),
             event_config: None,
             cluster: Some("default".to_string()),
@@ -3288,6 +3327,7 @@ async fn run_bootstrap(
             enabled: true,
             last_run: None, next_run: None, last_status: None,
             created_at: Utc::now(),
+            engine: "auto".to_string(),
             trigger_type: "time".to_string(),
             event_config: None,
             cluster: Some("default".to_string()),
@@ -3489,6 +3529,8 @@ struct CreateScheduleRequest {
     target: String,
     #[serde(default = "default_enabled")]
     enabled: bool,
+    #[serde(default = "default_auto_engine")]
+    engine: String,
     #[serde(default = "default_trigger_type")]
     trigger_type: String,
     event_config: Option<EventConfig>,
@@ -3508,6 +3550,7 @@ struct UpdateScheduleRequest {
     cron: Option<String>,
     target: Option<String>,
     enabled: Option<bool>,
+    engine: Option<String>,
     trigger_type: Option<String>,
     event_config: Option<EventConfig>,
     cluster: Option<String>,
@@ -3518,6 +3561,10 @@ struct UpdateScheduleRequest {
 
 fn default_enabled() -> bool {
     true
+}
+
+fn default_auto_engine() -> String {
+    "auto".to_string()
 }
 
 fn default_trigger_type() -> String {
@@ -3697,6 +3744,7 @@ async fn update_schedule(
             if let Some(cron) = &req.cron { job.cron = cron.clone(); }
             if let Some(target) = req.target { job.target = target; }
             if let Some(enabled) = req.enabled { job.enabled = enabled; }
+            if let Some(engine) = req.engine { job.engine = engine; }
             if let Some(trigger_type) = req.trigger_type { job.trigger_type = trigger_type; }
             if req.event_config.is_some() { job.event_config = req.event_config; }
             if req.cluster.is_some() { job.cluster = req.cluster; }
@@ -3758,6 +3806,7 @@ async fn create_schedule(
         next_run,
         last_status: None,
         created_at: Utc::now(),
+        engine: req.engine,
         trigger_type: req.trigger_type,
         event_config: req.event_config,
         cluster: req.cluster,
@@ -3829,12 +3878,13 @@ async fn run_schedule(
             let job_type = job.job_type.clone();
             let job_name = job.name.clone();
             let job_id = job.id.clone();
+            let job_engine = job.engine.clone();
             job.last_run = Some(now);
             drop(jobs);
 
             let result = match job_type.as_str() {
                 "transform" => run_transform_job(&state, &target, &run_start).await,
-                "sql" => run_sql_job(&state, &target, &run_start).await,
+                "sql" => run_sql_job(&state, &target, &job_engine, &run_start).await,
                 "notebook" => run_notebook_job(&state, &target, &run_start).await,
                 "pipeline" => run_pipeline_job(&state, &target, &run_start).await,
                 "dashboard_refresh" => run_dashboard_refresh_job(&target, &run_start).await,
@@ -3905,14 +3955,21 @@ async fn run_transform_job(
     Ok(format!("Transform '{}' executed successfully", target))
 }
 
-/// Execute a raw SQL job directly via DataFusion.
+/// Execute a raw SQL job via the specified engine (auto/datafusion/duckdb/polars).
 async fn run_sql_job(
     state: &Arc<AppState>,
     sql: &str,
+    engine: &str,
     _run_start: &Instant,
 ) -> Result<String, String> {
-    let ctx = state.ctx.read().await;
-    let batches = ctx.sql(sql).await.map_err(|e| e.to_string())?;
+    let batches = match engine.to_lowercase().as_str() {
+        "duckdb" if state.duckdb_available() => execute_via_duckdb(state, sql).await?,
+        "polars" if state.polars_available() => execute_via_polars(state, sql).await?,
+        _ => {
+            let ctx = state.ctx.read().await;
+            ctx.sql(sql).await.map_err(|e| e.to_string())?
+        }
+    };
     let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
     Ok(format!("SQL executed — {} rows returned", row_count))
 }
@@ -5157,13 +5214,44 @@ async fn list_engines(
 
     #[cfg(not(feature = "duckdb"))]
     {
-        let _ = &state; // suppress unused warning
         engines.push(serde_json::json!({
             "name": "DuckDB",
             "version": "N/A",
             "status": "not_compiled",
             "default": false,
             "description": "Compile with --features duckdb to enable"
+        }));
+    }
+
+    #[cfg(feature = "polars")]
+    {
+        if let Some(ref engine) = state.polars_engine {
+            engines.push(serde_json::json!({
+                "name": "Polars",
+                "version": engine.version(),
+                "status": "running",
+                "default": false,
+                "description": "DataFrame engine — lazy evaluation, memory-efficient transforms"
+            }));
+        } else {
+            engines.push(serde_json::json!({
+                "name": "Polars",
+                "version": "0.53",
+                "status": "disabled",
+                "default": false,
+                "description": "DataFrame engine — enable with RUSTLAKE_POLARS__ENABLED=true"
+            }));
+        }
+    }
+
+    #[cfg(not(feature = "polars"))]
+    {
+        engines.push(serde_json::json!({
+            "name": "Polars",
+            "version": "N/A",
+            "status": "not_compiled",
+            "default": false,
+            "description": "Compile with --features polars to enable"
         }));
     }
 
@@ -5249,17 +5337,58 @@ async fn compare_benchmark(
         })
     };
 
-    // Calculate speedup
-    let df_ms = df_result["duration_ms"].as_f64().unwrap_or(1.0);
-    let dk_ms = duck_result["duration_ms"].as_f64().unwrap_or(1.0);
+    // Run on Polars
+    let polars_result = if state.polars_available() {
+        let polars_start = Instant::now();
+        match execute_via_polars(&state, &query.sql).await {
+            Ok(batches) => {
+                let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
+                let duration_ms = polars_start.elapsed().as_millis();
+                serde_json::json!({
+                    "duration_ms": duration_ms,
+                    "row_count": row_count,
+                    "status": "success"
+                })
+            }
+            Err(e) => serde_json::json!({
+                "duration_ms": polars_start.elapsed().as_millis(),
+                "row_count": 0,
+                "status": "error",
+                "error": e.to_string()
+            }),
+        }
+    } else {
+        serde_json::json!({
+            "duration_ms": 0,
+            "row_count": 0,
+            "status": "unavailable"
+        })
+    };
+
+    // Calculate winner across all engines
+    let df_ms = df_result["duration_ms"].as_f64().unwrap_or(f64::MAX);
+    let dk_ms = duck_result["duration_ms"].as_f64().unwrap_or(f64::MAX);
+    let pl_ms = polars_result["duration_ms"].as_f64().unwrap_or(f64::MAX);
+    let dk_ok = duck_result["status"].as_str() == Some("success");
+    let pl_ok = polars_result["status"].as_str() == Some("success");
+
+    let mut best_ms = df_ms;
+    let mut winner = "DataFusion";
+    if dk_ok && dk_ms < best_ms {
+        best_ms = dk_ms;
+        winner = "DuckDB";
+    }
+    if pl_ok && pl_ms < best_ms {
+        winner = "Polars";
+    }
     let speedup = if dk_ms > 0.0 { df_ms / dk_ms } else { 1.0 };
-    let winner = if df_ms <= dk_ms { "DataFusion" } else { "DuckDB" };
 
     Ok(Json(serde_json::json!({
         "query_id": query.id,
         "query_name": query.name,
         "datafusion": df_result,
         "duckdb": duck_result,
+        "polars": polars_result,
         "speedup": speedup,
         "winner": winner,
     })))

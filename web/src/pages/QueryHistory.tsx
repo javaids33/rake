@@ -34,6 +34,7 @@ export function QueryHistory() {
       const entryEngine = e.engine || 'DataFusion'
       if (engineFilter === 'datafusion' && entryEngine !== 'DataFusion') return false
       if (engineFilter === 'duckdb' && entryEngine !== 'DuckDB') return false
+      if (engineFilter === 'polars' && entryEngine !== 'Polars') return false
     }
     if (search && !e.sql.toLowerCase().includes(search.toLowerCase())) return false
     return true
@@ -100,6 +101,7 @@ export function QueryHistory() {
             { id: 'all', label: 'All Engines' },
             { id: 'datafusion', label: 'DataFusion' },
             { id: 'duckdb', label: 'DuckDB' },
+            { id: 'polars', label: 'Polars' },
           ].map(eng => (
             <button
               key={eng.id}
@@ -143,8 +145,8 @@ export function QueryHistory() {
                     <code className="text-xs font-mono text-zinc-300 block truncate">{entry.sql}</code>
                     <div className="flex items-center gap-2 mt-1.5">
                       <Badge className={QUERY_TYPE_COLORS[entry.query_type] || 'bg-white/[0.04] text-zinc-400 border-white/[0.06]'}>{entry.query_type}</Badge>
-                      <Badge className={(entry.engine || 'DataFusion') === 'DuckDB' ? 'bg-emerald-400/10 text-emerald-400 border-emerald-400/20' : 'bg-amber-400/10 text-amber-400 border-amber-400/20'}>
-                        {(entry.engine || 'DataFusion') === 'DuckDB' ? 'DK' : 'DF'}
+                      <Badge className={(entry.engine || 'DataFusion') === 'DuckDB' ? 'bg-emerald-400/10 text-emerald-400 border-emerald-400/20' : (entry.engine || 'DataFusion') === 'Polars' ? 'bg-cyan-400/10 text-cyan-400 border-cyan-400/20' : 'bg-amber-400/10 text-amber-400 border-amber-400/20'}>
+                        {(entry.engine || 'DataFusion') === 'DuckDB' ? 'DK' : (entry.engine || 'DataFusion') === 'Polars' ? 'PL' : 'DF'}
                       </Badge>
                       <span className="text-2xs font-mono text-zinc-500 flex items-center gap-1"><Zap className="w-3 h-3" />{formatDuration(entry.duration_ms)}</span>
                       <span className="text-2xs font-mono text-zinc-500 flex items-center gap-1"><Rows3 className="w-3 h-3" />{formatNumber(entry.row_count)}</span>

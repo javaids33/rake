@@ -45,9 +45,10 @@ export function truncate(str: string, len: number): string {
 
 export function inferFormat(tableName: string): { format: string; variant: string } {
   if (!tableName) return { format: 'Unknown', variant: 'unknown' }
-  if (tableName.startsWith('pg_')) return { format: 'PostgreSQL', variant: 'external' }
-  if (tableName.startsWith('mysql_')) return { format: 'MySQL', variant: 'external' }
-  if (tableName.startsWith('mongo_')) return { format: 'MongoDB', variant: 'external' }
+  // Schema-qualified names: pg.table, mysql.table, mongo.table
+  if (tableName.startsWith('pg.') || tableName.startsWith('pg_')) return { format: 'PostgreSQL', variant: 'external' }
+  if (tableName.startsWith('mysql.') || tableName.startsWith('mysql_')) return { format: 'MySQL', variant: 'external' }
+  if (tableName.startsWith('mongo.') || tableName.startsWith('mongo_')) return { format: 'MongoDB', variant: 'external' }
   if (tableName.startsWith('uploads_')) return { format: 'Upload', variant: 'file' }
   if (tableName.includes('parquet')) return { format: 'Parquet', variant: 'file' }
   if (tableName.includes('csv')) return { format: 'CSV', variant: 'file' }

@@ -35,6 +35,9 @@ pub struct RustLakeConfig {
     /// DuckDB OLAP accelerator settings.
     #[serde(default)]
     pub duckdb: DuckDbEngineConfig,
+    /// Polars DataFrame engine settings.
+    #[serde(default)]
+    pub polars: PolarsEngineConfig,
 }
 
 impl RustLakeConfig {
@@ -396,6 +399,25 @@ impl Default for DuckDbEngineConfig {
             memory_limit: None,
             threads: None,
         }
+    }
+}
+
+/// Polars DataFrame engine configuration.
+///
+/// When enabled, SQL queries can be routed to Polars for execution. Polars
+/// excels at lazy evaluation and memory-efficient DataFrame transformations.
+///
+/// Env override: `RUSTLAKE_POLARS__ENABLED=true`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PolarsEngineConfig {
+    /// Whether the Polars engine is enabled. Defaults to `false`.
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+impl Default for PolarsEngineConfig {
+    fn default() -> Self {
+        Self { enabled: false }
     }
 }
 

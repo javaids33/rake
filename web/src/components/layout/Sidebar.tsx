@@ -4,7 +4,7 @@ import { useAppStore } from '../../stores/app'
 import {
   Home, Terminal, Database, FolderInput, Radio, Search,
   GitBranch, Clock, Settings, Info, Layers, PanelLeftClose, PanelLeft,
-  Gauge, ShieldCheck, Timer,
+  Gauge, ShieldCheck, Timer, Sun, Moon,
 } from 'lucide-react'
 
 const nav = [
@@ -35,20 +35,23 @@ const accentMap: Record<string, { active: string; glow: string }> = {
 
 export function Sidebar() {
   const location = useLocation()
-  const { sidebarCollapsed, toggleSidebar } = useAppStore()
+  const { sidebarCollapsed, toggleSidebar, darkMode, toggleTheme } = useAppStore()
 
   return (
     <aside className={cn(
-      'flex flex-col h-full glass transition-all duration-300 relative z-20',
-      'border-r-0 border-amber-500/[0.04]',
+      'flex flex-col h-full transition-all duration-300 relative z-20',
+      darkMode
+        ? 'glass border-r-0 border-amber-500/[0.04]'
+        : 'bg-white border-r border-slate-200',
       sidebarCollapsed ? 'w-[56px]' : 'w-[224px]'
     )}>
-      {/* Right edge glow line */}
-      <div className="absolute right-0 top-0 bottom-0 w-px bg-gradient-to-b from-transparent via-amber-400/10 to-transparent" />
+      {/* Right edge glow line — dark only */}
+      {darkMode && <div className="absolute right-0 top-0 bottom-0 w-px bg-gradient-to-b from-transparent via-amber-400/10 to-transparent" />}
 
       {/* Logo */}
       <div className={cn(
-        'flex items-center h-14 border-b border-amber-500/[0.06] px-3',
+        'flex items-center h-14 px-3',
+        darkMode ? 'border-b border-amber-500/[0.06]' : 'border-b border-slate-200',
         sidebarCollapsed ? 'justify-center' : 'gap-3'
       )}>
         <div className="relative w-8 h-8 rounded-xl bg-gradient-to-br from-amber-400 to-amber-600 flex items-center justify-center flex-shrink-0 shadow-lg shadow-amber-500/20">
@@ -58,8 +61,8 @@ export function Sidebar() {
         </div>
         {!sidebarCollapsed && (
           <div className="flex flex-col min-w-0">
-            <span className="text-sm font-display font-bold text-zinc-50 tracking-tight">RustLake</span>
-            <span className="text-2xs text-amber-400/50 font-mono tracking-wider">v0.4.0</span>
+            <span className={cn('text-sm font-display font-bold tracking-tight', darkMode ? 'text-zinc-50' : 'text-slate-900')}>RustLake</span>
+            <span className={cn('text-2xs font-mono tracking-wider', darkMode ? 'text-amber-400/50' : 'text-amber-600/60')}>v0.4.0</span>
           </div>
         )}
       </div>
@@ -79,8 +82,10 @@ export function Sidebar() {
                 'group flex items-center gap-2.5 rounded-lg transition-all duration-200 border',
                 sidebarCollapsed ? 'justify-center p-2.5' : 'px-3 py-2',
                 isActive
-                  ? accent.active
-                  : 'text-zinc-500 border-transparent hover:text-zinc-300 hover:bg-white/[0.02] hover:border-white/[0.03]'
+                  ? darkMode ? accent.active : `text-amber-700 bg-amber-50 border-amber-200`
+                  : darkMode
+                    ? 'text-zinc-500 border-transparent hover:text-zinc-300 hover:bg-white/[0.02] hover:border-white/[0.03]'
+                    : 'text-slate-500 border-transparent hover:text-slate-700 hover:bg-slate-100 hover:border-slate-200'
               )}
               title={sidebarCollapsed ? item.label : undefined}
             >
@@ -99,11 +104,30 @@ export function Sidebar() {
         })}
       </nav>
 
-      {/* Toggle */}
-      <div className="p-2 border-t border-amber-500/[0.04]">
+      {/* Theme + Collapse toggles */}
+      <div className={cn('p-2 space-y-1', darkMode ? 'border-t border-amber-500/[0.04]' : 'border-t border-slate-200')}>
+        <button
+          onClick={toggleTheme}
+          className={cn(
+            'w-full flex items-center gap-2.5 p-2 rounded-lg transition-all duration-200',
+            sidebarCollapsed ? 'justify-center' : '',
+            darkMode
+              ? 'text-zinc-500 hover:text-amber-400/80 hover:bg-amber-400/[0.04]'
+              : 'text-slate-400 hover:text-amber-600 hover:bg-amber-50'
+          )}
+          title={darkMode ? 'Switch to light mode' : 'Switch to dark mode'}
+        >
+          {darkMode ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
+          {!sidebarCollapsed && <span className={cn('text-xs', darkMode ? 'text-zinc-500' : 'text-slate-500')}>{darkMode ? 'Light mode' : 'Dark mode'}</span>}
+        </button>
         <button
           onClick={toggleSidebar}
-          className="w-full flex items-center justify-center p-2 rounded-lg text-zinc-600 hover:text-amber-400/60 hover:bg-amber-400/[0.03] transition-all duration-200"
+          className={cn(
+            'w-full flex items-center justify-center p-2 rounded-lg transition-all duration-200',
+            darkMode
+              ? 'text-zinc-600 hover:text-amber-400/60 hover:bg-amber-400/[0.03]'
+              : 'text-slate-400 hover:text-amber-600 hover:bg-amber-50'
+          )}
         >
           {sidebarCollapsed ? <PanelLeft className="w-4 h-4" /> : <PanelLeftClose className="w-4 h-4" />}
         </button>

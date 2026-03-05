@@ -241,7 +241,19 @@ async fn bootstrap_demo_connections(state: Arc<AppState>) {
                 );
             }
 
-            // Register each collection into DataFusion
+            // Register each collection into a "mongo" DataFusion schema
+            {
+                let ctx = state.ctx.read().await;
+                let df_ctx = ctx.datafusion_ctx();
+                // Ensure "mongo" schema exists
+                if let Some(catalog) = df_ctx.catalog("datafusion") {
+                    if catalog.schema("mongo").is_none() {
+                        let mongo_schema: std::sync::Arc<dyn datafusion::catalog::SchemaProvider> =
+                            std::sync::Arc::new(datafusion::catalog::MemorySchemaProvider::new());
+                        let _ = catalog.register_schema("mongo", mongo_schema);
+                    }
+                }
+            }
             for coll_name in &collections {
                 match mongodb_conn::fetch_collection_as_arrow(&mongo_params, coll_name).await {
                     Ok(batch) => {
@@ -249,13 +261,18 @@ async fn bootstrap_demo_connections(state: Arc<AppState>) {
                         let schema = batch.schema();
                         match datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]) {
                             Ok(mem_table) => {
-                                let df_name = format!("mongo_{}", coll_name);
+                                let df_name = format!("mongo.{}", coll_name);
                                 let ctx = state.ctx.read().await;
-                                match ctx.datafusion_ctx().register_table(&df_name, std::sync::Arc::new(mem_table)) {
-                                    Ok(_) => {
-                                        tracing::info!(table = %df_name, rows = row_count, "Bootstrap: registered MongoDB collection");
+                                let df_ctx = ctx.datafusion_ctx();
+                                if let Some(catalog) = df_ctx.catalog("datafusion") {
+                                    if let Some(schema_prov) = catalog.schema("mongo") {
+                                        match schema_prov.register_table(coll_name.clone(), std::sync::Arc::new(mem_table)) {
+                                            Ok(_) => {
+                                                tracing::info!(table = %df_name, rows = row_count, "Bootstrap: registered MongoDB collection");
+                                            }
+                                            Err(e) => tracing::warn!(table = %df_name, error = %e, "Bootstrap: failed to register MongoDB collection"),
+                                        }
                                     }
-                                    Err(e) => tracing::warn!(table = %df_name, error = %e, "Bootstrap: failed to register MongoDB collection"),
                                 }
                             }
                             Err(e) => tracing::warn!(collection = %coll_name, error = %e, "Bootstrap: failed to create MongoDB MemTable"),
@@ -300,12 +317,13 @@ async fn bootstrap_demo_connections(state: Arc<AppState>) {
             name: "Postgres Snapshot".to_string(),
             job_type: "sql_query".to_string(),
             cron: "*/5 * * * *".to_string(),
-            target: "SELECT count(*) FROM pg_customers".to_string(),
+            target: "SELECT count(*) FROM pg.customers".to_string(),
             enabled: true,
             last_run: None,
             next_run: None,
             last_status: None,
             created_at: chrono::Utc::now(),
+            engine: "auto".to_string(),
             trigger_type: "time".to_string(),
             event_config: None,
             cluster: Some("default".to_string()),
@@ -324,6 +342,7 @@ async fn bootstrap_demo_connections(state: Arc<AppState>) {
             next_run: None,
             last_status: None,
             created_at: chrono::Utc::now(),
+            engine: "auto".to_string(),
             trigger_type: "time".to_string(),
             event_config: None,
             cluster: Some("default".to_string()),
@@ -336,12 +355,13 @@ async fn bootstrap_demo_connections(state: Arc<AppState>) {
             name: "MV: Sales Summary".to_string(),
             job_type: "materialized_view".to_string(),
             cron: "*/30 * * * *".to_string(),
-            target: "SELECT product_id, SUM(amount) as total_amount FROM pg_sales GROUP BY product_id".to_string(),
+            target: "SELECT product_id, SUM(amount) as total_amount FROM pg.sales GROUP BY product_id".to_string(),
             enabled: true,
             last_run: None,
             next_run: None,
             last_status: None,
             created_at: chrono::Utc::now(),
+            engine: "auto".to_string(),
             trigger_type: "time".to_string(),
             event_config: None,
             cluster: Some("default".to_string()),
@@ -354,12 +374,13 @@ async fn bootstrap_demo_connections(state: Arc<AppState>) {
             name: "TPC-H Q1: Pricing Summary".to_string(),
             job_type: "sql_query".to_string(),
             cron: "0 * * * *".to_string(),
-            target: "SELECT l_returnflag, l_linestatus, SUM(l_quantity) as sum_qty, SUM(l_extendedprice) as sum_base_price, COUNT(*) as count_order FROM pg_tpch_lineitem WHERE l_shipdate <= DATE '1998-12-01' - INTERVAL '90' DAY GROUP BY l_returnflag, l_linestatus ORDER BY l_returnflag, l_linestatus".to_string(),
+            target: "SELECT l_returnflag, l_linestatus, SUM(l_quantity) as sum_qty, SUM(l_extendedprice) as sum_base_price, COUNT(*) as count_order FROM pg.tpch_lineitem WHERE l_shipdate <= DATE '1998-12-01' - INTERVAL '90' DAY GROUP BY l_returnflag, l_linestatus ORDER BY l_returnflag, l_linestatus".to_string(),
             enabled: true,
             last_run: None,
             next_run: None,
             last_status: None,
             created_at: chrono::Utc::now(),
+            engine: "auto".to_string(),
             trigger_type: "time".to_string(),
             event_config: None,
             cluster: Some("default".to_string()),
@@ -372,12 +393,13 @@ async fn bootstrap_demo_connections(state: Arc<AppState>) {
             name: "ETL: Revenue by Nation".to_string(),
             job_type: "etl_pipeline".to_string(),
             cron: "0 */6 * * *".to_string(),
-            target: "SELECT n.n_name as nation, EXTRACT(YEAR FROM o.o_orderdate) as year, SUM(l.l_extendedprice * (1 - l.l_discount)) as revenue FROM pg_tpch_lineitem l JOIN pg_tpch_orders o ON l.l_orderkey = o.o_orderkey JOIN pg_tpch_customer c ON o.o_custkey = c.c_custkey JOIN pg_tpch_nation n ON c.c_nationkey = n.n_nationkey GROUP BY n.n_name, EXTRACT(YEAR FROM o.o_orderdate) ORDER BY nation, year".to_string(),
+            target: "SELECT n.n_name as nation, EXTRACT(YEAR FROM o.o_orderdate) as year, SUM(l.l_extendedprice * (1 - l.l_discount)) as revenue FROM pg.tpch_lineitem l JOIN pg.tpch_orders o ON l.l_orderkey = o.o_orderkey JOIN pg.tpch_customer c ON o.o_custkey = c.c_custkey JOIN pg.tpch_nation n ON c.c_nationkey = n.n_nationkey GROUP BY n.n_name, EXTRACT(YEAR FROM o.o_orderdate) ORDER BY nation, year".to_string(),
             enabled: true,
             last_run: None,
             next_run: None,
             last_status: None,
             created_at: chrono::Utc::now(),
+            engine: "auto".to_string(),
             trigger_type: "time".to_string(),
             event_config: None,
             cluster: Some("default".to_string()),
@@ -421,32 +443,32 @@ async fn bootstrap_demo_connections(state: Arc<AppState>) {
     let demo_transforms = vec![
         UserTransform {
             name: "customer_orders".to_string(),
-            sql: "SELECT c.name, COUNT(o.id) as order_count, SUM(o.amount) as total_spent\nFROM pg_customers c\nJOIN pg_orders o ON c.id = o.customer_id\nGROUP BY c.name\nORDER BY total_spent DESC".to_string(),
-            depends_on: vec!["pg_customers".to_string(), "pg_orders".to_string()],
+            sql: "SELECT c.name, COUNT(o.id) as order_count, SUM(o.amount) as total_spent\nFROM pg.customers c\nJOIN pg.orders o ON c.id = o.customer_id\nGROUP BY c.name\nORDER BY total_spent DESC".to_string(),
+            depends_on: vec!["pg.customers".to_string(), "pg.orders".to_string()],
             materialization: "view".to_string(),
             description: "Customer order summary with count and total spend".to_string(),
             created_at: chrono::Utc::now(),
         },
         UserTransform {
             name: "sales_by_product".to_string(),
-            sql: "SELECT p.name as product_name, p.category,\n  COUNT(s.id) as sale_count, SUM(s.amount) as revenue\nFROM pg_products p\nJOIN pg_sales s ON p.id = s.product_id\nGROUP BY p.name, p.category\nORDER BY revenue DESC".to_string(),
-            depends_on: vec!["pg_products".to_string(), "pg_sales".to_string()],
+            sql: "SELECT p.name as product_name, p.category,\n  COUNT(s.id) as sale_count, SUM(s.amount) as revenue\nFROM pg.products p\nJOIN pg.sales s ON p.id = s.product_id\nGROUP BY p.name, p.category\nORDER BY revenue DESC".to_string(),
+            depends_on: vec!["pg.products".to_string(), "pg.sales".to_string()],
             materialization: "table".to_string(),
             description: "Product sales aggregation with revenue breakdown".to_string(),
             created_at: chrono::Utc::now(),
         },
         UserTransform {
             name: "tpch_revenue_by_nation".to_string(),
-            sql: "SELECT n.n_name as nation,\n  SUM(l.l_extendedprice * (1 - l.l_discount)) as revenue\nFROM pg_tpch_customer c\nJOIN pg_tpch_orders o ON c.c_custkey = o.o_custkey\nJOIN pg_tpch_lineitem l ON l.l_orderkey = o.o_orderkey\nJOIN pg_tpch_supplier s ON l.l_suppkey = s.s_suppkey AND c.c_nationkey = s.s_nationkey\nJOIN pg_tpch_nation n ON s.s_nationkey = n.n_nationkey\nJOIN pg_tpch_region r ON n.n_regionkey = r.r_regionkey\nWHERE r.r_name = 'ASIA'\nGROUP BY n.n_name\nORDER BY revenue DESC".to_string(),
-            depends_on: vec!["pg_tpch_customer".to_string(), "pg_tpch_orders".to_string(), "pg_tpch_lineitem".to_string(), "pg_tpch_supplier".to_string(), "pg_tpch_nation".to_string(), "pg_tpch_region".to_string()],
+            sql: "SELECT n.n_name as nation,\n  SUM(l.l_extendedprice * (1 - l.l_discount)) as revenue\nFROM pg.tpch_customer c\nJOIN pg.tpch_orders o ON c.c_custkey = o.o_custkey\nJOIN pg.tpch_lineitem l ON l.l_orderkey = o.o_orderkey\nJOIN pg.tpch_supplier s ON l.l_suppkey = s.s_suppkey AND c.c_nationkey = s.s_nationkey\nJOIN pg.tpch_nation n ON s.s_nationkey = n.n_nationkey\nJOIN pg.tpch_region r ON n.n_regionkey = r.r_regionkey\nWHERE r.r_name = 'ASIA'\nGROUP BY n.n_name\nORDER BY revenue DESC".to_string(),
+            depends_on: vec!["pg.tpch_customer".to_string(), "pg.tpch_orders".to_string(), "pg.tpch_lineitem".to_string(), "pg.tpch_supplier".to_string(), "pg.tpch_nation".to_string(), "pg.tpch_region".to_string()],
             materialization: "table".to_string(),
             description: "TPC-H Q5: Revenue by nation for Asia-Pacific suppliers".to_string(),
             created_at: chrono::Utc::now(),
         },
         UserTransform {
             name: "tpch_customer_segments".to_string(),
-            sql: "SELECT c.c_mktsegment as segment,\n  COUNT(DISTINCT c.c_custkey) as customer_count,\n  COUNT(o.o_orderkey) as order_count,\n  SUM(o.o_totalprice) as total_revenue\nFROM pg_tpch_customer c\nLEFT JOIN pg_tpch_orders o ON c.c_custkey = o.o_custkey\nGROUP BY c.c_mktsegment\nORDER BY total_revenue DESC".to_string(),
-            depends_on: vec!["pg_tpch_customer".to_string(), "pg_tpch_orders".to_string()],
+            sql: "SELECT c.c_mktsegment as segment,\n  COUNT(DISTINCT c.c_custkey) as customer_count,\n  COUNT(o.o_orderkey) as order_count,\n  SUM(o.o_totalprice) as total_revenue\nFROM pg.tpch_customer c\nLEFT JOIN pg.tpch_orders o ON c.c_custkey = o.o_custkey\nGROUP BY c.c_mktsegment\nORDER BY total_revenue DESC".to_string(),
+            depends_on: vec!["pg.tpch_customer".to_string(), "pg.tpch_orders".to_string()],
             materialization: "view".to_string(),
             description: "Customer segmentation with order counts and revenue by market segment".to_string(),
             created_at: chrono::Utc::now(),
@@ -510,6 +532,53 @@ async fn sync_tables_to_duckdb(state: &AppState) {
         }
         Err(e) => {
             tracing::warn!(error = %e, "DuckDB: table sync failed");
+        }
+    }
+}
+
+/// Sync all registered DataFusion tables into Polars for DataFrame execution.
+#[cfg(feature = "polars")]
+async fn sync_tables_to_polars(state: &AppState) {
+    let Some(ref polars_engine) = state.polars_engine else {
+        return;
+    };
+
+    let ctx = state.ctx.read().await;
+    let tables = match ctx.list_tables().await {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(error = %e, "Polars sync: failed to list tables");
+            return;
+        }
+    };
+
+    let mut sync_data = Vec::new();
+    for table_name in &tables {
+        let sql = format!("SELECT * FROM \"{}\"", table_name);
+        match ctx.datafusion_ctx().sql(&sql).await {
+            Ok(df) => match df.collect().await {
+                Ok(batches) if !batches.is_empty() => {
+                    sync_data.push((table_name.clone(), batches));
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::debug!(table = %table_name, error = %e, "Polars sync: skip table (read error)");
+                }
+            },
+            Err(e) => {
+                tracing::debug!(table = %table_name, error = %e, "Polars sync: skip table (sql error)");
+            }
+        }
+    }
+    drop(ctx);
+
+    let table_count = sync_data.len();
+    match polars_engine.sync_tables(sync_data).await {
+        Ok(synced) => {
+            tracing::info!(synced, total = table_count, "Polars: table sync complete");
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Polars: table sync failed");
         }
     }
 }
@@ -592,6 +661,28 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Initialize Polars engine if compiled and enabled
+    #[cfg(feature = "polars")]
+    {
+        let polars_enabled = std::env::var("RUSTLAKE_POLARS__ENABLED")
+            .map(|v| v == "true" || v == "1")
+            .unwrap_or(config.polars.enabled);
+
+        if polars_enabled {
+            match rustlake_engine::polars_engine::PolarsEngine::new() {
+                Ok(engine) => {
+                    tracing::info!(version = %engine.version(), "Polars engine initialized");
+                    state.polars_engine = Some(engine);
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "Failed to initialize Polars engine");
+                }
+            }
+        } else {
+            tracing::info!("Polars engine disabled — enable with RUSTLAKE_POLARS__ENABLED=true");
+        }
+    }
+
     let flight_metrics = FlightMetrics::default();
     state.flight_metrics = Some(flight_metrics.clone());
 
@@ -631,6 +722,14 @@ async fn main() -> anyhow::Result<()> {
                     sync_tables_to_duckdb(&bootstrap_state).await;
                 }
             }
+
+            // Sync all registered tables to Polars after bootstrap
+            #[cfg(feature = "polars")]
+            {
+                if bootstrap_state.polars_available() {
+                    sync_tables_to_polars(&bootstrap_state).await;
+                }
+            }
         });
     }
 
@@ -638,7 +737,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("║              RustLake Data Platform v0.1.0               ║");
     tracing::info!("╚══════════════════════════════════════════════════════════╝");
     tracing::info!(role = ?node_role, bind = %bind_addr, "HTTP API server starting");
-    tracing::info!(flight = flight_enabled, duckdb = state.duckdb_available(), "Engine status");
+    tracing::info!(flight = flight_enabled, duckdb = state.duckdb_available(), polars = state.polars_available(), "Engine status");
     tracing::debug!("RUST_LOG={}", std::env::var("RUST_LOG").unwrap_or_else(|_| "info,rustlake_*=debug,tower_http=debug".to_string()));
 
     // Build the Axum router

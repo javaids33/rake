@@ -145,7 +145,7 @@ export function Benchmarks() {
     ? Math.round([...results.values()].reduce((a, r) => a + r.duration_ms, 0) / completedCount)
     : 0
 
-  const hasTpchTables = bootstrap?.registered_tables.some(t => t.startsWith('pg_tpch_')) ?? false
+  const hasTpchTables = bootstrap?.registered_tables.some(t => t.startsWith('pg.tpch_') || t.startsWith('pg_tpch_')) ?? false
 
   return (
     <div className="flex flex-col h-full animate-fade-in">
@@ -280,23 +280,34 @@ export function Benchmarks() {
                         </pre>
                       </details>
                       {compare && (
-                        <div className="mt-2 flex items-center gap-3 p-2 rounded-lg bg-white/[0.02] border border-white/[0.04]">
+                        <div className="mt-2 flex items-center gap-3 p-2 rounded-lg bg-white/[0.02] border border-white/[0.04] flex-wrap">
                           <span className={cn(
                             'text-2xs font-mono px-2 py-0.5 rounded',
-                            compare.winner === 'datafusion' ? 'bg-emerald-400/10 text-emerald-400' : 'text-zinc-400'
+                            compare.winner === 'DataFusion' ? 'bg-amber-400/10 text-amber-400' : 'text-zinc-400'
                           )}>
-                            DataFusion: {compare.datafusion.duration_ms}ms
+                            DF: {compare.datafusion.duration_ms}ms
                           </span>
                           <span className="text-2xs text-zinc-600">|</span>
                           <span className={cn(
                             'text-2xs font-mono px-2 py-0.5 rounded',
-                            compare.winner === 'duckdb' ? 'bg-emerald-400/10 text-emerald-400' : 'text-zinc-400'
+                            compare.winner === 'DuckDB' ? 'bg-emerald-400/10 text-emerald-400' : 'text-zinc-400'
                           )}>
-                            DuckDB: {compare.duckdb.duration_ms}ms
+                            DK: {compare.duckdb.duration_ms}ms
                           </span>
+                          {compare.polars && (
+                            <>
+                              <span className="text-2xs text-zinc-600">|</span>
+                              <span className={cn(
+                                'text-2xs font-mono px-2 py-0.5 rounded',
+                                compare.winner === 'Polars' ? 'bg-cyan-400/10 text-cyan-400' : 'text-zinc-400'
+                              )}>
+                                PL: {compare.polars.status === 'success' ? `${compare.polars.duration_ms}ms` : compare.polars.status}
+                              </span>
+                            </>
+                          )}
                           <span className="text-2xs text-zinc-600">|</span>
                           <Badge className="bg-amber-400/10 text-amber-400 border-amber-400/20">
-                            Winner: {compare.winner} ({compare.speedup.toFixed(1)}x)
+                            Winner: {compare.winner}
                           </Badge>
                         </div>
                       )}

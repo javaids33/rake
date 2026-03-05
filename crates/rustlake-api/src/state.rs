@@ -179,6 +179,9 @@ pub struct ScheduledJob {
     pub next_run: Option<DateTime<Utc>>,
     pub last_status: Option<String>,
     pub created_at: DateTime<Utc>,
+    /// Target engine: "auto", "datafusion", "duckdb", or "polars".
+    #[serde(default = "default_auto_engine")]
+    pub engine: String,
     /// Trigger type: "time", "event", or "continuous".
     #[serde(default = "default_trigger_type")]
     pub trigger_type: String,
@@ -197,6 +200,10 @@ pub struct ScheduledJob {
     /// User-defined tags for filtering.
     #[serde(default)]
     pub tags: Vec<String>,
+}
+
+fn default_auto_engine() -> String {
+    "auto".to_string()
 }
 
 fn default_trigger_type() -> String {
@@ -255,6 +262,9 @@ pub struct AppState {
     /// Optional DuckDB OLAP accelerator engine.
     #[cfg(feature = "duckdb")]
     pub duckdb_engine: Option<rustlake_engine::duckdb_engine::DuckDbEngine>,
+    /// Optional Polars DataFrame engine.
+    #[cfg(feature = "polars")]
+    pub polars_engine: Option<rustlake_engine::polars_engine::PolarsEngine>,
     /// Live metrics from the Arrow Flight gRPC server (None if Flight is disabled).
     pub flight_metrics: Option<rustlake_flight::server::FlightMetrics>,
     /// Coordinator handle for cluster management (None if not a coordinator).
@@ -316,6 +326,18 @@ impl AppState {
         }
     }
 
+    /// Whether Polars is available as a DataFrame engine.
+    pub fn polars_available(&self) -> bool {
+        #[cfg(feature = "polars")]
+        {
+            self.polars_engine.is_some()
+        }
+        #[cfg(not(feature = "polars"))]
+        {
+            false
+        }
+    }
+
     /// Create a new AppState with an empty vector index.
     #[allow(dead_code)]
     pub fn new(ctx: RustLakeContext) -> Self {
@@ -325,6 +347,8 @@ impl AppState {
             provider_registry: crate::providers::ProviderRegistry::new(),
             #[cfg(feature = "duckdb")]
             duckdb_engine: None,
+            #[cfg(feature = "polars")]
+            polars_engine: None,
             flight_metrics: None,
             coordinator: None,
             query_history: RwLock::new(Vec::new()),
@@ -360,6 +384,8 @@ impl AppState {
             provider_registry: crate::providers::ProviderRegistry::new(),
             #[cfg(feature = "duckdb")]
             duckdb_engine: None,
+            #[cfg(feature = "polars")]
+            polars_engine: None,
             flight_metrics: None,
             coordinator: None,
             query_history: RwLock::new(Vec::new()),

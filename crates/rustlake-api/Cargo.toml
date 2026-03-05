@@ -4,8 +4,9 @@ version.workspace = true
 edition.workspace = true
 
 [features]
-default = ["duckdb", "postgres", "mysql", "sqlite"]
+default = ["duckdb", "postgres", "mysql", "sqlite", "polars"]
 duckdb = ["rustlake-engine/duckdb"]
+polars = ["rustlake-engine/polars"]
 postgres = ["datafusion-table-providers/postgres-federation"]
 mysql = ["datafusion-table-providers/mysql-federation", "dep:mysql_async"]
 sqlite = ["datafusion-table-providers/sqlite-federation", "datafusion-table-providers/sqlite-bundled", "dep:rusqlite"]
