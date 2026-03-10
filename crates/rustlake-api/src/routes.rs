@@ -587,6 +587,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/", get(dashboard))
         .route("/health", get(health))
         .route("/api/v1/sql", post(execute_sql))
+        .route("/api/v1/sql/compare", post(compare_sql))
         .route("/api/v1/sql/explain", post(explain_sql))
         .route("/api/v1/tables", get(list_tables))
         .route("/api/v1/tables/register", post(register_table))
@@ -882,6 +883,120 @@ async fn execute_via_polars(
     Err("Polars engine not available".to_string())
 }
 
+/// Compare SQL execution across all available engines.
+/// Returns per-engine timing, row counts, and the winner.
+async fn compare_sql(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SqlRequest>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let query_id = Uuid::new_v4();
+    tracing::info!(%query_id, sql = %req.sql, "Comparing SQL across engines");
+
+    // Run on DataFusion
+    let df_start = Instant::now();
+    let ctx = state.ctx.read().await;
+    let df_result = match ctx.datafusion_ctx().sql(&req.sql).await {
+        Ok(df) => match df.collect().await {
+            Ok(batches) => {
+                let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
+                serde_json::json!({
+                    "duration_ms": df_start.elapsed().as_millis() as u64,
+                    "row_count": row_count,
+                    "status": "success"
+                })
+            }
+            Err(e) => serde_json::json!({
+                "duration_ms": df_start.elapsed().as_millis() as u64,
+                "row_count": 0,
+                "status": "error",
+                "error": e.to_string()
+            }),
+        },
+        Err(e) => serde_json::json!({
+            "duration_ms": df_start.elapsed().as_millis() as u64,
+            "row_count": 0,
+            "status": "error",
+            "error": e.to_string()
+        }),
+    };
+    drop(ctx);
+
+    // Run on DuckDB
+    let duck_result = if state.duckdb_available() {
+        let duck_start = Instant::now();
+        match execute_via_duckdb(&state, &req.sql).await {
+            Ok(batches) => {
+                let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
+                serde_json::json!({
+                    "duration_ms": duck_start.elapsed().as_millis() as u64,
+                    "row_count": row_count,
+                    "status": "success"
+                })
+            }
+            Err(e) => serde_json::json!({
+                "duration_ms": duck_start.elapsed().as_millis() as u64,
+                "row_count": 0,
+                "status": "error",
+                "error": e.to_string()
+            }),
+        }
+    } else {
+        serde_json::json!({ "duration_ms": 0, "row_count": 0, "status": "unavailable" })
+    };
+
+    // Run on Polars
+    let polars_result = if state.polars_available() {
+        let polars_start = Instant::now();
+        match execute_via_polars(&state, &req.sql).await {
+            Ok(batches) => {
+                let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
+                serde_json::json!({
+                    "duration_ms": polars_start.elapsed().as_millis() as u64,
+                    "row_count": row_count,
+                    "status": "success"
+                })
+            }
+            Err(e) => serde_json::json!({
+                "duration_ms": polars_start.elapsed().as_millis() as u64,
+                "row_count": 0,
+                "status": "error",
+                "error": e.to_string()
+            }),
+        }
+    } else {
+        serde_json::json!({ "duration_ms": 0, "row_count": 0, "status": "unavailable" })
+    };
+
+    // Determine winner
+    let df_ms = df_result["duration_ms"].as_f64().unwrap_or(f64::MAX);
+    let df_ok = df_result["status"].as_str() == Some("success");
+    let dk_ms = duck_result["duration_ms"].as_f64().unwrap_or(f64::MAX);
+    let dk_ok = duck_result["status"].as_str() == Some("success");
+    let pl_ms = polars_result["duration_ms"].as_f64().unwrap_or(f64::MAX);
+    let pl_ok = polars_result["status"].as_str() == Some("success");
+
+    let mut best_ms = f64::MAX;
+    let mut winner = "N/A";
+    if df_ok && df_ms < best_ms { best_ms = df_ms; winner = "DataFusion"; }
+    if dk_ok && dk_ms < best_ms { best_ms = dk_ms; winner = "DuckDB"; }
+    if pl_ok && pl_ms < best_ms { best_ms = pl_ms; winner = "Polars"; }
+
+    let slowest = [df_ms, dk_ms, pl_ms].iter().copied()
+        .filter(|&v| v < f64::MAX && v > 0.0)
+        .fold(0.0_f64, f64::max);
+    let speedup = if best_ms > 0.0 && slowest > 0.0 { slowest / best_ms } else { 1.0 };
+
+    Ok(Json(serde_json::json!({
+        "query_id": query_id.to_string(),
+        "sql": req.sql,
+        "datafusion": df_result,
+        "duckdb": duck_result,
+        "polars": polars_result,
+        "speedup": (speedup * 100.0).round() / 100.0,
+        "winner": winner,
+    })))
+}
+
 /// Shared response builder for execute_sql (avoids duplication with fallback path).
 async fn finish_sql_response(
     state: &AppState,
@@ -1108,6 +1223,30 @@ async fn register_table(
     })?;
 
     tracing::info!(table = %req.name, path = %req.path, format, "Table registered");
+
+    // Sync newly registered table to DuckDB and Polars engines
+    let table_name = req.name.clone();
+    let sync_sql = format!("SELECT * FROM \"{}\"", table_name);
+    if let Ok(df) = ctx.datafusion_ctx().sql(&sync_sql).await {
+        if let Ok(batches) = df.collect().await {
+            if !batches.is_empty() {
+                #[cfg(feature = "duckdb")]
+                if let Some(ref duckdb) = state.duckdb_engine {
+                    match duckdb.register_arrow_table(&table_name, &batches).await {
+                        Ok(()) => tracing::debug!(table = %table_name, "Synced to DuckDB"),
+                        Err(e) => tracing::debug!(table = %table_name, error = %e, "DuckDB sync skipped"),
+                    }
+                }
+                #[cfg(feature = "polars")]
+                if let Some(ref polars) = state.polars_engine {
+                    match polars.register_arrow_table(&table_name, &batches).await {
+                        Ok(()) => tracing::debug!(table = %table_name, "Synced to Polars"),
+                        Err(e) => tracing::debug!(table = %table_name, error = %e, "Polars sync skipped"),
+                    }
+                }
+            }
+        }
+    }
 
     Ok(Json(serde_json::json!({
         "status": "ok",

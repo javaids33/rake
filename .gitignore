@@ -23,3 +23,5 @@ benchmarks/
 # Environment (secrets)
 .env
 .env.local
+CLAUDE.md
+.gitignore

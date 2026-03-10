@@ -16,18 +16,9 @@ duckdb = { workspace = true, optional = true }
 # Cargo unifies this with duckdb's arrow-array/arrow-schema v56 dependencies.
 duckdb-ipc = { package = "arrow-ipc", version = "56", optional = true }
 rustlake-core = { workspace = true }
-rustlake-storage = { workspace = true }
-rustlake-catalog = { workspace = true }
 datafusion = { workspace = true }
 datafusion-federation = { workspace = true }
 arrow = { workspace = true }
 arrow-ipc = { workspace = true }
-arrow-json = { workspace = true }
-arrow-cast = { workspace = true }
-object_store = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
-async-trait = { workspace = true }
-serde = { workspace = true }
-serde_json = { workspace = true }
-url = { workspace = true }

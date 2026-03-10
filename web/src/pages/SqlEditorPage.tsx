@@ -11,12 +11,13 @@ import { Tabs } from '../components/ui/Tabs'
 import { Modal } from '../components/ui/Modal'
 import { Input } from '../components/ui/Input'
 import { cn, formatDuration, QUERY_TYPE_COLORS, FORMAT_COLORS, inferFormat } from '../lib/utils'
-import { executeSql, explainSql, estimateQuery, getTables, getTableSchema, getConnections, getS3Configs } from '../api/client'
+import { executeSql, explainSql, estimateQuery, compareSql, getTables, getTableSchema, getConnections, getS3Configs } from '../api/client'
+import type { SqlCompareResponse } from '../api/client'
 import type { ChartType, ColumnSchema, ConnectionEntry, S3Config, ExplainResponse, QueryEstimateResponse } from '../types'
 import { Tooltip } from '../components/ui/Tooltip'
 import {
   Play, Plus, X, Table2, BarChart3, LineChart, ScatterChart, PieChart,
-  AreaChart, Save, BookOpen, Zap, Clock, Rows3, Terminal, FileSearch, Gauge,
+  AreaChart, Save, BookOpen, Zap, Clock, Rows3, Terminal, FileSearch, Gauge, ArrowLeftRight, Trophy,
   ChevronDown, ChevronRight, GitBranch, Radio, Workflow, Database, Plug, Search, Columns3, MousePointerClick, HardDrive, Trash2,
 } from 'lucide-react'
 
@@ -58,6 +59,8 @@ export function SqlEditorPage() {
   const [renameValue, setRenameValue] = useState('')
   const [editorHeight, setEditorHeight] = useState(45) // percentage
   const [engineChoice, setEngineChoice] = useState<string>('auto')
+  const [compareResult, setCompareResult] = useState<SqlCompareResponse | null>(null)
+  const [comparing, setComparing] = useState(false)
   const resizing = useRef(false)
   const containerRef = useRef<HTMLDivElement>(null)
   const workflowRef = useRef<HTMLDivElement>(null)
@@ -100,6 +103,7 @@ export function SqlEditorPage() {
   useEffect(() => {
     setEstimate(null)
     setExplainResult(null)
+    setCompareResult(null)
     setView('table')
   }, [store.activeTabId])
 
@@ -173,6 +177,20 @@ export function SqlEditorPage() {
       setEstimate(est)
     } catch { setEstimate(null) }
     setEstimating(false)
+  }
+
+  const handleCompare = async () => {
+    const sql = activeTab.sql.trim()
+    if (!sql) return
+    setComparing(true)
+    setCompareResult(null)
+    try {
+      const res = await compareSql(sql)
+      setCompareResult(res)
+    } catch (e) {
+      store.setError(store.activeTabId, (e as Error).message)
+    }
+    setComparing(false)
   }
 
   const toggleConn = (id: string) => {
@@ -369,6 +387,9 @@ export function SqlEditorPage() {
           <Button variant="primary" size="sm" icon={<Play className="w-3.5 h-3.5" />} onClick={runQuery} loading={loading}>
             Run
           </Button>
+          <Button variant="ghost" size="sm" icon={<ArrowLeftRight className="w-3.5 h-3.5 text-cyan-400" />} onClick={handleCompare} loading={comparing}>
+            <span className="text-cyan-400">Compare All</span>
+          </Button>
         </div>
       </div>
 
@@ -415,6 +436,75 @@ export function SqlEditorPage() {
                 <span style={{ color: '#94a3b8' }}>Tables: {estimate.tables_referenced.join(', ')}</span>
               )}
               <button onClick={() => setEstimate(null)} style={{ marginLeft: 'auto', background: 'none', border: 'none', color: '#64748b', cursor: 'pointer', fontSize: 14 }}>&#x2715;</button>
+            </div>
+          )}
+
+          {/* Engine Comparison Panel */}
+          {compareResult && (
+            <div className="px-4 py-3 border-b border-white/[0.04] bg-navy-950/60">
+              <div className="flex items-center justify-between mb-2.5">
+                <div className="flex items-center gap-2">
+                  <ArrowLeftRight className="w-3.5 h-3.5 text-cyan-400" />
+                  <span className="text-xs font-semibold text-zinc-200">Engine Comparison</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  {compareResult.winner !== 'N/A' && (
+                    <span className="flex items-center gap-1 text-2xs font-medium text-amber-400">
+                      <Trophy className="w-3 h-3" /> {compareResult.winner} wins
+                      {compareResult.speedup > 1 && ` (${compareResult.speedup}x faster)`}
+                    </span>
+                  )}
+                  <button onClick={() => setCompareResult(null)} className="text-zinc-600 hover:text-zinc-400 transition-colors">
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              </div>
+              <div className="grid grid-cols-3 gap-2">
+                {([
+                  { key: 'datafusion' as const, label: 'DataFusion', short: 'DF', color: 'amber' },
+                  { key: 'duckdb' as const, label: 'DuckDB', short: 'DK', color: 'emerald' },
+                  { key: 'polars' as const, label: 'Polars', short: 'PL', color: 'cyan' },
+                ] as const).map(eng => {
+                  const r = compareResult[eng.key]
+                  const isWinner = compareResult.winner === eng.label
+                  return (
+                    <div key={eng.key} className={cn(
+                      'rounded-lg border p-2.5 transition-all',
+                      isWinner
+                        ? `border-${eng.color}-500/40 bg-${eng.color}-500/[0.06]`
+                        : 'border-white/[0.04] bg-navy-950/40'
+                    )} style={isWinner ? {
+                      borderColor: eng.color === 'amber' ? 'rgba(245,158,11,0.4)' : eng.color === 'emerald' ? 'rgba(16,185,129,0.4)' : 'rgba(6,182,212,0.4)',
+                      background: eng.color === 'amber' ? 'rgba(245,158,11,0.06)' : eng.color === 'emerald' ? 'rgba(16,185,129,0.06)' : 'rgba(6,182,212,0.06)',
+                    } : {}}>
+                      <div className="flex items-center justify-between mb-1.5">
+                        <span className={cn(
+                          'inline-flex items-center px-1.5 py-0.5 rounded text-2xs font-bold',
+                          eng.color === 'amber' ? 'bg-amber-500/15 text-amber-400' :
+                          eng.color === 'emerald' ? 'bg-emerald-500/15 text-emerald-400' :
+                          'bg-cyan-500/15 text-cyan-400'
+                        )}>
+                          {eng.short}
+                        </span>
+                        {isWinner && <Trophy className="w-3 h-3 text-amber-400" />}
+                      </div>
+                      {r.status === 'success' ? (
+                        <div className="space-y-0.5">
+                          <div className="text-sm font-mono font-bold text-zinc-200">{r.duration_ms}ms</div>
+                          <div className="text-2xs text-zinc-500">{r.row_count.toLocaleString()} rows</div>
+                        </div>
+                      ) : r.status === 'unavailable' ? (
+                        <div className="text-2xs text-zinc-600 italic">unavailable</div>
+                      ) : (
+                        <div className="space-y-0.5">
+                          <div className="text-2xs text-rose-400">error</div>
+                          <div className="text-2xs text-zinc-600 truncate" title={r.error}>{r.error}</div>
+                        </div>
+                      )}
+                    </div>
+                  )
+                })}
+              </div>
             </div>
           )}
 

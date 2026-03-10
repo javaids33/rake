@@ -127,6 +127,19 @@ export const deleteS3Config = (name: string) =>
 export const explainSql = (sql: string) =>
   request<ExplainResponse>('/api/v1/sql/explain', { method: 'POST', body: JSON.stringify({ sql }) })
 
+// Compare SQL across all engines
+export interface SqlCompareResponse {
+  query_id: string
+  sql: string
+  datafusion: { duration_ms: number; row_count: number; status: string; error?: string }
+  duckdb: { duration_ms: number; row_count: number; status: string; error?: string }
+  polars: { duration_ms: number; row_count: number; status: string; error?: string }
+  speedup: number
+  winner: string
+}
+export const compareSql = (sql: string) =>
+  request<SqlCompareResponse>('/api/v1/sql/compare', { method: 'POST', body: JSON.stringify({ sql }) })
+
 // Quality
 export const getQualityChecks = () => request<QualityChecksResponse>('/api/v1/quality/checks')
 export const getQualityRules = () => request<{ rules: QualityRule[] }>('/api/v1/quality/rules')

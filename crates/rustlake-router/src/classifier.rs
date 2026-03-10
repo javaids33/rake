@@ -154,12 +154,12 @@ impl QueryClassifier {
         }
 
         // Interactive: simple lookups, LIMIT-bound, no aggregation/join
-        if query.limit_clause.is_some() || (!has_group_by && !has_join) {
+        if query.limit_clause.is_some() {
             return Ok(QueryType::Interactive);
         }
 
-        // Default: OLAP
-        Ok(QueryType::Olap)
+        // Default: simple SELECTs without GROUP BY/JOIN are interactive
+        Ok(QueryType::Interactive)
     }
 }
 

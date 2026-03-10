@@ -5528,23 +5528,14 @@ name = "rustlake-engine"
 version = "0.1.0"
 dependencies = [
  "arrow 57.3.0",
- "arrow-cast 57.3.0",
  "arrow-ipc 56.2.0",
  "arrow-ipc 57.3.0",
- "arrow-json",
- "async-trait",
  "datafusion",
  "datafusion-federation",
  "duckdb",
- "object_store",
- "rustlake-catalog",
  "rustlake-core",
- "rustlake-storage",
- "serde",
- "serde_json",
  "tokio",
  "tracing",
- "url",
 ]
 
 [[package]]
@@ -5599,7 +5590,6 @@ version = "0.1.0"
 dependencies = [
  "datafusion",
  "rustlake-core",
- "tracing",
 ]
 
 [[package]]
