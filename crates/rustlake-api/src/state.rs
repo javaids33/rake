@@ -137,6 +137,16 @@ pub struct ConnectionEntry {
     pub created_at: DateTime<Utc>,
     /// How this connection was added: "bootstrap" (auto) or "user" (manual).
     pub source: String,
+    /// Sync status for async onboarding: "ready", "syncing", "error".
+    #[serde(default = "default_sync_ready")]
+    pub sync_status: String,
+    /// Error message if sync failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_error: Option<String>,
+}
+
+fn default_sync_ready() -> String {
+    "ready".to_string()
 }
 
 /// A user-created transform model.
@@ -642,6 +652,17 @@ impl AppState {
             tracing::error!(error = %e, "Failed to persist connection to disk");
         }
         self.connections.write().await.push(entry);
+    }
+
+    /// Update a connection entry in place and rewrite persistence file.
+    pub async fn update_connection_entry(&self, id: &str, f: impl FnOnce(&mut ConnectionEntry)) {
+        let mut connections = self.connections.write().await;
+        if let Some(entry) = connections.iter_mut().find(|c| c.id == id) {
+            f(entry);
+        }
+        if let Err(e) = rewrite_json_lines(CONNECTIONS_PATH, &*connections) {
+            tracing::error!(error = %e, "Failed to rewrite connections file");
+        }
     }
 
     /// Remove a connection and rewrite the persistence file.

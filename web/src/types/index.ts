@@ -236,6 +236,8 @@ export interface ConnectionEntry {
   tables: string[]
   created_at: string
   mode: 'federated' | 'snapshot'
+  sync_status?: 'syncing' | 'ready' | 'error'
+  sync_error?: string
 }
 
 export interface ProviderInfo {

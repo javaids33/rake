@@ -136,6 +136,8 @@ async fn bootstrap_demo_connections(state: Arc<AppState>) {
                     tables: tables.clone(),
                     created_at: chrono::Utc::now(),
                     source: "bootstrap".to_string(),
+                    sync_status: "ready".to_string(),
+                    sync_error: None,
                 };
                 state.seed_connection(entry, pg_pass).await;
                 tracing::info!(count = tables.len(), "Bootstrap: Postgres tables registered (federated)");
@@ -188,6 +190,8 @@ async fn bootstrap_demo_connections(state: Arc<AppState>) {
                     tables: tables.clone(),
                     created_at: chrono::Utc::now(),
                     source: "bootstrap".to_string(),
+                    sync_status: "ready".to_string(),
+                    sync_error: None,
                 };
                 state.seed_connection(entry, mysql_pass).await;
                 tracing::info!(count = tables.len(), "Bootstrap: MySQL tables registered (federated)");
@@ -231,6 +235,8 @@ async fn bootstrap_demo_connections(state: Arc<AppState>) {
                 tables: collections.clone(),
                 created_at: chrono::Utc::now(),
                 source: "bootstrap".to_string(),
+                sync_status: "ready".to_string(),
+                sync_error: None,
             };
 
             if state.seed_connection(entry, mongo_pass.clone()).await {

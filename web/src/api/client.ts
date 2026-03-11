@@ -105,9 +105,11 @@ export const getClusters = () => request<ClusterInfo>('/api/v1/clusters')
 // Connections
 export const getConnections = () => request<{ connections: ConnectionEntry[] }>('/api/v1/connections')
 export const addConnection = (c: { name: string; conn_type?: string; host: string; port: number; database: string; username: string; password?: string }) =>
-  request<{ status: string }>('/api/v1/connections', { method: 'POST', body: JSON.stringify(c) })
+  request<{ status: string; sync_status: string; id: string; name: string; tables: string[] }>('/api/v1/connections', { method: 'POST', body: JSON.stringify(c) })
 export const deleteConnection = (id: string) =>
   request<{ status: string }>(`/api/v1/connections/${id}`, { method: 'DELETE' })
+export const getConnectionStatus = (id: string) =>
+  request<{ id: string; sync_status: string; sync_error: string | null; tables: string[]; table_count: number }>(`/api/v1/connections/${id}/status`)
 
 // Upload
 export const uploadFile = (file: File) => {

@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import { Card } from '../components/ui/Card'
 import { Button } from '../components/ui/Button'
 import { Badge } from '../components/ui/Badge'
@@ -9,7 +9,7 @@ import { Tabs } from '../components/ui/Tabs'
 import { EmptyState } from '../components/ui/EmptyState'
 import { StatusDot } from '../components/ui/StatusDot'
 import { cn } from '../lib/utils'
-import { getConnections, addConnection, deleteConnection, getS3Configs, addS3Config, deleteS3Config, uploadFile, registerTable, testConnection } from '../api/client'
+import { getConnections, addConnection, deleteConnection, getConnectionStatus, getS3Configs, addS3Config, deleteS3Config, uploadFile, registerTable, testConnection } from '../api/client'
 import type { ConnectionEntry, S3Config, ConnectionTestResponse } from '../types'
 import {
   FolderInput, Database, HardDrive, Upload, Plus, Trash2,
@@ -242,6 +242,52 @@ export function DataSources() {
     setTesting(false)
   }
 
+  // Poll syncing connections for status updates
+  const syncingRef = useRef<Set<string>>(new Set())
+
+  const pollSyncStatus = useCallback(async (connId: string) => {
+    if (syncingRef.current.has(connId)) return // already polling
+    syncingRef.current.add(connId)
+    const poll = async () => {
+      try {
+        const status = await getConnectionStatus(connId)
+        if (status.sync_status === 'ready') {
+          syncingRef.current.delete(connId)
+          setConnections(prev => prev.map(c =>
+            c.id === connId ? { ...c, tables: status.tables, sync_status: 'ready', sync_error: undefined } : c
+          ))
+          toast.success(`${status.table_count} tables discovered`, { id: `sync-${connId}` })
+          return
+        }
+        if (status.sync_status === 'error') {
+          syncingRef.current.delete(connId)
+          setConnections(prev => prev.map(c =>
+            c.id === connId ? { ...c, sync_status: 'error', sync_error: status.sync_error || 'Unknown error' } : c
+          ))
+          toast.error(`Sync failed: ${status.sync_error}`, { id: `sync-${connId}` })
+          return
+        }
+        // Still syncing — update table count if growing
+        setConnections(prev => prev.map(c =>
+          c.id === connId && status.tables.length > (c.tables?.length || 0)
+            ? { ...c, tables: status.tables }
+            : c
+        ))
+        setTimeout(poll, 2000) // poll every 2s
+      } catch {
+        syncingRef.current.delete(connId)
+      }
+    }
+    poll()
+  }, [])
+
+  // On mount, start polling any connections that are still syncing
+  useEffect(() => {
+    connections.forEach(c => {
+      if (c.sync_status === 'syncing') pollSyncStatus(c.id)
+    })
+  }, [connections.length]) // eslint-disable-line react-hooks/exhaustive-deps
+
   const handleConnect = async () => {
     if (!selectedConnector || !connName.trim()) return
     try {
@@ -257,7 +303,7 @@ export function DataSources() {
         toast.success('Storage configured')
         getS3Configs().then(r => setS3Configs(r.configs || []))
       } else if (DB_LIKE_CATEGORIES.includes(selectedConnector.category) && configValues.host) {
-        await addConnection({
+        const result = await addConnection({
           name: connName,
           conn_type: selectedConnector.id,
           host: configValues.host || 'localhost',
@@ -266,8 +312,28 @@ export function DataSources() {
           username: configValues.username || '',
           password: configValues.password || '',
         })
-        toast.success('Database connected')
-        getConnections().then(r => setConnections(r.connections || []))
+        // Add connection immediately with syncing status
+        const newConn: ConnectionEntry = {
+          id: result.id,
+          name: connName,
+          conn_type: selectedConnector.id,
+          host: configValues.host || 'localhost',
+          port: parseInt(configValues.port || '5432'),
+          database: configValues.database || configValues.catalog || configValues.keyspace || '',
+          username: configValues.username || '',
+          status: 'connected',
+          tables: [],
+          created_at: new Date().toISOString(),
+          mode: ['postgres', 'mysql', 'sqlite', 'clickhouse'].includes(selectedConnector.id) ? 'federated' : 'snapshot',
+          sync_status: result.sync_status === 'syncing' ? 'syncing' : 'ready',
+        }
+        setConnections(prev => [...prev, newConn])
+        setTab('active')
+        toast.loading('Discovering tables in background...', { id: `sync-${result.id}`, duration: 30000 })
+        // Start polling for this connection
+        if (result.sync_status === 'syncing') {
+          pollSyncStatus(result.id)
+        }
       } else if (selectedConnector.category === 'format') {
         if (configValues.path || configValues.catalog_uri) {
           await registerTable(configValues.path || configValues.catalog_uri)
@@ -415,29 +481,47 @@ export function DataSources() {
             <EmptyState icon={<Plug className="w-5 h-5" />} title="No active connections" description="Choose a connector from the catalog to get started" />
           ) : (
             <div className="space-y-3 stagger">
-              {connections.map(c => (
-                <Card key={c.id} className="flex items-center gap-4">
+              {connections.map(c => {
+                const isSyncing = c.sync_status === 'syncing'
+                const isSyncError = c.sync_status === 'error'
+                return (
+                <Card key={c.id} className={cn("flex items-center gap-4", isSyncing && "border-amber-400/20")}>
                   <div className="w-10 h-10 rounded-lg bg-cyan-400/[0.06] border border-cyan-400/10 flex items-center justify-center relative">
                     <Server className="w-5 h-5 text-cyan-400" />
                     <span style={{
                       position: 'absolute', top: -2, right: -2, width: 10, height: 10, borderRadius: '50%',
-                      background: '#22c55e', border: '2px solid rgba(2,6,23,0.8)',
-                      boxShadow: '0 0 6px rgba(34,197,94,0.4)',
+                      background: isSyncing ? '#f59e0b' : isSyncError ? '#ef4444' : '#22c55e',
+                      border: '2px solid rgba(2,6,23,0.8)',
+                      boxShadow: `0 0 6px ${isSyncing ? 'rgba(245,158,11,0.4)' : isSyncError ? 'rgba(239,68,68,0.4)' : 'rgba(34,197,94,0.4)'}`,
+                      animation: isSyncing ? 'pulse 2s infinite' : undefined,
                     }} />
                   </div>
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center gap-2">
                       <h3 className="text-sm font-semibold text-zinc-200">{c.name}</h3>
-                      <StatusDot status={c.status === 'connected' ? 'healthy' : 'error'} />
+                      <StatusDot status={isSyncError ? 'error' : c.status === 'connected' ? 'healthy' : 'error'} />
                       <Badge className="bg-cyan-400/8 text-cyan-400/80 border-cyan-400/10">{c.conn_type}</Badge>
                       {['postgres', 'mysql', 'sqlite', 'clickhouse'].includes(c.conn_type) ? (
                         <Badge className="bg-violet-400/8 text-violet-400/80 border-violet-400/10 text-2xs">Federated</Badge>
                       ) : (
                         <Badge className="bg-zinc-400/8 text-zinc-400/80 border-zinc-400/10 text-2xs">Snapshot</Badge>
                       )}
-                      <Badge className="bg-emerald-400/8 text-emerald-400/80 border-emerald-400/10 text-2xs">Connected</Badge>
+                      {isSyncing ? (
+                        <Badge className="bg-amber-400/10 text-amber-400 border-amber-400/20 text-2xs animate-pulse">
+                          Discovering tables...
+                        </Badge>
+                      ) : isSyncError ? (
+                        <Badge className="bg-red-400/10 text-red-400 border-red-400/20 text-2xs">Sync Failed</Badge>
+                      ) : (
+                        <Badge className="bg-emerald-400/8 text-emerald-400/80 border-emerald-400/10 text-2xs">
+                          Connected {c.tables.length > 0 && `(${c.tables.length} tables)`}
+                        </Badge>
+                      )}
                     </div>
                     <p className="text-2xs font-mono text-zinc-500 mt-0.5">{c.host}:{c.port}/{c.database}</p>
+                    {isSyncError && c.sync_error && (
+                      <p className="text-2xs text-red-400/80 mt-1">{c.sync_error}</p>
+                    )}
                     {c.tables.length > 0 && (
                       <div className="flex items-center gap-1.5 mt-2 flex-wrap">
                         {c.tables.slice(0, 5).map(t => <Badge key={t} className="text-2xs">{t}</Badge>)}
@@ -449,7 +533,8 @@ export function DataSources() {
                     <Trash2 className="w-3.5 h-3.5 text-zinc-600" />
                   </Button>
                 </Card>
-              ))}
+                )
+              })}
               {s3Configs.map(c => (
                 <Card key={c.name} className="flex items-center gap-4">
                   <div className="w-10 h-10 rounded-lg bg-amber-400/[0.06] border border-amber-400/10 flex items-center justify-center relative">

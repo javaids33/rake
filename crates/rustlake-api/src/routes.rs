@@ -625,6 +625,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             post(add_connection).get(list_connections),
         )
         .route("/api/v1/connections/{id}", delete(delete_connection))
+        .route("/api/v1/connections/{id}/status", get(connection_sync_status))
         .route(
             "/api/v1/connections/{id}/register/{table}",
             post(register_external_table),
@@ -2361,7 +2362,7 @@ pub struct UploadResponse {
 // ── Connection Request / Response Types ─────────────────────────────
 
 /// Request body for adding a new database connection.
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct AddConnectionRequest {
     /// User-assigned connection name.
     pub name: String,
@@ -2784,12 +2785,134 @@ async fn upload_file(
 
 // ── Connection Handlers ─────────────────────────────────────────────
 
-/// POST /api/v1/connections — test connection, discover tables, store config.
+/// POST /api/v1/connections — verify connectivity, return immediately, discover tables in background.
 async fn add_connection(
     State(state): State<Arc<AppState>>,
     Json(req): Json<AddConnectionRequest>,
 ) -> std::result::Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
     let id = Uuid::new_v4().to_string();
+    let conn_type = req.conn_type.clone();
+
+    // Quick connectivity check only — validate we can reach the server
+    match conn_type.as_str() {
+        "trino" | "presto" => {
+            let user = if req.username.is_empty() { "rustlake".to_string() } else { req.username.clone() };
+            let base_url = trino_base_url(&req.host, req.port);
+            let rest = crate::trino_client::TrinoRestClient::new(base_url, user, req.password.clone());
+            rest.server_info().await
+                .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: format!("Cannot reach Trino: {}", e) })))?;
+        }
+        #[cfg(feature = "postgres")]
+        "postgres" | "postgresql" => {
+            // Quick TCP check
+            let addr = format!("{}:{}", req.host, req.port);
+            tokio::net::TcpStream::connect(&addr).await
+                .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: format!("Cannot reach Postgres: {}", e) })))?;
+        }
+        #[cfg(feature = "mysql")]
+        "mysql" | "mariadb" => {
+            let addr = format!("{}:{}", req.host, req.port);
+            tokio::net::TcpStream::connect(&addr).await
+                .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: format!("Cannot reach MySQL: {}", e) })))?;
+        }
+        "mongodb" => {
+            let addr = format!("{}:{}", req.host, req.port);
+            tokio::net::TcpStream::connect(&addr).await
+                .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: format!("Cannot reach MongoDB: {}", e) })))?;
+        }
+        #[cfg(feature = "sqlite")]
+        "sqlite" => {
+            // SQLite: just check file exists
+            if !std::path::Path::new(&req.host).exists() {
+                return Err((StatusCode::BAD_REQUEST, Json(ErrorResponse { error: format!("SQLite file not found: {}", req.host) })));
+            }
+        }
+        other => {
+            return Err((StatusCode::BAD_REQUEST, Json(ErrorResponse { error: format!("Unsupported connection type: {}", other) })));
+        }
+    }
+
+    // Create connection entry immediately with "syncing" status
+    let entry = ConnectionEntry {
+        id: id.clone(),
+        name: req.name.clone(),
+        conn_type: req.conn_type.clone(),
+        host: req.host.clone(),
+        port: req.port,
+        database: req.database.clone(),
+        username: req.username.clone(),
+        status: "connected".to_string(),
+        tables: vec![],
+        created_at: Utc::now(),
+        source: "user".to_string(),
+        sync_status: "syncing".to_string(),
+        sync_error: None,
+    };
+
+    state.add_connection_entry(entry).await;
+    state.store_password(id.clone(), req.password.clone()).await;
+
+    tracing::info!(
+        id = %id,
+        name = %req.name,
+        conn_type = %req.conn_type,
+        "Connection added — starting background table discovery"
+    );
+
+    // Return immediately
+    let response = serde_json::json!({
+        "status": "connected",
+        "sync_status": "syncing",
+        "id": id,
+        "name": req.name,
+        "tables": serde_json::Value::Array(vec![]),
+    });
+
+    // Spawn background task for table discovery and registration
+    let bg_state = state.clone();
+    let bg_id = id.clone();
+    let bg_req = req.clone();
+    tokio::spawn(async move {
+        let result = discover_and_register_tables(&bg_state, &bg_id, &bg_req).await;
+        match result {
+            Ok(tables) => {
+                bg_state.update_connection_entry(&bg_id, |entry| {
+                    entry.tables = tables.clone();
+                    entry.sync_status = "ready".to_string();
+                    entry.sync_error = None;
+                }).await;
+                tracing::info!(
+                    id = %bg_id,
+                    name = %bg_req.name,
+                    tables = tables.len(),
+                    "Background sync complete: {} tables registered",
+                    tables.len()
+                );
+            }
+            Err(e) => {
+                bg_state.update_connection_entry(&bg_id, |entry| {
+                    entry.sync_status = "error".to_string();
+                    entry.sync_error = Some(e.clone());
+                }).await;
+                tracing::error!(
+                    id = %bg_id,
+                    name = %bg_req.name,
+                    error = %e,
+                    "Background sync failed"
+                );
+            }
+        }
+    });
+
+    Ok(Json(response))
+}
+
+/// Background task: discover tables and register them as DataFusion providers.
+async fn discover_and_register_tables(
+    state: &Arc<AppState>,
+    id: &str,
+    req: &AddConnectionRequest,
+) -> std::result::Result<Vec<String>, String> {
     let prefix = match req.conn_type.as_str() {
         "postgres" | "postgresql" => "pg",
         "mysql" | "mariadb" => "mysql",
@@ -2799,37 +2922,34 @@ async fn add_connection(
         _ => &req.conn_type,
     };
 
-    let ctx = state.ctx.read().await;
-    let df_ctx = ctx.datafusion_ctx();
-
-    // Dispatch to the appropriate federated provider or snapshot connector
-    let registered: Vec<String> = match req.conn_type.as_str() {
+    match req.conn_type.as_str() {
         #[cfg(feature = "postgres")]
         "postgres" | "postgresql" => {
+            let ctx = state.ctx.read().await;
+            let df_ctx = ctx.datafusion_ctx();
             state.provider_registry.register_postgres(
-                &id, &req.host, req.port, &req.database, &req.username, &req.password,
+                id, &req.host, req.port, &req.database, &req.username, &req.password,
                 prefix, df_ctx,
-            ).await.map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e })))?
+            ).await
         }
         #[cfg(feature = "mysql")]
         "mysql" | "mariadb" => {
+            let ctx = state.ctx.read().await;
+            let df_ctx = ctx.datafusion_ctx();
             state.provider_registry.register_mysql(
-                &id, &req.host, req.port, &req.database, &req.username, &req.password,
+                id, &req.host, req.port, &req.database, &req.username, &req.password,
                 prefix, df_ctx,
-            ).await.map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e })))?
+            ).await
         }
         #[cfg(feature = "sqlite")]
         "sqlite" => {
-            // For SQLite, host is the file path
-            drop(ctx);
-            let ctx2 = state.ctx.read().await;
+            let ctx = state.ctx.read().await;
             state.provider_registry.register_sqlite(
-                &id, &req.host, prefix, ctx2.datafusion_ctx(),
-            ).await.map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e })))?
+                id, &req.host, prefix, ctx.datafusion_ctx(),
+            ).await
         }
         "mongodb" => {
-            drop(ctx);
-            // MongoDB: keep snapshot approach (no provider available)
+            use futures::stream::{self, StreamExt};
             let mongo_params = crate::mongodb_conn::MongoConnParams {
                 host: req.host.clone(),
                 port: req.port,
@@ -2838,73 +2958,69 @@ async fn add_connection(
                 password: req.password.clone(),
             };
             let collections = crate::mongodb_conn::connect_and_discover(&mongo_params)
-                .await
-                .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e })))?;
-            let ctx2 = state.ctx.read().await;
-            let mongo_schema = crate::providers::ensure_schema(ctx2.datafusion_ctx(), "mongo")
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e })))?;
-            let mut mongo_registered = Vec::new();
-            for coll_name in &collections {
-                if let Ok(batch) = crate::mongodb_conn::fetch_collection_as_arrow(&mongo_params, coll_name).await {
-                    let schema = batch.schema();
-                    if let Ok(mem_table) = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]) {
-                        let df_name = format!("mongo.{}", coll_name);
-                        if mongo_schema.register_table(coll_name.clone(), std::sync::Arc::new(mem_table)).is_ok() {
-                            mongo_registered.push(df_name);
+                .await?;
+            let ctx = state.ctx.read().await;
+            let mongo_schema = crate::providers::ensure_schema(ctx.datafusion_ctx(), "mongo")
+                .map_err(|e| e.to_string())?;
+
+            // Fetch collections in parallel (up to 8 concurrent)
+            let results: Vec<Option<(String, arrow::record_batch::RecordBatch)>> = stream::iter(collections.iter().cloned())
+                .map(|coll_name| {
+                    let params = mongo_params.clone();
+                    async move {
+                        match crate::mongodb_conn::fetch_collection_as_arrow(&params, &coll_name).await {
+                            Ok(batch) => Some((coll_name, batch)),
+                            Err(_) => None,
                         }
+                    }
+                })
+                .buffer_unordered(8)
+                .collect()
+                .await;
+
+            let mut mongo_registered = Vec::new();
+            for (coll_name, batch) in results.into_iter().flatten() {
+                let schema = batch.schema();
+                if let Ok(mem_table) = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]) {
+                    let df_name = format!("mongo.{}", coll_name);
+                    if mongo_schema.register_table(coll_name, std::sync::Arc::new(mem_table)).is_ok() {
+                        mongo_registered.push(df_name);
                     }
                 }
             }
-            mongo_registered
+            Ok(mongo_registered)
         }
         "trino" | "presto" => {
-            drop(ctx);
-            // Trino: lightweight connect — cache catalog structure in DuckDB, no data fetching
             let user = if req.username.is_empty() { "rustlake".to_string() } else { req.username.clone() };
             let pass = req.password.clone();
             let catalog = if req.database.is_empty() { "postgresql".to_string() } else { req.database.clone() };
             let base_url = trino_base_url(&req.host, req.port);
 
-            let pass_str = pass.clone();
-            let rest = crate::trino_client::TrinoRestClient::new(base_url.clone(), user.clone(), pass_str);
-
-            // Verify connectivity
-            rest.server_info().await
-                .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e })))?;
-
-            // Build TrinoConnection with DuckDB cache
             #[cfg(feature = "duckdb")]
-            let trino_conn = {
+            {
+                let rest = crate::trino_client::TrinoRestClient::new(base_url.clone(), user.clone(), pass.clone());
                 let cache = state.trino_cache.clone()
-                    .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: "Trino cache not initialized".into() })))?;
+                    .ok_or_else(|| "Trino cache not initialized".to_string())?;
                 let conn = crate::trino_client::TrinoConnection {
-                    id: id.clone(),
+                    id: id.to_string(),
                     name: req.name.clone(),
                     rest,
                     default_catalog: catalog.clone(),
                     cache,
                 };
-                // Fetch catalog structure and cache (lightweight: only schema/table names)
-                let table_count = conn.refresh_cache().await
-                    .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e })))?;
+                let table_count = conn.refresh_cache().await?;
                 tracing::info!(conn_id = %id, tables = table_count, "Trino connected and cached");
-                conn
-            };
 
-            #[cfg(feature = "duckdb")]
-            {
-                // Store connection for future browse/query/refresh calls
                 let rest_arc = std::sync::Arc::new(
                     crate::trino_client::TrinoRestClient::new(base_url.clone(), user.clone(), pass.clone())
                 );
-                let conn_arc = std::sync::Arc::new(trino_conn);
-                state.trino_connections.write().await.insert(id.clone(), conn_arc.clone());
+                let conn_arc = std::sync::Arc::new(conn);
+                state.trino_connections.write().await.insert(id.to_string(), conn_arc.clone());
 
-                // Register Trino tables as DataFusion providers for transparent SQL access
                 let ctx = state.ctx.read().await;
                 let df_ctx = ctx.datafusion_ctx();
                 let trino_registered = state.provider_registry
-                    .register_trino(&id, &conn_arc, rest_arc, df_ctx)
+                    .register_trino(id, &conn_arc, rest_arc, df_ctx)
                     .await
                     .unwrap_or_else(|e| {
                         tracing::warn!(error = %e, "Failed to register Trino table providers");
@@ -2916,70 +3032,25 @@ async fn add_connection(
                     tracing::info!(count = trino_registered.len(), "Trino tables registered as DataFusion providers");
                 }
 
-                // Build table list from cache for the response
                 let tree = conn_arc.browse().await.unwrap_or_else(|_| crate::trino_client::TrinoCatalogTree {
                     catalogs: vec![], cached_at: None, total_tables: 0,
                 });
-                tree.catalogs.iter()
+                let tables: Vec<String> = tree.catalogs.iter()
                     .flat_map(|c| c.schemas.iter().flat_map(move |s| {
                         s.tables.iter().map(move |t| format!("trino.{}_{}", s.name, t))
                     }))
-                    .collect()
+                    .collect();
+                Ok(tables)
             }
 
             #[cfg(not(feature = "duckdb"))]
             {
-                vec![] // No DuckDB cache — Trino requires DuckDB feature
+                let _ = (user, pass, catalog, base_url);
+                Ok(vec![])
             }
         }
-        other => {
-            drop(ctx);
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse {
-                    error: format!("Unsupported connection type: {}", other),
-                }),
-            ));
-        }
-    };
-
-    let tables = registered.clone();
-
-    let entry = ConnectionEntry {
-        id: id.clone(),
-        name: req.name.clone(),
-        conn_type: req.conn_type.clone(),
-        host: req.host.clone(),
-        port: req.port,
-        database: req.database.clone(),
-        username: req.username.clone(),
-        status: "connected".to_string(),
-        tables: tables.clone(),
-        created_at: Utc::now(),
-        source: "user".to_string(),
-    };
-
-    state.add_connection_entry(entry).await;
-    state.store_password(id.clone(), req.password).await;
-
-    tracing::info!(
-        source = "user",
-        id = %id,
-        name = %req.name,
-        conn_type = %req.conn_type,
-        tables = tables.len(),
-        "Data source added: {} ({} tables registered)",
-        req.name,
-        tables.len()
-    );
-
-    Ok(Json(serde_json::json!({
-        "status": "connected",
-        "id": id,
-        "name": req.name,
-        "tables": tables,
-        "registered": registered,
-    })))
+        _ => Ok(vec![]),
+    }
 }
 
 /// GET /api/v1/connections — list all connections.
@@ -3030,6 +3101,24 @@ async fn delete_connection(
     Ok(Json(serde_json::json!({
         "status": "ok",
         "deleted": id,
+    })))
+}
+
+/// GET /api/v1/connections/:id/status — poll sync status for a connection.
+async fn connection_sync_status(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let connections = state.connections.read().await;
+    let conn = connections.iter().find(|c| c.id == id).ok_or_else(|| {
+        (StatusCode::NOT_FOUND, Json(ErrorResponse { error: format!("Connection '{}' not found", id) }))
+    })?;
+    Ok(Json(serde_json::json!({
+        "id": conn.id,
+        "sync_status": conn.sync_status,
+        "sync_error": conn.sync_error,
+        "tables": conn.tables,
+        "table_count": conn.tables.len(),
     })))
 }
 
@@ -3559,6 +3648,8 @@ async fn run_bootstrap(
                     tables: tables.clone(),
                     created_at: Utc::now(),
                     source: "bootstrap".to_string(),
+                    sync_status: "ready".to_string(),
+                    sync_error: None,
                 };
                 state.seed_connection(entry, pg_pass).await;
                 results.insert("postgres".to_string(), serde_json::json!({
@@ -3627,6 +3718,8 @@ async fn run_bootstrap(
                     tables: tables.clone(),
                     created_at: Utc::now(),
                     source: "bootstrap".to_string(),
+                    sync_status: "ready".to_string(),
+                    sync_error: None,
                 };
                 state.seed_connection(entry, mysql_pass).await;
                 results.insert("mysql".to_string(), serde_json::json!({
@@ -3674,6 +3767,8 @@ async fn run_bootstrap(
                 tables: collections.clone(),
                 created_at: Utc::now(),
                 source: "bootstrap".to_string(),
+                sync_status: "ready".to_string(),
+                sync_error: None,
             };
             state.seed_connection(entry, "rustlake".to_string()).await;
 

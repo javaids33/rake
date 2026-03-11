@@ -13,7 +13,11 @@ use std::sync::Arc;
 
 use datafusion::catalog::MemorySchemaProvider;
 use datafusion::execution::context::SessionContext;
+use futures::stream::{self, StreamExt};
 use tokio::sync::RwLock;
+
+/// Maximum number of concurrent table registrations per connection.
+const PARALLEL_TABLE_REGISTRATIONS: usize = 8;
 
 /// A registered provider entry with connection metadata.
 #[derive(Debug, Clone)]
@@ -97,24 +101,41 @@ impl ProviderRegistry {
         //    matches the physical table name (required for correct WHERE pushdown).
         let schema_provider = ensure_schema(ctx, prefix)?;
 
-        let mut registered = Vec::new();
-        for table_name in &table_names {
-            let table_ref = TableReference::partial("public", table_name.as_str());
-            match factory.table_provider(table_ref).await {
-                Ok(provider) => {
-                    let df_name = format!("{}.{}", prefix, table_name);
-                    match schema_provider.register_table(table_name.clone(), provider) {
-                        Ok(_) => {
-                            tracing::info!(table = %df_name, "Federated provider registered");
-                            registered.push(df_name);
+        // Resolve table providers in parallel (up to 8 concurrent)
+        let factory = Arc::new(factory);
+        let prefix_owned = prefix.to_string();
+        let results: Vec<Option<(String, String, Arc<dyn datafusion::catalog::TableProvider>)>> = stream::iter(table_names.iter().cloned())
+            .map(|table_name| {
+                let factory = factory.clone();
+                let prefix_owned = prefix_owned.clone();
+                async move {
+                    let table_ref = TableReference::partial("public", table_name.as_str());
+                    match factory.table_provider(table_ref).await {
+                        Ok(provider) => {
+                            let df_name = format!("{}.{}", prefix_owned, table_name);
+                            Some((table_name, df_name, provider))
                         }
                         Err(e) => {
-                            tracing::warn!(table = %df_name, error = %e, "Failed to register federated table");
+                            tracing::warn!(table = %table_name, error = %e, "Failed to create table provider");
+                            None
                         }
                     }
                 }
+            })
+            .buffer_unordered(PARALLEL_TABLE_REGISTRATIONS)
+            .collect()
+            .await;
+
+        let mut registered = Vec::new();
+        for item in results.into_iter().flatten() {
+            let (table_name, df_name, provider) = item;
+            match schema_provider.register_table(table_name, provider) {
+                Ok(_) => {
+                    tracing::info!(table = %df_name, "Federated provider registered");
+                    registered.push(df_name);
+                }
                 Err(e) => {
-                    tracing::warn!(table = %table_name, error = %e, "Failed to create table provider");
+                    tracing::warn!(table = %df_name, error = %e, "Failed to register federated table");
                 }
             }
         }
@@ -172,24 +193,43 @@ impl ProviderRegistry {
         //    matches the physical table name (required for correct WHERE pushdown).
         let schema_provider = ensure_schema(ctx, prefix)?;
 
-        let mut registered = Vec::new();
-        for table_name in &table_names {
-            let table_ref = TableReference::partial(database, table_name.as_str());
-            match factory.table_provider(table_ref).await {
-                Ok(provider) => {
-                    let df_name = format!("{}.{}", prefix, table_name);
-                    match schema_provider.register_table(table_name.clone(), provider) {
-                        Ok(_) => {
-                            tracing::info!(table = %df_name, "Federated provider registered");
-                            registered.push(df_name);
+        // Resolve table providers in parallel (up to 8 concurrent)
+        let factory = Arc::new(factory);
+        let prefix_owned = prefix.to_string();
+        let database_owned = database.to_string();
+        let results: Vec<Option<(String, String, Arc<dyn datafusion::catalog::TableProvider>)>> = stream::iter(table_names.iter().cloned())
+            .map(|table_name| {
+                let factory = factory.clone();
+                let prefix_owned = prefix_owned.clone();
+                let database_owned = database_owned.clone();
+                async move {
+                    let table_ref = TableReference::partial(database_owned.as_str(), table_name.as_str());
+                    match factory.table_provider(table_ref).await {
+                        Ok(provider) => {
+                            let df_name = format!("{}.{}", prefix_owned, table_name);
+                            Some((table_name, df_name, provider))
                         }
                         Err(e) => {
-                            tracing::warn!(table = %df_name, error = %e, "Failed to register federated table");
+                            tracing::warn!(table = %table_name, error = %e, "Failed to create MySQL table provider");
+                            None
                         }
                     }
                 }
+            })
+            .buffer_unordered(PARALLEL_TABLE_REGISTRATIONS)
+            .collect()
+            .await;
+
+        let mut registered = Vec::new();
+        for item in results.into_iter().flatten() {
+            let (table_name, df_name, provider) = item;
+            match schema_provider.register_table(table_name, provider) {
+                Ok(_) => {
+                    tracing::info!(table = %df_name, "Federated provider registered");
+                    registered.push(df_name);
+                }
                 Err(e) => {
-                    tracing::warn!(table = %table_name, error = %e, "Failed to create MySQL table provider");
+                    tracing::warn!(table = %df_name, error = %e, "Failed to register federated table");
                 }
             }
         }
@@ -287,57 +327,77 @@ impl ProviderRegistry {
 
         #[cfg(feature = "duckdb")]
         {
-            let mut registered = Vec::new();
+            use datafusion::catalog::SchemaProvider;
 
+            // Pre-create all schema providers
+            let mut schema_map: HashMap<String, Arc<dyn SchemaProvider>> = HashMap::new();
             for catalog in &tree.catalogs {
                 let schema_prefix = format!("trino_{}", catalog.name);
-                let schema_provider = ensure_schema(ctx, &schema_prefix)?;
+                if !schema_map.contains_key(&schema_prefix) {
+                    schema_map.insert(schema_prefix, ensure_schema(ctx, &format!("trino_{}", catalog.name))?);
+                }
+            }
 
+            // Collect all (catalog, schema, table, prefix) tuples for parallel column resolution
+            let mut table_tasks: Vec<(String, String, String, String)> = Vec::new();
+            for catalog in &tree.catalogs {
+                let schema_prefix = format!("trino_{}", catalog.name);
                 for schema in &catalog.schemas {
                     for table_name in &schema.tables {
-                        // Resolve column schema — from DuckDB cache or Trino DESCRIBE
+                        table_tasks.push((
+                            catalog.name.clone(),
+                            schema.name.clone(),
+                            table_name.clone(),
+                            schema_prefix.clone(),
+                        ));
+                    }
+                }
+            }
+
+            // Resolve columns in parallel (up to 8 concurrent network calls)
+            let results: Vec<Option<(String, String, String, Arc<dyn datafusion::catalog::TableProvider>)>> = stream::iter(table_tasks)
+                .map(|(cat, sch, tbl, prefix)| {
+                    let trino_conn = trino_conn;
+                    let rest_client = rest_client.clone();
+                    async move {
                         let columns = trino_conn
-                            .columns(&catalog.name, &schema.name, table_name)
+                            .columns(&cat, &sch, &tbl)
                             .await
                             .unwrap_or_default();
 
                         if columns.is_empty() {
                             tracing::warn!(
-                                catalog = %catalog.name,
-                                schema = %schema.name,
-                                table = %table_name,
+                                catalog = %cat, schema = %sch, table = %tbl,
                                 "Skipping Trino table: no columns resolved"
                             );
-                            continue;
+                            return None;
                         }
 
-                        let arrow_schema =
-                            crate::trino_provider::trino_columns_to_schema(&columns);
+                        let arrow_schema = crate::trino_provider::trino_columns_to_schema(&columns);
                         let provider = crate::trino_provider::TrinoTableProvider::new(
-                            catalog.name.clone(),
-                            schema.name.clone(),
-                            table_name.clone(),
-                            arrow_schema,
-                            rest_client.clone(),
+                            cat, sch.clone(), tbl.clone(), arrow_schema, rest_client,
                         );
+                        let df_table_name = format!("{}_{}", sch, tbl);
+                        let df_full = format!("{}.{}", prefix, df_table_name);
+                        Some((df_table_name, df_full, prefix, Arc::new(provider) as Arc<dyn datafusion::catalog::TableProvider>))
+                    }
+                })
+                .buffer_unordered(PARALLEL_TABLE_REGISTRATIONS)
+                .collect()
+                .await;
 
-                        let df_table_name = format!("{}_{}", schema.name, table_name);
-                        let df_full = format!("{}.{}", schema_prefix, df_table_name);
-
-                        match schema_provider
-                            .register_table(df_table_name, Arc::new(provider))
-                        {
-                            Ok(_) => {
-                                tracing::info!(table = %df_full, "Trino table provider registered");
-                                registered.push(df_full);
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    table = %df_full,
-                                    error = %e,
-                                    "Failed to register Trino table provider"
-                                );
-                            }
+            // Register providers sequentially (schema_provider registration is not concurrent-safe)
+            let mut registered = Vec::new();
+            for item in results.into_iter().flatten() {
+                let (df_table_name, df_full, prefix, provider) = item;
+                if let Some(schema_prov) = schema_map.get(&prefix) {
+                    match schema_prov.register_table(df_table_name, provider) {
+                        Ok(_) => {
+                            tracing::info!(table = %df_full, "Trino table provider registered");
+                            registered.push(df_full);
+                        }
+                        Err(e) => {
+                            tracing::warn!(table = %df_full, error = %e, "Failed to register Trino table provider");
                         }
                     }
                 }
