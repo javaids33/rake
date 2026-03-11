@@ -18,6 +18,7 @@ use rustlake_flight::worker::WorkerNode;
 use rustlake_vector::embedding::SimpleEmbeddingGenerator;
 use rustlake_vector::search::VectorIndex;
 
+mod iceberg_s3;
 mod mongodb_conn;
 mod providers;
 mod routes;
@@ -717,6 +718,22 @@ async fn main() -> anyhow::Result<()> {
     if !connections.is_empty() {
         tracing::info!(count = connections.len(), "Loaded persisted connections from connections.jsonl");
         *state.connections.get_mut() = connections;
+    }
+
+    // Fetch S3 credentials from external API if configured
+    if let Ok(creds_url) = std::env::var("RUSTLAKE_S3_CREDENTIALS_URL") {
+        if !creds_url.is_empty() {
+            match state::fetch_s3_credentials_from_api(&creds_url).await {
+                Ok(bucket_map) => {
+                    let count = bucket_map.len();
+                    *state.migration_s3_creds.get_mut() = bucket_map;
+                    tracing::info!(buckets = count, url = %creds_url, "Loaded S3 credentials from external API");
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, url = %creds_url, "Failed to fetch S3 credentials from external API");
+                }
+            }
+        }
     }
 
     let state = Arc::new(state);

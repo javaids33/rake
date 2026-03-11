@@ -271,6 +271,104 @@ pub struct S3Config {
     pub created_at: DateTime<Utc>,
 }
 
+/// S3 credentials for a set of buckets, fetched from the credentials API.
+#[derive(Debug, Clone)]
+pub struct S3BucketCreds {
+    pub account_id: String,
+    pub access_key: String,
+    pub secret_key: String,
+    pub session_token: Option<String>,
+    pub region: String,
+}
+
+/// Fetch S3 credentials from an external API and build a bucket→creds map.
+///
+/// The API returns JSON like:
+/// ```json
+/// {
+///   "account-uuid": {
+///     "access_key": "...",
+///     "secret_key": "...",
+///     "session_token": null,
+///     "bucket_names": ["bucket-a", "bucket-b"]
+///   }
+/// }
+/// ```
+pub async fn fetch_s3_credentials_from_api(
+    url: &str,
+) -> Result<std::collections::HashMap<String, S3BucketCreds>, String> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("HTTP client build failed: {}", e))?;
+
+    let resp = client.get(url)
+        .send().await
+        .map_err(|e| format!("Failed to fetch S3 credentials from {}: {}", url, e))?;
+
+    if !resp.status().is_success() {
+        return Err(format!("S3 credentials API returned HTTP {}", resp.status()));
+    }
+
+    let body: serde_json::Value = resp.json().await
+        .map_err(|e| format!("Failed to parse S3 credentials JSON: {}", e))?;
+
+    let mut bucket_map: std::collections::HashMap<String, S3BucketCreds> = std::collections::HashMap::new();
+    let region = std::env::var("RUSTLAKE_S3_REGION").unwrap_or_else(|_| "us-east-1".to_string());
+
+    if let Some(obj) = body.as_object() {
+        for (account_id, account_data) in obj {
+            let access_key = account_data.get("access_key")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let secret_key = account_data.get("secret_key")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let session_token = account_data.get("session_token")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+
+            if access_key.is_empty() || secret_key.is_empty() {
+                tracing::warn!(account_id = %account_id, "Skipping account: missing access_key or secret_key");
+                continue;
+            }
+
+            let buckets = account_data.get("bucket_names")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+
+            let creds = S3BucketCreds {
+                account_id: account_id.clone(),
+                access_key,
+                secret_key,
+                session_token,
+                region: region.clone(),
+            };
+
+            for bucket in &buckets {
+                bucket_map.insert(bucket.clone(), creds.clone());
+            }
+
+            tracing::info!(
+                account_id = %account_id,
+                buckets = buckets.len(),
+                bucket_names = ?buckets,
+                "Loaded S3 credentials for {} buckets",
+                buckets.len()
+            );
+        }
+    }
+
+    Ok(bucket_map)
+}
+
 /// A table discovered from a Trino Iceberg catalog for migration to Rake.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MigrationTable {
@@ -485,9 +583,9 @@ pub struct AppState {
     pub migration_tables: RwLock<Vec<MigrationTable>>,
     /// Migration comparison results (Trino vs local engines).
     pub migration_comparisons: RwLock<Vec<MigrationComparison>>,
-    /// S3 credentials for migration (bucket_or_key -> (access_key, secret_key)).
-    /// In-memory only, never persisted to disk.
-    pub migration_s3_creds: RwLock<std::collections::HashMap<String, (String, String, String)>>,
+    /// S3 credentials for migration (bucket_name -> S3BucketCreds).
+    /// Auto-populated from RUSTLAKE_S3_CREDENTIALS_URL or manually via POST /api/v1/migration/credentials.
+    pub migration_s3_creds: RwLock<std::collections::HashMap<String, S3BucketCreds>>,
     /// Engine performance tracker for adaptive routing decisions.
     pub engine_tracker: RwLock<EnginePerformanceTracker>,
     /// Read-only tables from migration — DDL/DML blocked to protect source data.
