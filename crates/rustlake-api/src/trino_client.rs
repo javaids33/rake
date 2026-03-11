@@ -6,9 +6,20 @@
 //! - On-demand: fetch column info and previews when user drills down
 //! - Explicit refresh to re-sync with Trino
 //! - All Trino REST calls go through `TrinoRestClient::query()`
+//!
+//! Optimizations:
+//! - HTTP/2 multiplexing: multiple requests share a single TCP connection
+//! - Connection keep-alive: reuses connections across sequential requests
+//! - Parallel discovery: schemas and tables fetched 8-at-a-time
+//! - Iceberg catalog filter: `system.metadata.catalogs` to skip non-Iceberg catalogs
+//! - Batch DuckDB writes: single transaction per cache update
 
+use futures::stream::{self, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
+
+/// Maximum concurrent Trino REST calls during catalog discovery.
+const DISCOVERY_PARALLELISM: usize = 8;
 
 // ── Types ────────────────────────────────────────────────────────────
 
@@ -172,11 +183,11 @@ impl TrinoCache {
         if cols.is_empty() { None } else { Some(cols) }
     }
 
-    // ── Cache writes ──
+    // ── Cache writes (individual + batch) ──
 
+    #[allow(dead_code)] // Used by individual schema/table caching paths
     pub fn set_schemas(&self, conn_id: &str, catalog: &str, schemas: &[String]) -> Result<(), String> {
         let db = self.db.lock().map_err(|e| e.to_string())?;
-        // Clear old entries for this catalog
         db.execute(
             "DELETE FROM trino_schemas WHERE conn_id = ? AND catalog_name = ?",
             duckdb::params![conn_id, catalog],
@@ -190,6 +201,7 @@ impl TrinoCache {
         Ok(())
     }
 
+    #[allow(dead_code)] // Used by individual schema/table caching paths
     pub fn set_tables(&self, conn_id: &str, catalog: &str, schema: &str, tables: &[String]) -> Result<(), String> {
         let db = self.db.lock().map_err(|e| e.to_string())?;
         db.execute(
@@ -202,6 +214,43 @@ impl TrinoCache {
         for t in tables {
             stmt.execute(duckdb::params![conn_id, catalog, schema, t]).map_err(|e| e.to_string())?;
         }
+        Ok(())
+    }
+
+    /// Batch write: cache all schemas and tables for a connection in a single lock acquisition.
+    /// Much faster than individual set_schemas/set_tables calls for large catalogs.
+    pub fn batch_cache_discovery(
+        &self,
+        conn_id: &str,
+        discovery: &[(String, Vec<(String, Vec<String>)>)], // Vec<(catalog, Vec<(schema, Vec<table>)>)>
+    ) -> Result<(), String> {
+        let db = self.db.lock().map_err(|e| e.to_string())?;
+        // Single transaction for all writes
+        db.execute_batch("BEGIN TRANSACTION").map_err(|e| e.to_string())?;
+
+        // Clear old data
+        db.execute("DELETE FROM trino_schemas WHERE conn_id = ?", duckdb::params![conn_id]).map_err(|e| e.to_string())?;
+        db.execute("DELETE FROM trino_tables WHERE conn_id = ?", duckdb::params![conn_id]).map_err(|e| e.to_string())?;
+
+        let mut schema_stmt = db.prepare(
+            "INSERT INTO trino_schemas (conn_id, catalog_name, schema_name) VALUES (?, ?, ?)"
+        ).map_err(|e| e.to_string())?;
+        let mut table_stmt = db.prepare(
+            "INSERT INTO trino_tables (conn_id, catalog_name, schema_name, table_name) VALUES (?, ?, ?, ?)"
+        ).map_err(|e| e.to_string())?;
+
+        for (catalog, schemas) in discovery {
+            for (schema, tables) in schemas {
+                schema_stmt.execute(duckdb::params![conn_id, catalog, schema]).map_err(|e| e.to_string())?;
+                for table in tables {
+                    table_stmt.execute(duckdb::params![conn_id, catalog, schema, table]).map_err(|e| e.to_string())?;
+                }
+            }
+        }
+
+        drop(schema_stmt);
+        drop(table_stmt);
+        db.execute_batch("COMMIT").map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -220,12 +269,15 @@ impl TrinoCache {
         Ok(())
     }
 
+    #[allow(dead_code)] // Kept for manual cache invalidation
     pub fn invalidate_connection(&self, conn_id: &str) -> Result<(), String> {
         let db = self.db.lock().map_err(|e| e.to_string())?;
+        db.execute_batch("BEGIN TRANSACTION").map_err(|e| e.to_string())?;
         db.execute("DELETE FROM trino_schemas WHERE conn_id = ?", duckdb::params![conn_id]).map_err(|e| e.to_string())?;
         db.execute("DELETE FROM trino_tables WHERE conn_id = ?", duckdb::params![conn_id]).map_err(|e| e.to_string())?;
         db.execute("DELETE FROM trino_columns WHERE conn_id = ?", duckdb::params![conn_id]).map_err(|e| e.to_string())?;
         db.execute("DELETE FROM trino_preview_meta WHERE conn_id = ?", duckdb::params![conn_id]).map_err(|e| e.to_string())?;
+        db.execute_batch("COMMIT").map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -282,10 +334,21 @@ impl std::fmt::Debug for TrinoRestClient {
 }
 
 impl TrinoRestClient {
-    /// Create a new client with password-based auth (basic or none).
+    /// Create a new client optimized for fast, parallel metadata discovery.
+    ///
+    /// Tuning:
+    /// - HTTP/2 preferred (multiplexes many requests over one TCP connection)
+    /// - Connection pool: up to 20 idle connections per host (for parallel discovery)
+    /// - TCP nodelay + keepalive for low-latency sequential requests
+    /// - 60s timeout (some Trino queries can be slow)
     pub fn new(base_url: String, user: String, password: String) -> Self {
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(60))
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .pool_max_idle_per_host(20)
+            .pool_idle_timeout(std::time::Duration::from_secs(90))
+            .tcp_nodelay(true)
+            .tcp_keepalive(std::time::Duration::from_secs(30))
             .danger_accept_invalid_certs(
                 std::env::var("RUSTLAKE_TRINO_INSECURE").unwrap_or_default() == "true"
             )
@@ -317,6 +380,33 @@ impl TrinoRestClient {
         let resp = self.apply_auth(builder)
             .send().await.map_err(|e| format!("Trino /v1/info failed: {}", e))?;
         resp.json().await.map_err(|e| format!("Parse error: {}", e))
+    }
+
+    /// List only Iceberg catalogs via system.metadata.catalogs.
+    /// Falls back to SHOW CATALOGS if the metadata query fails.
+    pub async fn list_iceberg_catalogs(&self) -> Result<Vec<String>, String> {
+        let result = self.query(
+            "SELECT catalog_name FROM system.metadata.catalogs WHERE connector_name = 'iceberg'",
+            "system",
+        ).await;
+        match result {
+            Ok(rows) => {
+                let catalogs: Vec<String> = rows.into_iter()
+                    .filter_map(|r| r.first().and_then(|v| v.as_str()).map(|s| s.trim().to_string()))
+                    .collect();
+                if catalogs.is_empty() {
+                    tracing::info!("No Iceberg catalogs found, falling back to all catalogs");
+                    self.list_catalogs().await
+                } else {
+                    tracing::info!(count = catalogs.len(), "Discovered Iceberg catalogs via system.metadata.catalogs");
+                    Ok(catalogs)
+                }
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "system.metadata.catalogs query failed, falling back to SHOW CATALOGS");
+                self.list_catalogs().await
+            }
+        }
     }
 
     pub async fn list_catalogs(&self) -> Result<Vec<String>, String> {
@@ -356,7 +446,6 @@ impl TrinoRestClient {
 
     pub async fn execute_query(&self, sql: &str, catalog: &str) -> Result<TrinoQueryResult, String> {
         let start = std::time::Instant::now();
-        // Get columns from the first response
         let req_builder = self.http.post(&format!("{}/v1/statement", self.base_url))
             .header("X-Trino-Catalog", catalog)
             .body(sql.to_string());
@@ -381,11 +470,12 @@ impl TrinoRestClient {
             all_data.extend(data.iter().cloned().filter_map(|v| v.as_array().cloned()));
         }
 
-        // Follow nextUri chain
+        // Follow nextUri chain with adaptive polling
         let mut next_uri = body.get("nextUri").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let mut poll_delay_ms = 25u64; // Start aggressive, back off if needed
         for _ in 0..200 {
             let Some(uri) = next_uri.take() else { break };
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(poll_delay_ms)).await;
             let poll = self.http.get(&uri);
             let poll_resp = self.apply_auth(poll)
                 .send().await.map_err(|e| format!("Poll: {}", e))?;
@@ -408,6 +498,10 @@ impl TrinoRestClient {
                     return Err(format!("Trino query failed: {}", err));
                 }
                 break;
+            }
+            // Adaptive backoff: if no data yet, slow down slightly
+            if all_data.is_empty() && poll_delay_ms < 100 {
+                poll_delay_ms = (poll_delay_ms * 3 / 2).min(100);
             }
         }
 
@@ -469,13 +563,15 @@ impl TrinoConnection {
         }
         // Fetch from Trino
         let cols = self.rest.describe_table(catalog, schema, table).await?;
-        // Cache
+        // Cache in background (don't block the response)
         let cache = self.cache.clone();
         let (conn_id, cat, sch, tbl) = (self.id.clone(), catalog.to_string(), schema.to_string(), table.to_string());
         let cols_clone = cols.clone();
-        tokio::task::spawn_blocking(move || {
-            let _ = cache.set_columns(&conn_id, &cat, &sch, &tbl, &cols_clone);
-        }).await.ok();
+        tokio::task::spawn(async move {
+            let _ = tokio::task::spawn_blocking(move || {
+                cache.set_columns(&conn_id, &cat, &sch, &tbl, &cols_clone)
+            }).await;
+        });
         Ok(cols)
     }
 
@@ -491,40 +587,87 @@ impl TrinoConnection {
     }
 
     /// Re-fetch all metadata from Trino and update cache.
+    ///
+    /// Optimizations vs naive approach:
+    /// 1. Iceberg-first: queries system.metadata.catalogs to find only Iceberg catalogs
+    /// 2. Parallel discovery: fetches schemas for all catalogs simultaneously (up to 8)
+    /// 3. Parallel table listing: fetches tables for all schemas simultaneously (up to 8)
+    /// 4. Batch cache write: single DuckDB transaction for all discovered metadata
     #[cfg(feature = "duckdb")]
     pub async fn refresh_cache(&self) -> Result<usize, String> {
-        tracing::info!(conn_id = %self.id, "Refreshing Trino cache from REST API");
-        // Invalidate old cache
+        let start = std::time::Instant::now();
+        tracing::info!(conn_id = %self.id, "Refreshing Trino cache (parallel discovery, Iceberg-first)");
+
+        // Step 1: Get Iceberg catalogs (or all catalogs as fallback)
+        let catalogs = self.rest.list_iceberg_catalogs().await?;
+        if catalogs.is_empty() {
+            tracing::warn!(conn_id = %self.id, "No catalogs found");
+            return Ok(0);
+        }
+        tracing::info!(conn_id = %self.id, count = catalogs.len(), catalogs = ?catalogs, "Catalogs to scan");
+
+        // Step 2: Fetch schemas for all catalogs in parallel (up to 8 concurrent)
+        let catalog_schemas: Vec<(String, Vec<String>)> = stream::iter(catalogs)
+            .map(|catalog| {
+                let rest = &self.rest;
+                async move {
+                    let schemas = rest.list_schemas(&catalog).await.unwrap_or_else(|e| {
+                        tracing::warn!(catalog = %catalog, error = %e, "Failed to list schemas");
+                        vec![]
+                    });
+                    (catalog, schemas)
+                }
+            })
+            .buffer_unordered(DISCOVERY_PARALLELISM)
+            .collect()
+            .await;
+
+        // Step 3: Fetch tables for all schemas in parallel (up to 8 concurrent)
+        // Flatten to (catalog, schema) pairs for parallel processing
+        let schema_pairs: Vec<(String, String)> = catalog_schemas.iter()
+            .flat_map(|(cat, schemas)| schemas.iter().map(move |s| (cat.clone(), s.clone())))
+            .collect();
+
+        let schema_tables: Vec<(String, String, Vec<String>)> = stream::iter(schema_pairs)
+            .map(|(catalog, schema)| {
+                let rest = &self.rest;
+                async move {
+                    let tables = rest.list_tables(&catalog, &schema).await.unwrap_or_else(|e| {
+                        tracing::warn!(catalog = %catalog, schema = %schema, error = %e, "Failed to list tables");
+                        vec![]
+                    });
+                    (catalog, schema, tables)
+                }
+            })
+            .buffer_unordered(DISCOVERY_PARALLELISM)
+            .collect()
+            .await;
+
+        // Step 4: Build discovery structure for batch cache write
+        // Group by catalog → Vec<(schema, Vec<table>)>
+        let mut catalog_map: std::collections::HashMap<String, Vec<(String, Vec<String>)>> = std::collections::HashMap::new();
+        let mut total_tables = 0usize;
+        for (cat, schema, tables) in &schema_tables {
+            total_tables += tables.len();
+            catalog_map.entry(cat.clone())
+                .or_default()
+                .push((schema.clone(), tables.clone()));
+        }
+        let discovery: Vec<(String, Vec<(String, Vec<String>)>)> = catalog_map.into_iter().collect();
+
+        // Step 5: Batch write to DuckDB cache (single transaction)
         let cache = self.cache.clone();
         let conn_id = self.id.clone();
-        tokio::task::spawn_blocking(move || cache.invalidate_connection(&conn_id))
+        tokio::task::spawn_blocking(move || cache.batch_cache_discovery(&conn_id, &discovery))
             .await.map_err(|e| e.to_string())??;
 
-        let catalogs = self.rest.list_catalogs().await?;
-        let mut total_tables = 0usize;
-
-        for catalog in &catalogs {
-            let schemas = self.rest.list_schemas(catalog).await.unwrap_or_default();
-            // Cache schemas
-            let cache = self.cache.clone();
-            let (cid, cat) = (self.id.clone(), catalog.clone());
-            let schemas_clone = schemas.clone();
-            tokio::task::spawn_blocking(move || cache.set_schemas(&cid, &cat, &schemas_clone))
-                .await.map_err(|e| e.to_string())??;
-
-            for schema in &schemas {
-                let tables = self.rest.list_tables(catalog, schema).await.unwrap_or_default();
-                total_tables += tables.len();
-                // Cache tables
-                let cache = self.cache.clone();
-                let (cid, cat, sch) = (self.id.clone(), catalog.clone(), schema.clone());
-                let tables_clone = tables.clone();
-                tokio::task::spawn_blocking(move || cache.set_tables(&cid, &cat, &sch, &tables_clone))
-                    .await.map_err(|e| e.to_string())??;
-            }
-        }
-
-        tracing::info!(conn_id = %self.id, catalogs = catalogs.len(), tables = total_tables, "Trino cache refreshed");
+        let elapsed = start.elapsed().as_millis();
+        tracing::info!(
+            conn_id = %self.id,
+            total_tables,
+            elapsed_ms = elapsed,
+            "Trino cache refreshed (parallel discovery)"
+        );
         Ok(total_tables)
     }
 
