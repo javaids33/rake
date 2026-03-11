@@ -45,4 +45,5 @@ tokio-postgres = { workspace = true }
 mysql_async = { workspace = true, optional = true }
 rusqlite = { workspace = true, optional = true }
 mongodb = { workspace = true }
+reqwest = { workspace = true }
 futures = { workspace = true }

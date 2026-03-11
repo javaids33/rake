@@ -2569,6 +2569,7 @@ async fn add_connection(
         "mysql" | "mariadb" => "mysql",
         "sqlite" => "sqlite",
         "mongodb" => "mongo",
+        "trino" | "presto" => "trino",
         _ => &req.conn_type,
     };
 
@@ -2629,6 +2630,135 @@ async fn add_connection(
                 }
             }
             mongo_registered
+        }
+        "trino" | "presto" => {
+            drop(ctx);
+            // Trino: discover tables via REST API, register as MemTable snapshots
+            let user = if req.username.is_empty() { "rustlake".to_string() } else { req.username.clone() };
+            let pass = req.password.clone();
+            let catalog = if req.database.is_empty() { "postgresql".to_string() } else { req.database.clone() };
+            let base_url = format!("http://{}:{}", req.host, req.port);
+
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: format!("HTTP client error: {}", e) })))?;
+
+            // Helper closure to execute a Trino query and return rows
+            async fn trino_query(client: &reqwest::Client, base_url: &str, user: &str, pass: &str, catalog: &str, sql: &str) -> Result<Vec<Vec<serde_json::Value>>, String> {
+                let mut req_builder = client.post(&format!("{}/v1/statement", base_url))
+                    .header("X-Trino-User", user)
+                    .header("X-Trino-Catalog", catalog)
+                    .body(sql.to_string());
+                if !pass.is_empty() {
+                    req_builder = req_builder.basic_auth(user, Some(pass));
+                }
+                let resp = req_builder.send().await.map_err(|e| format!("Trino request failed: {}", e))?;
+                if !resp.status().is_success() {
+                    return Err(format!("Trino returned HTTP {}", resp.status()));
+                }
+                let body: serde_json::Value = resp.json().await.map_err(|e| format!("Parse error: {}", e))?;
+                let mut all_data: Vec<Vec<serde_json::Value>> = Vec::new();
+                if let Some(data) = body.get("data").and_then(|d| d.as_array()) {
+                    all_data.extend(data.iter().cloned().filter_map(|v| v.as_array().cloned()));
+                }
+                let mut next_uri = body.get("nextUri").and_then(|v| v.as_str()).map(|s| s.to_string());
+                for _ in 0..50 {
+                    let Some(uri) = next_uri.take() else { break };
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    let mut poll_req = client.get(&uri).header("X-Trino-User", user);
+                    if !pass.is_empty() {
+                        poll_req = poll_req.basic_auth(user, Some(pass));
+                    }
+                    let poll_resp = poll_req.send().await.map_err(|e| format!("Poll failed: {}", e))?;
+                    let poll_body: serde_json::Value = poll_resp.json().await.map_err(|e| format!("Poll parse: {}", e))?;
+                    if let Some(data) = poll_body.get("data").and_then(|d| d.as_array()) {
+                        all_data.extend(data.iter().cloned().filter_map(|v| v.as_array().cloned()));
+                    }
+                    next_uri = poll_body.get("nextUri").and_then(|v| v.as_str()).map(|s| s.to_string());
+                    let state = poll_body.get("stats").and_then(|s| s.get("state")).and_then(|v| v.as_str()).unwrap_or("");
+                    if state == "FINISHED" || state == "FAILED" { break; }
+                }
+                Ok(all_data)
+            }
+
+            // Discover schemas in the catalog
+            let schemas = trino_query(&client, &base_url, &user, &pass, &catalog, &format!("SHOW SCHEMAS FROM {}", catalog))
+                .await
+                .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e })))?;
+            let schema_names: Vec<String> = schemas.into_iter()
+                .filter_map(|row| row.first().and_then(|v| v.as_str()).map(|s| s.trim().to_string()))
+                .filter(|s| s != "information_schema" && s != "pg_catalog" && s != "performance_schema")
+                .collect();
+
+            tracing::info!(catalog = %catalog, schemas = ?schema_names, "Trino: discovered schemas");
+
+            // Discover tables per schema and register them
+            let ctx2 = state.ctx.read().await;
+            let trino_schema = crate::providers::ensure_schema(ctx2.datafusion_ctx(), prefix)
+                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e })))?;
+
+            let mut trino_registered = Vec::new();
+            for schema_name in &schema_names {
+                let tables = trino_query(&client, &base_url, &user, &pass, &catalog,
+                    &format!("SHOW TABLES FROM {}.{}", catalog, schema_name))
+                    .await
+                    .unwrap_or_default();
+                let table_names: Vec<String> = tables.into_iter()
+                    .filter_map(|row| row.first().and_then(|v| v.as_str()).map(|s| s.trim().to_string()))
+                    .collect();
+
+                for table_name in &table_names {
+                    // Fetch a preview (100 rows) to build the Arrow schema and register
+                    let fq_table = format!("{}.{}.{}", catalog, schema_name, table_name);
+                    let preview_sql = format!("SELECT * FROM {} LIMIT 100", fq_table);
+                    let rows = match trino_query(&client, &base_url, &user, &pass, &catalog, &preview_sql).await {
+                        Ok(r) => r,
+                        Err(e) => {
+                            tracing::warn!(table = %fq_table, error = %e, "Trino: failed to preview table, skipping");
+                            continue;
+                        }
+                    };
+
+                    // Also get column info
+                    let col_sql = format!("DESCRIBE {}", fq_table);
+                    let col_rows = trino_query(&client, &base_url, &user, &pass, &catalog, &col_sql).await.unwrap_or_default();
+
+                    // Build Arrow schema from DESCRIBE output
+                    let mut fields = Vec::new();
+                    for col_row in &col_rows {
+                        let col_name = col_row.first().and_then(|v| v.as_str()).unwrap_or("unknown").trim().to_string();
+                        let col_type = col_row.get(1).and_then(|v| v.as_str()).unwrap_or("varchar").trim().to_string();
+                        let arrow_type = trino_type_to_arrow(&col_type);
+                        fields.push(arrow::datatypes::Field::new(col_name, arrow_type, true));
+                    }
+
+                    if fields.is_empty() { continue; }
+
+                    let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(fields.clone()));
+
+                    // Build Arrow arrays from row data
+                    let batch = match build_arrow_batch_from_trino_rows(&schema, &rows) {
+                        Some(b) => b,
+                        None => {
+                            // Empty table — create empty batch
+                            match arrow::record_batch::RecordBatch::new_empty(schema.clone()) {
+                                b => b,
+                            }
+                        }
+                    };
+
+                    if let Ok(mem_table) = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]) {
+                        let reg_name = format!("{}_{}", schema_name, table_name);
+                        let df_name = format!("{}.{}", prefix, reg_name);
+                        if trino_schema.register_table(reg_name, std::sync::Arc::new(mem_table)).is_ok() {
+                            trino_registered.push(df_name);
+                        }
+                    }
+                }
+            }
+
+            trino_registered
         }
         other => {
             drop(ctx);
@@ -5258,6 +5388,157 @@ async fn test_connection(
                 }
             }
         }
+        // Trino / Presto — HTTP REST API protocol test
+        "trino" | "presto" => {
+            let user = req.username.as_deref().unwrap_or("rustlake");
+            let pass = req.password.as_deref().unwrap_or("");
+            let base_url = format!("http://{}:{}", req.host, port);
+
+            // Check 4a: HTTP /v1/info — server status
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .build()
+                .unwrap_or_default();
+
+            let info_url = format!("{}/v1/info", base_url);
+            match client.get(&info_url).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    let body: serde_json::Value = resp.json().await.unwrap_or_default();
+                    let version = body.get("nodeVersion")
+                        .and_then(|v| v.get("version"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| format!("Trino {}", s));
+                    let state_str = body.get("state").and_then(|v| v.as_str()).unwrap_or("unknown");
+
+                    checks.push(ConnectionCheck {
+                        name: "protocol".into(),
+                        passed: true,
+                        detail: format!("HTTP REST API OK — server state: {}", state_str),
+                    });
+
+                    // Check 4b: Run a test query with auth to verify credentials
+                    let catalog = req.database.as_deref().unwrap_or("system");
+                    let mut query_req = client.post(&format!("{}/v1/statement", base_url))
+                        .header("X-Trino-User", user)
+                        .header("X-Trino-Catalog", catalog)
+                        .header("X-Trino-Schema", "information_schema")
+                        .body("SELECT count(*) FROM information_schema.tables");
+                    if !pass.is_empty() {
+                        query_req = query_req.basic_auth(user, Some(pass));
+                    }
+
+                    match query_req.send().await {
+                        Ok(resp) if resp.status().is_success() => {
+                            let query_body: serde_json::Value = resp.json().await.unwrap_or_default();
+
+                            // Follow nextUri to get actual results
+                            let mut next_uri = query_body.get("nextUri").and_then(|v| v.as_str()).map(|s| s.to_string());
+                            let mut table_count: Option<usize> = None;
+                            for _ in 0..20 {
+                                let Some(uri) = next_uri.take() else { break };
+                                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                                let mut poll_req = client.get(&uri).header("X-Trino-User", user);
+                                if !pass.is_empty() {
+                                    poll_req = poll_req.basic_auth(user, Some(pass));
+                                }
+                                if let Ok(poll_resp) = poll_req.send().await {
+                                    if let Ok(poll_body) = poll_resp.json::<serde_json::Value>().await {
+                                        if let Some(data) = poll_body.get("data").and_then(|d| d.as_array()) {
+                                            table_count = data.first()
+                                                .and_then(|row| row.as_array())
+                                                .and_then(|cols| cols.first())
+                                                .and_then(|v| v.as_i64())
+                                                .map(|n| n as usize);
+                                        }
+                                        next_uri = poll_body.get("nextUri").and_then(|v| v.as_str()).map(|s| s.to_string());
+                                        let state_val = poll_body.get("stats").and_then(|s| s.get("state")).and_then(|v| v.as_str()).unwrap_or("");
+                                        if state_val == "FINISHED" || state_val == "FAILED" { break; }
+                                    }
+                                }
+                            }
+
+                            checks.push(ConnectionCheck { name: "auth".into(), passed: true, detail: format!("Authenticated as {}", user) });
+
+                            Json(ConnectionTestResponse {
+                                success: true,
+                                message: "Full connection verified".into(),
+                                latency_ms: Some(start.elapsed().as_millis()),
+                                server_version: version,
+                                tables_found: table_count,
+                                validation_level: "full".into(),
+                                checks,
+                            })
+                        }
+                        Ok(resp) => {
+                            let status = resp.status();
+                            let body_text = resp.text().await.unwrap_or_default();
+                            checks.push(ConnectionCheck {
+                                name: "auth".into(),
+                                passed: false,
+                                detail: format!("Query failed (HTTP {}): {}", status, &body_text[..body_text.len().min(200)]),
+                            });
+                            Json(ConnectionTestResponse {
+                                success: false,
+                                message: format!("Trino authentication failed (HTTP {})", status),
+                                latency_ms: Some(start.elapsed().as_millis()),
+                                server_version: version,
+                                tables_found: None,
+                                validation_level: "tcp".into(),
+                                checks,
+                            })
+                        }
+                        Err(e) => {
+                            checks.push(ConnectionCheck {
+                                name: "auth".into(),
+                                passed: false,
+                                detail: format!("Query request failed: {}", e),
+                            });
+                            Json(ConnectionTestResponse {
+                                success: false,
+                                message: format!("Trino query test failed: {}", e),
+                                latency_ms: Some(start.elapsed().as_millis()),
+                                server_version: version,
+                                tables_found: None,
+                                validation_level: "tcp".into(),
+                                checks,
+                            })
+                        }
+                    }
+                }
+                Ok(resp) => {
+                    checks.push(ConnectionCheck {
+                        name: "protocol".into(),
+                        passed: false,
+                        detail: format!("HTTP {} from /v1/info", resp.status()),
+                    });
+                    Json(ConnectionTestResponse {
+                        success: false,
+                        message: format!("Trino REST API returned HTTP {}", resp.status()),
+                        latency_ms: Some(start.elapsed().as_millis()),
+                        server_version: None,
+                        tables_found: None,
+                        validation_level: "tcp".into(),
+                        checks,
+                    })
+                }
+                Err(e) => {
+                    checks.push(ConnectionCheck {
+                        name: "protocol".into(),
+                        passed: false,
+                        detail: format!("HTTP request failed: {}", e),
+                    });
+                    Json(ConnectionTestResponse {
+                        success: false,
+                        message: format!("Cannot reach Trino REST API: {}", e),
+                        latency_ms: Some(start.elapsed().as_millis()),
+                        server_version: None,
+                        tables_found: None,
+                        validation_level: "tcp".into(),
+                        checks,
+                    })
+                }
+            }
+        }
         _ => {
             // No client library — TCP reachability is the best we can do
             checks.push(ConnectionCheck {
@@ -5286,6 +5567,7 @@ fn default_port_for(conn_type: &str) -> u16 {
         "mongodb" | "cdc_mongodb" => 27017,
         "redis" => 6379,
         "clickhouse" => 8123,
+        "trino" | "presto" => 8080,
         "kafka" => 9092,
         "elasticsearch" | "opensearch" => 9200,
         "cassandra" | "scylladb" => 9042,
@@ -5308,9 +5590,121 @@ fn required_fields_for(conn_type: &str) -> Vec<String> {
         "postgres" | "postgresql" | "mysql" | "mariadb" | "mssql" | "sqlserver"
         | "oracle" | "cockroachdb" | "cdc_postgres" => vec!["database".into(), "username".into()],
         "mongodb" | "cdc_mongodb" => vec!["database".into()],
+        "trino" | "presto" => vec!["username".into()],
         "clickhouse" | "neo4j" | "cassandra" | "scylladb" => vec!["username".into()],
         _ => vec![],
     }
+}
+
+// ── Trino helpers ─────────────────────────────────────────────────
+
+/// Map Trino SQL types to Arrow DataType.
+fn trino_type_to_arrow(trino_type: &str) -> arrow::datatypes::DataType {
+    use arrow::datatypes::DataType;
+    let t = trino_type.to_lowercase();
+    let t = t.trim();
+    if t.starts_with("varchar") || t.starts_with("char") || t == "json" || t == "uuid" || t == "ipaddress" {
+        DataType::Utf8
+    } else if t == "boolean" {
+        DataType::Boolean
+    } else if t == "tinyint" {
+        DataType::Int8
+    } else if t == "smallint" {
+        DataType::Int16
+    } else if t == "integer" || t == "int" {
+        DataType::Int32
+    } else if t == "bigint" {
+        DataType::Int64
+    } else if t == "real" || t == "float" {
+        DataType::Float32
+    } else if t == "double" {
+        DataType::Float64
+    } else if t.starts_with("decimal") || t.starts_with("numeric") {
+        DataType::Utf8 // store as string to avoid precision loss
+    } else if t == "date" {
+        DataType::Utf8
+    } else if t.starts_with("timestamp") {
+        DataType::Utf8
+    } else if t.starts_with("time") {
+        DataType::Utf8
+    } else if t == "varbinary" {
+        DataType::Binary
+    } else {
+        DataType::Utf8 // fallback
+    }
+}
+
+/// Build an Arrow RecordBatch from Trino JSON row data.
+fn build_arrow_batch_from_trino_rows(
+    schema: &std::sync::Arc<arrow::datatypes::Schema>,
+    rows: &[Vec<serde_json::Value>],
+) -> Option<arrow::record_batch::RecordBatch> {
+    use arrow::array::*;
+    use arrow::datatypes::DataType;
+
+    if rows.is_empty() { return None; }
+
+    let mut columns: Vec<std::sync::Arc<dyn arrow::array::Array>> = Vec::new();
+    for (i, field) in schema.fields().iter().enumerate() {
+        let arr: std::sync::Arc<dyn arrow::array::Array> = match field.data_type() {
+            DataType::Boolean => {
+                let vals: Vec<Option<bool>> = rows.iter().map(|row| {
+                    row.get(i).and_then(|v| v.as_bool())
+                }).collect();
+                std::sync::Arc::new(BooleanArray::from(vals))
+            }
+            DataType::Int8 => {
+                let vals: Vec<Option<i8>> = rows.iter().map(|row| {
+                    row.get(i).and_then(|v| v.as_i64()).map(|n| n as i8)
+                }).collect();
+                std::sync::Arc::new(Int8Array::from(vals))
+            }
+            DataType::Int16 => {
+                let vals: Vec<Option<i16>> = rows.iter().map(|row| {
+                    row.get(i).and_then(|v| v.as_i64()).map(|n| n as i16)
+                }).collect();
+                std::sync::Arc::new(Int16Array::from(vals))
+            }
+            DataType::Int32 => {
+                let vals: Vec<Option<i32>> = rows.iter().map(|row| {
+                    row.get(i).and_then(|v| v.as_i64()).map(|n| n as i32)
+                }).collect();
+                std::sync::Arc::new(Int32Array::from(vals))
+            }
+            DataType::Int64 => {
+                let vals: Vec<Option<i64>> = rows.iter().map(|row| {
+                    row.get(i).and_then(|v| v.as_i64())
+                }).collect();
+                std::sync::Arc::new(Int64Array::from(vals))
+            }
+            DataType::Float32 => {
+                let vals: Vec<Option<f32>> = rows.iter().map(|row| {
+                    row.get(i).and_then(|v| v.as_f64()).map(|n| n as f32)
+                }).collect();
+                std::sync::Arc::new(Float32Array::from(vals))
+            }
+            DataType::Float64 => {
+                let vals: Vec<Option<f64>> = rows.iter().map(|row| {
+                    row.get(i).and_then(|v| v.as_f64())
+                }).collect();
+                std::sync::Arc::new(Float64Array::from(vals))
+            }
+            _ => {
+                // Utf8 fallback — stringify everything
+                let vals: Vec<Option<String>> = rows.iter().map(|row| {
+                    row.get(i).and_then(|v| {
+                        if v.is_null() { None }
+                        else if let Some(s) = v.as_str() { Some(s.to_string()) }
+                        else { Some(v.to_string()) }
+                    })
+                }).collect();
+                std::sync::Arc::new(StringArray::from(vals))
+            }
+        };
+        columns.push(arr);
+    }
+
+    arrow::record_batch::RecordBatch::try_new(schema.clone(), columns).ok()
 }
 
 // ── Engine info endpoints ──────────────────────────────────────────

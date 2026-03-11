@@ -77,8 +77,8 @@ const CONNECTOR_CATALOG = [
   { id: 'starrocks', name: 'StarRocks', icon: '⭐', category: 'analytics', status: 'preview', desc: 'Sub-second MPP analytics engine', config: ['host', 'port', 'database', 'username', 'password'] },
   { id: 'doris', name: 'Apache Doris', icon: '🌊', category: 'analytics', status: 'preview', desc: 'MPP analytical database', config: ['host', 'port', 'database', 'username', 'password'] },
   { id: 'firebolt', name: 'Firebolt', icon: '🔥', category: 'analytics', status: 'preview', desc: 'Cloud warehouse for sub-second queries', config: ['account', 'database', 'engine', 'username', 'password'] },
-  { id: 'trino', name: 'Trino', icon: '🔺', category: 'analytics', status: 'preview', desc: 'Distributed SQL query engine', config: ['host', 'port', 'catalog', 'schema', 'username'] },
-  { id: 'presto', name: 'PrestoDB', icon: '🎯', category: 'analytics', status: 'preview', desc: 'Distributed SQL engine (Meta fork)', config: ['host', 'port', 'catalog', 'schema', 'username'] },
+  { id: 'trino', name: 'Trino', icon: '🔺', category: 'analytics', status: 'available', desc: 'Distributed SQL query engine', config: ['host', 'port', 'catalog', 'schema', 'username', 'password'] },
+  { id: 'presto', name: 'PrestoDB', icon: '🎯', category: 'analytics', status: 'available', desc: 'Distributed SQL engine (Meta fork)', config: ['host', 'port', 'catalog', 'schema', 'username', 'password'] },
   { id: 'kylin', name: 'Apache Kylin', icon: '🐉', category: 'analytics', status: 'preview', desc: 'OLAP engine with pre-built cubes', config: ['host', 'port', 'project', 'username', 'password'] },
 
   // ─── NoSQL & Document ──────────────────────────────
@@ -230,7 +230,7 @@ export function DataSources() {
         conn_type: selectedConnector?.id || 'postgres',
         host: configValues.host || configValues.endpoint || configValues.contact_points || configValues.hosts || 'localhost',
         port: parseInt(configValues.port || '5432'),
-        database: configValues.database || configValues.keyspace || configValues.bucket || configValues.dbname,
+        database: configValues.database || configValues.catalog || configValues.keyspace || configValues.bucket || configValues.dbname,
         username: configValues.username || configValues.user,
         password: configValues.password || configValues.secret_key,
       })
@@ -262,7 +262,7 @@ export function DataSources() {
           conn_type: selectedConnector.id,
           host: configValues.host || 'localhost',
           port: parseInt(configValues.port || '5432'),
-          database: configValues.database || configValues.keyspace || '',
+          database: configValues.database || configValues.catalog || configValues.keyspace || '',
           username: configValues.username || '',
           password: configValues.password || '',
         })
@@ -529,7 +529,7 @@ export function DataSources() {
                 type={field.includes('password') || field.includes('secret') || field.includes('key') || field.includes('token') ? 'password' : 'text'}
                 value={configValues[field] || ''}
                 onChange={e => setConfigValues(v => ({ ...v, [field]: e.target.value }))}
-                placeholder={field === 'host' ? 'localhost' : field === 'port' ? '5432' : field === 'region' ? 'us-east-1' : field === 'ssl_mode' ? 'prefer' : ''}
+                placeholder={field === 'host' ? 'localhost' : field === 'port' ? (selectedConnector.id === 'trino' || selectedConnector.id === 'presto' ? '8080' : '5432') : field === 'catalog' ? 'postgresql' : field === 'schema' ? 'public' : field === 'region' ? 'us-east-1' : field === 'ssl_mode' ? 'prefer' : ''}
               />
             ))}
 

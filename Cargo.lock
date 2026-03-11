@@ -5454,6 +5454,7 @@ dependencies = [
  "mongodb",
  "mysql_async 0.34.2",
  "rand 0.8.5",
+ "reqwest",
  "rusqlite",
  "rustlake-core",
  "rustlake-engine",

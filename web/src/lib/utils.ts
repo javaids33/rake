@@ -49,6 +49,7 @@ export function inferFormat(tableName: string): { format: string; variant: strin
   if (tableName.startsWith('pg.') || tableName.startsWith('pg_')) return { format: 'PostgreSQL', variant: 'external' }
   if (tableName.startsWith('mysql.') || tableName.startsWith('mysql_')) return { format: 'MySQL', variant: 'external' }
   if (tableName.startsWith('mongo.') || tableName.startsWith('mongo_')) return { format: 'MongoDB', variant: 'external' }
+  if (tableName.startsWith('trino.') || tableName.startsWith('trino_')) return { format: 'Trino', variant: 'external' }
   if (tableName.startsWith('uploads_')) return { format: 'Upload', variant: 'file' }
   if (tableName.includes('parquet')) return { format: 'Parquet', variant: 'file' }
   if (tableName.includes('csv')) return { format: 'CSV', variant: 'file' }
@@ -77,5 +78,6 @@ export const FORMAT_COLORS: Record<string, string> = {
   PostgreSQL: 'bg-blue-500/15 text-blue-400 border-blue-500/20',
   MySQL: 'bg-cyan-500/15 text-cyan-400 border-cyan-500/20',
   MongoDB: 'bg-emerald-500/15 text-emerald-400 border-emerald-500/20',
+  Trino: 'bg-red-500/15 text-red-400 border-red-500/20',
   Upload: 'bg-orange-500/15 text-orange-400 border-orange-500/20',
 }
