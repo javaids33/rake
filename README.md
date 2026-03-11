@@ -92,15 +92,15 @@ All subsystems — SQL engine, vector search, scheduler, streaming, transforms, 
 - **Multi-Source Queries** — Upload CSV/Parquet/JSON, connect Postgres/MySQL/MongoDB, and JOIN across sources in a single SQL query.
 - **Python Bindings** — PyO3-powered `RustLakeSession` with zero-copy Arrow FFI to Polars and PyArrow.
 
-## Local Setup
+## Compile & Run Locally
 
 ### Prerequisites
 
 | Tool | Version | Purpose |
 |------|---------|---------|
 | Rust | 1.75+ | Backend (13 crates) |
-| Node.js | 18+ | Frontend (Next.js) |
-| Docker | 20+ | Optional — Postgres, MinIO, etc. |
+| Bun | 1.0+ | Frontend (Vite + React). Node.js 18+ also works (`npm` instead of `bun`) |
+| Docker | 20+ | Optional — Postgres, MySQL, MongoDB, MinIO, Trino |
 
 ### 1. Clone and build
 
@@ -108,55 +108,229 @@ All subsystems — SQL engine, vector search, scheduler, streaming, transforms, 
 git clone https://github.com/rustlake/rustlake.git
 cd rustlake
 
-# Build the Rust backend
+# Build the entire workspace (all 13 crates)
 cargo build
 
-# Install frontend dependencies
-cd web && npm install && cd ..
+# Or build only the API server binary
+cargo build --bin rustlake-api
+
+# Release build (optimized, ~100ms cold start)
+cargo build --release
 ```
+
+#### Feature flags
+
+The API server has optional features enabled by default. To compile with a minimal set:
+
+```bash
+# Default features: duckdb, postgres, mysql, sqlite, polars
+cargo build --bin rustlake-api
+
+# Disable DuckDB and Polars (faster compile, fewer dependencies)
+cargo build --bin rustlake-api --no-default-features --features postgres,mysql,sqlite
+
+# Everything off (DataFusion-only, smallest binary)
+cargo build --bin rustlake-api --no-default-features
+```
+
+| Feature | Default | Description |
+|---------|---------|-------------|
+| `duckdb` | yes | DuckDB OLAP accelerator (hybrid engine) |
+| `polars` | yes | Polars engine backend |
+| `postgres` | yes | Live Postgres federation via `datafusion-table-providers` |
+| `mysql` | yes | Live MySQL federation via `datafusion-table-providers` |
+| `sqlite` | yes | SQLite federation (bundled) |
+| `clickhouse` | no | ClickHouse federation |
+| `flight-sql-client` | no | Flight SQL client for remote engines |
 
 ### 2. Start the API server
 
 ```bash
+# Development (debug build)
 cargo run --bin rustlake-api
 # Server starts at http://127.0.0.1:3000
 # Includes: sample data, 20 pre-indexed vector docs, 6 transform models
+
+# Release
+cargo run --release --bin rustlake-api
 ```
 
-### 3. Start the web UI
+#### Environment variables
+
+```bash
+# Enable/disable engines
+RUSTLAKE_DUCKDB__ENABLED=true       # Enable DuckDB hybrid engine
+RUSTLAKE_POLARS__ENABLED=true       # Enable Polars engine
+
+# Arrow Flight gRPC (default: off)
+RUSTLAKE_FLIGHT__ENABLED=true       # Start Flight SQL on :50051
+
+# Cluster mode (default: standalone)
+RUSTLAKE_CLUSTER__NODE_ROLE=coordinator  # or "worker" or "standalone"
+
+# Auto-bootstrap external databases on startup
+RUSTLAKE_AUTO_BOOTSTRAP=true
+
+# Postgres connection (registered as pg.* tables)
+RUSTLAKE_PG_HOST=localhost
+RUSTLAKE_PG_PORT=5433
+RUSTLAKE_PG_DB=rustlake_demo
+RUSTLAKE_PG_USER=rustlake
+RUSTLAKE_PG_PASSWORD=rustlake
+
+# MySQL connection (registered as mysql.* tables)
+RUSTLAKE_MYSQL_HOST=localhost
+RUSTLAKE_MYSQL_PORT=3307
+RUSTLAKE_MYSQL_DB=rustlake_demo
+RUSTLAKE_MYSQL_USER=rustlake
+RUSTLAKE_MYSQL_PASSWORD=rustlake
+
+# MongoDB connection (registered as mongo.* tables)
+RUSTLAKE_MONGO_HOST=localhost
+RUSTLAKE_MONGO_PORT=27018
+RUSTLAKE_MONGO_DB=rustlake_demo
+RUSTLAKE_MONGO_USER=rustlake
+RUSTLAKE_MONGO_PASSWORD=rustlake
+
+# Logging
+RUST_LOG=info                        # or debug, trace
+```
+
+### 3. Install and start the web UI
 
 ```bash
 cd web
-npm run dev
+bun install        # or: npm install
+bun run dev        # or: npm run dev
 # Dashboard opens at http://localhost:3001
 ```
 
-### 4. (Optional) Start external databases
+The UI is a Vite + React + TypeScript app with Tailwind CSS and Monaco Editor. It proxies API requests to the backend at `:3000`.
+
+### 4. (Optional) Start Docker services
 
 ```bash
-# Postgres, MySQL, MongoDB, MinIO — all seeded with demo data
+# Core databases — Postgres, MySQL, MongoDB, MinIO (all seeded with demo data)
 docker compose up -d
 
-# Connect to Postgres from the UI:
-#   Host: localhost, Port: 5433, DB: rustlake_demo
-#   User: rustlake, Password: rustlake
+# Add streaming services (Kafka, RabbitMQ, NATS, MQTT)
+docker compose --profile streaming up -d
+
+# Add analytics (ClickHouse, Cassandra)
+docker compose --profile analytics up -d
+
+# Add search (Elasticsearch, Redis)
+docker compose --profile search up -d
+
+# Start everything
+docker compose --profile streaming --profile analytics --profile search up -d
 ```
 
-### 5. Verify it works
+#### Docker service credentials
+
+| Service | Host | Port | User | Password | Database |
+|---------|------|------|------|----------|----------|
+| Postgres | localhost | 5433 | rustlake | rustlake | rustlake_demo |
+| MySQL | localhost | 3307 | rustlake | rustlake | rustlake_demo |
+| MongoDB | localhost | 27018 | rustlake | rustlake | rustlake_demo |
+| MinIO | localhost | 9000 (API) / 9001 (Console) | rustlake | rustlake123 | — |
+| ClickHouse | localhost | 8123 (HTTP) / 9100 (TCP) | rustlake | rustlake | rustlake_demo |
+| Kafka | localhost | 9092 | — | — | — |
+| Redis | localhost | 6379 | — | — | — |
+| Elasticsearch | localhost | 9200 | — | — | — |
+| RabbitMQ | localhost | 5672 (AMQP) / 15672 (UI) | rustlake | rustlake | — |
+
+#### (Optional) Add Trino for federated queries
+
+Trino can query across Postgres, MySQL, and its built-in TPC-H generator in a single SQL statement:
+
+```bash
+# Start Trino on the same Docker network
+docker run -d \
+  --name rustlake-trino \
+  --network rake_default \
+  -p 8080:8080 \
+  -v ./docker/trino/catalog:/etc/trino/catalog \
+  trinodb/trino:latest
+
+# Trino UI: http://localhost:8080
+# Query via CLI:
+docker exec rustlake-trino trino --execute "SHOW CATALOGS"
+# Returns: mysql, postgresql, system, tpch
+
+# Cross-catalog query example:
+docker exec rustlake-trino trino --execute \
+  "SELECT pg.name, my.name
+   FROM postgresql.public.customers pg
+   JOIN mysql.rustlake_demo.customers my ON pg.customer_id = my.customer_id
+   LIMIT 5"
+```
+
+Trino catalog configs are in `docker/trino/catalog/` (postgresql.properties, mysql.properties, tpch.properties).
+
+### 5. Verify everything works
 
 ```bash
 # Health check
 curl http://127.0.0.1:3000/health
 
-# Run a query
+# Run a SQL query
 curl -X POST http://127.0.0.1:3000/api/v1/sql \
   -H 'Content-Type: application/json' \
   -d '{"sql": "SELECT 1 + 1 AS result"}'
+
+# Query with engine selection (auto | datafusion | duckdb | polars)
+curl -X POST http://127.0.0.1:3000/api/v1/sql \
+  -H 'Content-Type: application/json' \
+  -d '{"sql": "SELECT count(*) FROM pg.tpch_orders", "engine": "duckdb"}'
 
 # Vector search
 curl -X POST http://127.0.0.1:3000/api/v1/vector/search \
   -H 'Content-Type: application/json' \
   -d '{"query": "wireless headphones", "k": 5}'
+
+# List registered tables
+curl http://127.0.0.1:3000/api/v1/tables
+
+# List engines and their status
+curl http://127.0.0.1:3000/api/v1/engines
+
+# System metrics
+curl http://127.0.0.1:3000/api/v1/system/resources
+```
+
+### 6. Run tests
+
+```bash
+# All tests
+cargo test
+
+# Single crate
+cargo test -p rustlake-engine
+
+# With logging output
+RUST_LOG=debug cargo test -- --nocapture
+
+# Lint and format checks (run before committing)
+cargo clippy -- -D warnings
+cargo fmt --check
+```
+
+### 7. CLI usage
+
+```bash
+# Run SQL from the command line
+cargo run --bin rustlake -- query "SELECT count(*) FROM 'sample-data/sales.csv'"
+
+# Start the API server via CLI
+cargo run --bin rustlake -- serve
+cargo run --bin rustlake -- serve --port 8080 --flight  # with Flight SQL
+
+# List registered tables
+cargo run --bin rustlake -- tables list
+
+# Register a file as a table
+cargo run --bin rustlake -- tables register --path /path/to/data.parquet --name my_table
 ```
 
 ## Crate Map
@@ -221,7 +395,7 @@ crates/
 | HTTP Server | Axum 0.8 |
 | Async Runtime | Tokio (full features) |
 | RPC | Arrow Flight via tonic 0.14 |
-| Frontend | Next.js 16, React 19, Monaco Editor, SWR, Tailwind CSS |
+| Frontend | Vite 6, React 18, Monaco Editor, TanStack Query, Tailwind CSS |
 | Databases | Postgres 16, MySQL 8, MongoDB 7 (via Docker) |
 | Object Storage | MinIO / S3 / GCS / ADLS via `object_store` |
 | Error Handling | thiserror 2 (libraries), anyhow 1 (binaries) |
