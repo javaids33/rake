@@ -265,6 +265,95 @@ impl ProviderRegistry {
 
         Ok(registered)
     }
+
+    /// Register all tables from a Trino connection as DataFusion TableProviders.
+    ///
+    /// Creates a per-catalog DataFusion schema (e.g., `trino_postgresql`, `trino_mysql`)
+    /// and registers each Trino table with predicate/projection pushdown.
+    /// Table names use `{schema}_{table}` format within the DataFusion schema, so
+    /// `postgresql.public.customers` becomes `trino_postgresql.public_customers`.
+    pub async fn register_trino(
+        &self,
+        connection_id: &str,
+        trino_conn: &crate::trino_client::TrinoConnection,
+        rest_client: std::sync::Arc<crate::trino_client::TrinoRestClient>,
+        ctx: &SessionContext,
+    ) -> Result<Vec<String>, String> {
+        // Get catalog tree from DuckDB cache
+        #[cfg(feature = "duckdb")]
+        let tree = trino_conn.browse().await?;
+        #[cfg(not(feature = "duckdb"))]
+        return Err("DuckDB feature required for Trino provider".into());
+
+        #[cfg(feature = "duckdb")]
+        {
+            let mut registered = Vec::new();
+
+            for catalog in &tree.catalogs {
+                let schema_prefix = format!("trino_{}", catalog.name);
+                let schema_provider = ensure_schema(ctx, &schema_prefix)?;
+
+                for schema in &catalog.schemas {
+                    for table_name in &schema.tables {
+                        // Resolve column schema — from DuckDB cache or Trino DESCRIBE
+                        let columns = trino_conn
+                            .columns(&catalog.name, &schema.name, table_name)
+                            .await
+                            .unwrap_or_default();
+
+                        if columns.is_empty() {
+                            tracing::warn!(
+                                catalog = %catalog.name,
+                                schema = %schema.name,
+                                table = %table_name,
+                                "Skipping Trino table: no columns resolved"
+                            );
+                            continue;
+                        }
+
+                        let arrow_schema =
+                            crate::trino_provider::trino_columns_to_schema(&columns);
+                        let provider = crate::trino_provider::TrinoTableProvider::new(
+                            catalog.name.clone(),
+                            schema.name.clone(),
+                            table_name.clone(),
+                            arrow_schema,
+                            rest_client.clone(),
+                        );
+
+                        let df_table_name = format!("{}_{}", schema.name, table_name);
+                        let df_full = format!("{}.{}", schema_prefix, df_table_name);
+
+                        match schema_provider
+                            .register_table(df_table_name, Arc::new(provider))
+                        {
+                            Ok(_) => {
+                                tracing::info!(table = %df_full, "Trino table provider registered");
+                                registered.push(df_full);
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    table = %df_full,
+                                    error = %e,
+                                    "Failed to register Trino table provider"
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+
+            self.entries.write().await.insert(
+                connection_id.to_string(),
+                ProviderEntry {
+                    conn_type: "trino".to_string(),
+                    tables: registered.clone(),
+                },
+            );
+
+            Ok(registered)
+        }
+    }
 }
 
 /// Ensure a named schema exists in the default DataFusion catalog.

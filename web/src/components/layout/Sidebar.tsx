@@ -4,7 +4,7 @@ import { useAppStore } from '../../stores/app'
 import {
   Home, Terminal, Database, FolderInput, Radio, Search,
   GitBranch, Clock, Settings, Info, Layers, PanelLeftClose, PanelLeft,
-  Gauge, ShieldCheck, Timer, Sun, Moon,
+  Gauge, ShieldCheck, Timer, Sun, Moon, ArrowLeftRight,
 } from 'lucide-react'
 
 const nav = [
@@ -18,6 +18,7 @@ const nav = [
   { to: '/transforms', icon: GitBranch, label: 'Transforms', accent: 'violet' },
   { to: '/scheduler', icon: Clock, label: 'Scheduler', accent: 'amber' },
   { to: '/benchmarks', icon: Timer, label: 'Benchmarks', accent: 'amber' },
+  { to: '/migration', icon: ArrowLeftRight, label: 'Migration', accent: 'rose' },
   { to: '/metrics', icon: Gauge, label: 'Engine Metrics', accent: 'emerald' },
   { to: '/history', icon: Layers, label: 'Query History', accent: 'emerald' },
   { to: '/settings', icon: Settings, label: 'Settings', accent: 'zinc' },

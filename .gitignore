@@ -19,7 +19,7 @@ benchmarks/
 .vscode/
 *.swp
 *.swo
-
+migration_data/
 # Environment (secrets)
 .env
 .env.local

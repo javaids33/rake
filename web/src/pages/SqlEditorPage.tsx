@@ -11,14 +11,14 @@ import { Tabs } from '../components/ui/Tabs'
 import { Modal } from '../components/ui/Modal'
 import { Input } from '../components/ui/Input'
 import { cn, formatDuration, QUERY_TYPE_COLORS, FORMAT_COLORS, inferFormat } from '../lib/utils'
-import { executeSql, explainSql, estimateQuery, compareSql, getTables, getTableSchema, getConnections, getS3Configs } from '../api/client'
+import { executeSql, explainSql, estimateQuery, compareSql, getTables, getTableSchema, getConnections, getS3Configs, trinoBrowse, trinoColumns, trinoRefresh } from '../api/client'
 import type { SqlCompareResponse } from '../api/client'
 import type { ChartType, ColumnSchema, ConnectionEntry, S3Config, ExplainResponse, QueryEstimateResponse } from '../types'
 import { Tooltip } from '../components/ui/Tooltip'
 import {
   Play, Plus, X, Table2, BarChart3, LineChart, ScatterChart, PieChart,
   AreaChart, Save, BookOpen, Zap, Clock, Rows3, Terminal, FileSearch, Gauge, ArrowLeftRight, Trophy,
-  ChevronDown, ChevronRight, GitBranch, Radio, Workflow, Database, Plug, Search, Columns3, MousePointerClick, HardDrive, Trash2,
+  ChevronDown, ChevronRight, GitBranch, Radio, Workflow, Database, Plug, Search, Columns3, MousePointerClick, HardDrive, Trash2, RefreshCw, Layers,
 } from 'lucide-react'
 
 const chartOptions: Array<{ type: ChartType; icon: React.ReactNode; label: string }> = [
@@ -61,6 +61,13 @@ export function SqlEditorPage() {
   const [engineChoice, setEngineChoice] = useState<string>('auto')
   const [compareResult, setCompareResult] = useState<SqlCompareResponse | null>(null)
   const [comparing, setComparing] = useState(false)
+  // Trino catalog browser state
+  const [trinoCatalogs, setTrinoCatalogs] = useState<Record<string, { catalogs: Array<{ name: string; schemas: Array<{ name: string; tables: string[] }> }>; cached_at: string | null; total_tables: number }>>({})
+  const [expandedTrinoCatalog, setExpandedTrinoCatalog] = useState<Set<string>>(new Set()) // "connId:catalog"
+  const [expandedTrinoSchema, setExpandedTrinoSchema] = useState<Set<string>>(new Set()) // "connId:catalog:schema"
+  const [expandedTrinoTable, setExpandedTrinoTable] = useState<string | null>(null) // "connId:catalog:schema:table"
+  const [trinoColumnCache, setTrinoColumnCache] = useState<Record<string, Array<{ name: string; data_type: string; nullable: boolean; ordinal: number }>>>({})
+  const [trinoRefreshing, setTrinoRefreshing] = useState<Set<string>>(new Set())
   const resizing = useRef(false)
   const containerRef = useRef<HTMLDivElement>(null)
   const workflowRef = useRef<HTMLDivElement>(null)
@@ -124,7 +131,15 @@ export function SqlEditorPage() {
     getConnections().then(r => {
       const conns = r.connections || []
       setConnections(conns)
-      if (conns.length === 1) setExpandedConn(new Set([conns[0].id]))
+      if (conns.length === 1) {
+        setExpandedConn(new Set([conns[0].id]))
+        // Auto-load Trino catalog tree if the single connection is Trino
+        if (conns[0].conn_type === 'trino') {
+          trinoBrowse(conns[0].id).then(data => {
+            setTrinoCatalogs(prev => ({ ...prev, [conns[0].id]: data }))
+          }).catch(() => {})
+        }
+      }
     }).catch(() => {})
     getS3Configs().then(r => setS3Configs(r.configs || [])).catch(() => {})
   }, [])
@@ -201,6 +216,56 @@ export function SqlEditorPage() {
     })
   }
 
+  // Trino: load catalog tree when connection expanded
+  const expandTrinoConn = async (connId: string) => {
+    toggleConn(connId)
+    if (!trinoCatalogs[connId]) {
+      try {
+        const data = await trinoBrowse(connId)
+        setTrinoCatalogs(prev => ({ ...prev, [connId]: data }))
+      } catch { /* skip */ }
+    }
+  }
+
+  const toggleTrinoCatalog = (key: string) => {
+    setExpandedTrinoCatalog(prev => {
+      const next = new Set(prev)
+      if (next.has(key)) next.delete(key); else next.add(key)
+      return next
+    })
+  }
+
+  const toggleTrinoSchema = (key: string) => {
+    setExpandedTrinoSchema(prev => {
+      const next = new Set(prev)
+      if (next.has(key)) next.delete(key); else next.add(key)
+      return next
+    })
+  }
+
+  const expandTrinoTableCols = async (connId: string, catalog: string, schema: string, table: string) => {
+    const key = `${connId}:${catalog}:${schema}:${table}`
+    if (expandedTrinoTable === key) { setExpandedTrinoTable(null); return }
+    setExpandedTrinoTable(key)
+    if (!trinoColumnCache[key]) {
+      try {
+        const data = await trinoColumns(connId, catalog, schema, table)
+        setTrinoColumnCache(prev => ({ ...prev, [key]: data.columns }))
+      } catch { /* skip */ }
+    }
+  }
+
+  const handleTrinoRefresh = async (connId: string) => {
+    setTrinoRefreshing(prev => new Set(prev).add(connId))
+    try {
+      await trinoRefresh(connId)
+      const data = await trinoBrowse(connId)
+      setTrinoCatalogs(prev => ({ ...prev, [connId]: data }))
+      setTrinoColumnCache({}) // invalidate column cache
+    } catch { /* skip */ }
+    setTrinoRefreshing(prev => { const next = new Set(prev); next.delete(connId); return next })
+  }
+
   // Build mapping: connection raw table name → registered table name (e.g. "customers" → "pg.customers")
   const resolveRegistered = useCallback((connTableName: string, connType?: string) => {
     // Direct match first
@@ -238,7 +303,7 @@ export function SqlEditorPage() {
   )
   // Also include the raw connection table names for matching
   const connRawSet = new Set(connections.flatMap(c => c.tables || []))
-  const otherTables = tables.filter(t => !connRegisteredSet.has(t) && !connRawSet.has(t))
+  const otherTables = tables.filter(t => !connRegisteredSet.has(t) && !connRawSet.has(t) && !t.startsWith('trino_'))
   const filteredOther = catalogFilter
     ? otherTables.filter(t => t.toLowerCase().includes(catalogFilter.toLowerCase()))
     : otherTables
@@ -740,11 +805,157 @@ export function SqlEditorPage() {
 
               {/* Connections */}
               {connections.map(conn => {
+                const isTrino = conn.conn_type === 'trino'
                 const connTables = (conn.tables || []).filter(t =>
                   !catalogFilter || t.toLowerCase().includes(catalogFilter.toLowerCase())
                 )
-                if (catalogFilter && connTables.length === 0) return null
+                if (catalogFilter && connTables.length === 0 && !isTrino) return null
                 const isExpanded = expandedConn.has(conn.id)
+
+                // Trino connection — render catalog → schema → table → column tree
+                if (isTrino) {
+                  const tree = trinoCatalogs[conn.id]
+                  return (
+                    <div key={conn.id}>
+                      <button
+                        onClick={() => expandTrinoConn(conn.id)}
+                        className="w-full flex items-center gap-2 px-3 py-2 hover:bg-white/[0.02] transition-colors group"
+                      >
+                        {isExpanded
+                          ? <ChevronDown className="w-3 h-3 text-zinc-500 flex-shrink-0" />
+                          : <ChevronRight className="w-3 h-3 text-zinc-500 flex-shrink-0" />
+                        }
+                        <Layers className="w-3 h-3 text-red-400 flex-shrink-0" />
+                        <span className="text-xs font-semibold text-zinc-300 truncate">{conn.name}</span>
+                        <Badge className="ml-auto text-2xs bg-red-500/15 text-red-400 border-red-500/20">
+                          trino
+                        </Badge>
+                      </button>
+                      {isExpanded && (
+                        <div className="border-l-2 border-l-red-400/20 ml-4">
+                          {/* Refresh + stats bar */}
+                          <div className="flex items-center gap-2 px-4 py-1.5 border-b border-white/[0.03]">
+                            <button
+                              onClick={() => handleTrinoRefresh(conn.id)}
+                              className="text-2xs text-zinc-500 hover:text-zinc-300 flex items-center gap-1 transition-colors"
+                              disabled={trinoRefreshing.has(conn.id)}
+                            >
+                              <RefreshCw className={cn('w-3 h-3', trinoRefreshing.has(conn.id) && 'animate-spin')} />
+                              Refresh
+                            </button>
+                            {tree && (
+                              <span className="text-2xs text-zinc-600 ml-auto">
+                                {tree.total_tables} tables{tree.cached_at ? ' (cached)' : ''}
+                              </span>
+                            )}
+                          </div>
+                          {!tree && (
+                            <p className="px-4 py-2 text-2xs text-zinc-600 italic">Loading catalogs...</p>
+                          )}
+                          {tree && tree.catalogs.map(cat => {
+                            const catKey = `${conn.id}:${cat.name}`
+                            const isCatExpanded = expandedTrinoCatalog.has(catKey)
+                            const filteredSchemas = catalogFilter
+                              ? cat.schemas.filter(s => s.name.toLowerCase().includes(catalogFilter.toLowerCase()) || s.tables.some(t => t.toLowerCase().includes(catalogFilter.toLowerCase())))
+                              : cat.schemas
+                            if (catalogFilter && filteredSchemas.length === 0) return null
+                            return (
+                              <div key={cat.name}>
+                                <button
+                                  onClick={() => toggleTrinoCatalog(catKey)}
+                                  className="w-full flex items-center gap-1.5 px-4 py-1.5 hover:bg-white/[0.02] transition-colors"
+                                >
+                                  {isCatExpanded
+                                    ? <ChevronDown className="w-2.5 h-2.5 text-zinc-600 flex-shrink-0" />
+                                    : <ChevronRight className="w-2.5 h-2.5 text-zinc-600 flex-shrink-0" />
+                                  }
+                                  <Database className="w-3 h-3 text-red-400/70 flex-shrink-0" />
+                                  <span className="text-2xs font-semibold text-zinc-400">{cat.name}</span>
+                                  <span className="text-2xs text-zinc-600 ml-auto">{cat.schemas.reduce((n, s) => n + s.tables.length, 0)}</span>
+                                </button>
+                                {isCatExpanded && filteredSchemas.map(sch => {
+                                  const schKey = `${conn.id}:${cat.name}:${sch.name}`
+                                  const isSchExpanded = expandedTrinoSchema.has(schKey)
+                                  const filteredTables = catalogFilter
+                                    ? sch.tables.filter(t => t.toLowerCase().includes(catalogFilter.toLowerCase()))
+                                    : sch.tables
+                                  if (catalogFilter && filteredTables.length === 0) return null
+                                  return (
+                                    <div key={sch.name} className="ml-3">
+                                      <button
+                                        onClick={() => toggleTrinoSchema(schKey)}
+                                        className="w-full flex items-center gap-1.5 px-4 py-1 hover:bg-white/[0.02] transition-colors"
+                                      >
+                                        {isSchExpanded
+                                          ? <ChevronDown className="w-2.5 h-2.5 text-zinc-600 flex-shrink-0" />
+                                          : <ChevronRight className="w-2.5 h-2.5 text-zinc-600 flex-shrink-0" />
+                                        }
+                                        <span className="text-2xs font-mono text-zinc-500">{sch.name}</span>
+                                        <span className="text-2xs text-zinc-700 ml-auto">{sch.tables.length}</span>
+                                      </button>
+                                      {isSchExpanded && filteredTables.map(tbl => {
+                                        const tblKey = `${conn.id}:${cat.name}:${sch.name}:${tbl}`
+                                        const isTblExpanded = expandedTrinoTable === tblKey
+                                        const cols = trinoColumnCache[tblKey]
+                                        const fqn = `trino_${cat.name}.${sch.name}_${tbl}`
+                                        return (
+                                          <div key={tbl} className="ml-3">
+                                            <div className="flex items-center group">
+                                              <button
+                                                onClick={() => expandTrinoTableCols(conn.id, cat.name, sch.name, tbl)}
+                                                className="flex-1 flex items-center gap-1.5 px-4 py-1 hover:bg-white/[0.02] transition-colors min-w-0"
+                                              >
+                                                {isTblExpanded
+                                                  ? <ChevronDown className="w-2.5 h-2.5 text-zinc-600 flex-shrink-0" />
+                                                  : <ChevronRight className="w-2.5 h-2.5 text-zinc-600 flex-shrink-0" />
+                                                }
+                                                <Table2 className="w-3 h-3 text-zinc-500 flex-shrink-0" />
+                                                <span className="text-2xs font-mono text-zinc-400 truncate">{tbl}</span>
+                                              </button>
+                                              <Tooltip content={`SELECT * FROM ${fqn} LIMIT 100`} position="left">
+                                                <button
+                                                  onClick={() => insertAtCursor(`SELECT * FROM ${fqn} LIMIT 100;`)}
+                                                  className="p-1 mr-2 rounded opacity-0 group-hover:opacity-100 hover:bg-white/[0.04] transition-all"
+                                                >
+                                                  <MousePointerClick className="w-3 h-3 text-amber-400/70" />
+                                                </button>
+                                              </Tooltip>
+                                            </div>
+                                            {isTblExpanded && cols && (
+                                              <div className="ml-8 border-l border-white/[0.04]">
+                                                {cols.map(col => (
+                                                  <button
+                                                    key={col.name}
+                                                    onClick={() => insertAtCursor(`${fqn}.${col.name}`)}
+                                                    className="w-full flex items-center gap-1.5 px-3 py-1 hover:bg-white/[0.02] transition-colors cursor-pointer"
+                                                    title={`Insert ${fqn}.${col.name}`}
+                                                  >
+                                                    <Columns3 className="w-2.5 h-2.5 text-zinc-600 flex-shrink-0" />
+                                                    <span className="text-2xs font-mono text-zinc-500 truncate">{col.name}</span>
+                                                    <span className="ml-auto text-2xs font-mono text-zinc-700 flex-shrink-0">{col.data_type}</span>
+                                                  </button>
+                                                ))}
+                                              </div>
+                                            )}
+                                            {isTblExpanded && !cols && (
+                                              <p className="ml-8 px-3 py-1 text-2xs text-zinc-700 italic">Loading columns...</p>
+                                            )}
+                                          </div>
+                                        )
+                                      })}
+                                    </div>
+                                  )
+                                })}
+                              </div>
+                            )
+                          })}
+                        </div>
+                      )}
+                    </div>
+                  )
+                }
+
+                // Non-Trino connection — existing behavior
                 return (
                   <div key={conn.id}>
                     <button

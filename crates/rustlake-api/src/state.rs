@@ -16,6 +16,9 @@ const MAX_QUERY_HISTORY: usize = 1000;
 /// Maximum number of stream events to retain in the circular buffer.
 const MAX_STREAM_EVENTS: usize = 10000;
 
+/// Maximum number of engine performance records to retain.
+const MAX_ENGINE_HISTORY: usize = 500;
+
 /// Maximum number of chat messages to retain in memory.
 const MAX_CHAT_MESSAGES: usize = 500;
 
@@ -27,6 +30,9 @@ const TRANSFORMS_PATH: &str = "user_transforms.jsonl";
 
 /// Path to the persistent scheduled jobs file.
 const JOBS_PATH: &str = "scheduled_jobs.jsonl";
+
+/// Path to the persistent connections file.
+const CONNECTIONS_PATH: &str = "connections.jsonl";
 
 /// A single entry in the query history log.
 #[derive(Debug, Clone, Serialize)]
@@ -107,7 +113,7 @@ struct FlexibleFeedbackEntry {
 }
 
 /// A registered external database connection.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectionEntry {
     /// Unique connection ID.
     pub id: String,
@@ -255,6 +261,153 @@ pub struct S3Config {
     pub created_at: DateTime<Utc>,
 }
 
+/// A table discovered from a Trino Iceberg catalog for migration to Rake.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MigrationTable {
+    /// Connection ID for the source Trino instance.
+    pub conn_id: String,
+    /// Trino catalog name (e.g., "iceberg", "hive").
+    pub catalog: String,
+    /// Schema within the catalog.
+    pub schema_name: String,
+    /// Table name.
+    pub table_name: String,
+    /// Table format: "iceberg", "hive", "delta", "jdbc", "tpch", etc.
+    pub format: String,
+    /// S3 location of the table data (e.g., "s3://bucket/warehouse/table").
+    pub location: Option<String>,
+    /// Hive Metastore URI if applicable (e.g., "thrift://host:9083").
+    pub metastore_uri: Option<String>,
+    /// Number of columns in the table.
+    pub column_count: usize,
+    /// Approximate row count (if known).
+    pub row_count: Option<u64>,
+    /// Whether this table has been registered in Rake's DataFusion catalog.
+    pub registered_in_rake: bool,
+    /// Name of the table in Rake's catalog (e.g., "iceberg.schema.table").
+    pub rake_table_name: Option<String>,
+    /// Discovery/registration status: "discovered", "registered", "ready", "error".
+    pub status: String,
+    /// Error message if status is "error".
+    pub error: Option<String>,
+}
+
+/// Per-engine result from a migration comparison run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EngineResult {
+    pub engine: String,
+    pub duration_ms: u64,
+    pub row_count: usize,
+    pub status: String,
+    pub error: Option<String>,
+    /// Data path used for this engine result: "via_trino", "s3_direct", "in_memory".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+}
+
+/// A migration comparison entry (Trino vs local engines).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MigrationComparison {
+    pub id: String,
+    pub sql: String,
+    pub results: Vec<EngineResult>,
+    pub winner: String,
+    pub speedup: f64,
+    pub data_match: bool,
+    pub timestamp: DateTime<Utc>,
+}
+
+/// A record of engine performance for a single query execution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EngineLatencyRecord {
+    /// Engine name: "DataFusion", "DuckDB", "Polars", "Trino".
+    pub engine: String,
+    /// Classified query type: "scan_aggregate", "join", "complex_join", "point_lookup", "ordered_scan", "full_scan".
+    pub query_type: String,
+    /// Execution duration in milliseconds.
+    pub duration_ms: u64,
+    /// Number of rows returned.
+    pub row_count: usize,
+    /// Approximate data size in bytes.
+    pub data_size_bytes: u64,
+    /// Data path used: "s3_direct", "in_memory", "via_trino", "trino_native".
+    pub path: String,
+    /// ISO 8601 timestamp.
+    pub timestamp: String,
+}
+
+/// Tracks per-engine performance history for adaptive routing decisions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnginePerformanceTracker {
+    /// Per-engine latency history records.
+    pub history: Vec<EngineLatencyRecord>,
+}
+
+impl EnginePerformanceTracker {
+    /// Create an empty performance tracker.
+    pub fn new() -> Self {
+        Self { history: Vec::new() }
+    }
+
+    /// Record an engine execution result.
+    pub fn record(&mut self, record: EngineLatencyRecord) {
+        self.history.push(record);
+        if self.history.len() > MAX_ENGINE_HISTORY {
+            let drain_count = self.history.len() - MAX_ENGINE_HISTORY;
+            self.history.drain(..drain_count);
+        }
+    }
+
+    /// Average latency in ms for a given engine and query type.
+    /// Returns None if no history exists for the combination.
+    pub fn avg_latency(&self, engine: &str, query_type: &str) -> Option<f64> {
+        let matching: Vec<u64> = self.history.iter()
+            .filter(|r| r.engine == engine && r.query_type == query_type && r.duration_ms > 0)
+            .map(|r| r.duration_ms)
+            .collect();
+        if matching.is_empty() {
+            None
+        } else {
+            Some(matching.iter().sum::<u64>() as f64 / matching.len() as f64)
+        }
+    }
+
+    /// Check if we have any history for a given query type.
+    pub fn has_history_for(&self, query_type: &str) -> bool {
+        self.history.iter().any(|r| r.query_type == query_type)
+    }
+}
+
+/// An engine recommendation for a query, including strategy and explanation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EngineRecommendation {
+    /// Orchestration strategy: "single_engine", "scan_handoff", "parallel_fanout".
+    pub strategy: String,
+    /// Recommended primary engine.
+    pub primary_engine: String,
+    /// Explanation of why this engine/strategy was chosen.
+    pub reason: String,
+    /// Estimated speedup vs Trino baseline.
+    pub estimated_speedup: f64,
+    /// For scan_handoff: which engine scans the data.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scan_engine: Option<String>,
+    /// For scan_handoff: which engine processes/joins the data.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub process_engine: Option<String>,
+}
+
+/// An alternative orchestration strategy shown alongside the primary recommendation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AlternativeStrategy {
+    /// Strategy name.
+    pub strategy: String,
+    /// Human-readable description.
+    pub description: String,
+    /// When to use this strategy.
+    pub when: String,
+}
+
 /// Shared application state for the API server.
 pub struct AppState {
     /// The query engine context shared across all requests.
@@ -313,6 +466,22 @@ pub struct AppState {
     pub dbt_project: RwLock<Option<crate::routes::DbtProject>>,
     /// Benchmark run results (TPC-H query timings).
     pub benchmark_results: RwLock<Vec<crate::routes::BenchmarkResult>>,
+    /// DuckDB-backed Trino metadata cache (shared across all Trino connections).
+    #[cfg(feature = "duckdb")]
+    pub trino_cache: Option<std::sync::Arc<crate::trino_client::TrinoCache>>,
+    /// Active Trino connections keyed by connection ID.
+    pub trino_connections: RwLock<std::collections::HashMap<String, std::sync::Arc<crate::trino_client::TrinoConnection>>>,
+    /// Tables discovered from Trino for migration comparison.
+    pub migration_tables: RwLock<Vec<MigrationTable>>,
+    /// Migration comparison results (Trino vs local engines).
+    pub migration_comparisons: RwLock<Vec<MigrationComparison>>,
+    /// S3 credentials for migration (bucket_or_key -> (access_key, secret_key)).
+    /// In-memory only, never persisted to disk.
+    pub migration_s3_creds: RwLock<std::collections::HashMap<String, (String, String, String)>>,
+    /// Engine performance tracker for adaptive routing decisions.
+    pub engine_tracker: RwLock<EnginePerformanceTracker>,
+    /// Read-only tables from migration — DDL/DML blocked to protect source data.
+    pub read_only_tables: RwLock<std::collections::HashSet<String>>,
 }
 
 impl AppState {
@@ -374,6 +543,19 @@ impl AppState {
             quality_rules: RwLock::new(Vec::new()),
             dbt_project: RwLock::new(None),
             benchmark_results: RwLock::new(Vec::new()),
+            #[cfg(feature = "duckdb")]
+            trino_cache: {
+                match crate::trino_client::TrinoCache::new("trino_cache.duckdb") {
+                    Ok(c) => { tracing::info!("Trino DuckDB cache initialized"); Some(std::sync::Arc::new(c)) }
+                    Err(e) => { tracing::warn!("Trino cache init failed: {}", e); None }
+                }
+            },
+            trino_connections: RwLock::new(std::collections::HashMap::new()),
+            migration_tables: RwLock::new(Vec::new()),
+            migration_comparisons: RwLock::new(Vec::new()),
+            migration_s3_creds: RwLock::new(std::collections::HashMap::new()),
+            engine_tracker: RwLock::new(EnginePerformanceTracker::new()),
+            read_only_tables: RwLock::new(std::collections::HashSet::new()),
         }
     }
 
@@ -411,6 +593,19 @@ impl AppState {
             quality_rules: RwLock::new(Vec::new()),
             dbt_project: RwLock::new(None),
             benchmark_results: RwLock::new(Vec::new()),
+            #[cfg(feature = "duckdb")]
+            trino_cache: {
+                match crate::trino_client::TrinoCache::new("trino_cache.duckdb") {
+                    Ok(c) => Some(std::sync::Arc::new(c)),
+                    Err(e) => { tracing::warn!("Trino cache init failed: {}", e); None }
+                }
+            },
+            trino_connections: RwLock::new(std::collections::HashMap::new()),
+            migration_tables: RwLock::new(Vec::new()),
+            migration_comparisons: RwLock::new(Vec::new()),
+            migration_s3_creds: RwLock::new(std::collections::HashMap::new()),
+            engine_tracker: RwLock::new(EnginePerformanceTracker::new()),
+            read_only_tables: RwLock::new(std::collections::HashSet::new()),
         }
     }
 
@@ -441,6 +636,34 @@ impl AppState {
     }
 
     /// Add a user transform and persist to disk.
+    /// Add a connection and persist to disk.
+    pub async fn add_connection_entry(&self, entry: ConnectionEntry) {
+        if let Err(e) = append_json_line(CONNECTIONS_PATH, &entry) {
+            tracing::error!(error = %e, "Failed to persist connection to disk");
+        }
+        self.connections.write().await.push(entry);
+    }
+
+    /// Remove a connection and rewrite the persistence file.
+    pub async fn remove_connection_entry(&self, id: &str) -> bool {
+        let mut connections = self.connections.write().await;
+        let before = connections.len();
+        connections.retain(|c| c.id != id);
+        if connections.len() < before {
+            if let Err(e) = rewrite_json_lines(CONNECTIONS_PATH, &*connections) {
+                tracing::error!(error = %e, "Failed to rewrite connections file");
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Store a connection password (in-memory only, never persisted to disk).
+    pub async fn store_password(&self, id: String, password: String) -> Option<String> {
+        self.connection_passwords.write().await.insert(id, password)
+    }
+
     pub async fn add_user_transform(&self, ut: UserTransform) {
         if let Err(e) = append_json_line(TRANSFORMS_PATH, &ut) {
             tracing::error!(error = %e, "Failed to persist user transform to disk");
@@ -596,6 +819,18 @@ fn rewrite_json_lines<T: Serialize>(path: &str, items: &[T]) -> std::io::Result<
         writeln!(file, "{}", line)?;
     }
     Ok(())
+}
+
+/// Load connections from the JSONL persistence file.
+pub fn load_connections_from_file() -> Vec<ConnectionEntry> {
+    let contents = match std::fs::read_to_string(CONNECTIONS_PATH) {
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
+    };
+    contents
+        .lines()
+        .filter_map(|line| serde_json::from_str::<ConnectionEntry>(line).ok())
+        .collect()
 }
 
 /// Load user transforms from the JSONL persistence file.

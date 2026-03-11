@@ -189,3 +189,58 @@ export const getEngines = () => request<EnginesResponse>('/api/v1/engines')
 
 // Providers
 export const getProviders = () => request<{ providers: Array<{ name: string; enabled: boolean; connections: number; tables: number }> }>('/api/v1/providers')
+
+// Trino (DuckDB-cached catalog browsing)
+export const trinoBrowse = (connId: string) =>
+  request<{ catalogs: Array<{ name: string; schemas: Array<{ name: string; tables: string[] }> }>; cached_at: string | null; total_tables: number }>(`/api/v1/trino/${connId}/browse`)
+export const trinoColumns = (connId: string, catalog: string, schema: string, table: string) =>
+  request<{ columns: Array<{ name: string; data_type: string; nullable: boolean; ordinal: number }>; table: string }>(`/api/v1/trino/${connId}/columns?catalog=${encodeURIComponent(catalog)}&schema=${encodeURIComponent(schema)}&table=${encodeURIComponent(table)}`)
+export const trinoPreview = (connId: string, catalog: string, schema: string, table: string) =>
+  request<{ columns: string[]; rows: Record<string, unknown>[]; row_count: number; duration_ms: number; engine: string }>(`/api/v1/trino/${connId}/preview?catalog=${encodeURIComponent(catalog)}&schema=${encodeURIComponent(schema)}&table=${encodeURIComponent(table)}`)
+export const trinoQuery = (connId: string, sql: string, catalog: string) =>
+  request<{ columns: string[]; rows: Record<string, unknown>[]; row_count: number; duration_ms: number; engine: string }>(`/api/v1/trino/${connId}/query`, { method: 'POST', body: JSON.stringify({ sql, catalog }) })
+export const trinoRefresh = (connId: string) =>
+  request<{ status: string; tables_cached: number }>(`/api/v1/trino/${connId}/refresh`, { method: 'POST' })
+export const trinoStats = (connId: string) =>
+  request<{ schemas_cached: number; tables_cached: number; columns_cached: number; last_refresh: string | null }>(`/api/v1/trino/${connId}/stats`)
+
+// Migration - Iceberg focused
+export interface MigrationTable {
+  conn_id: string; catalog: string; schema_name: string; table_name: string
+  format: string; location: string | null; metastore_uri: string | null
+  column_count: number; row_count: number | null
+  registered_in_rake: boolean; rake_table_name: string | null
+  status: string; error: string | null
+}
+export interface EngineResultM { engine: string; duration_ms: number; row_count: number; status: string; error?: string; path?: string }
+export interface EngineRecommendation {
+  strategy: string
+  primary_engine: string
+  reason: string
+  estimated_speedup: number
+  scan_engine?: string
+  process_engine?: string
+  alternatives?: Array<{
+    strategy: string
+    description: string
+    when: string
+  }>
+}
+export interface MigrationComparison {
+  id: string; sql: string; results: EngineResultM[]; winner: string; speedup: number; data_match: boolean; timestamp: string
+  recommendation?: EngineRecommendation
+}
+export const migrationDiscover = (connId: string) =>
+  request<{ tables: MigrationTable[]; table_count: number; iceberg_catalogs: string[] }>(`/api/v1/migration/${connId}/discover`, { method: 'POST' })
+export const migrationRegister = (connId: string, tables?: string[]) =>
+  request<{ registered: number; total: number; errors: Array<{ table: string; error: string }> }>(`/api/v1/migration/${connId}/register`, { method: 'POST', body: JSON.stringify({ tables }) })
+export const migrationCompare = (connId: string, sql: string, localSql?: string, useNativeS3?: boolean) =>
+  request<MigrationComparison>('/api/v1/migration/compare', { method: 'POST', body: JSON.stringify({ conn_id: connId, sql, local_sql: localSql, use_native_s3: useNativeS3 }) })
+export const migrationCredentials = (bucket: string, accessKey: string, secretKey: string) =>
+  request<{ status: string }>('/api/v1/migration/credentials', { method: 'POST', body: JSON.stringify({ bucket, access_key: accessKey, secret_key: secretKey }) })
+export const getMigrationTables = (connId: string) =>
+  request<{ tables: MigrationTable[] }>(`/api/v1/migration/${connId}/tables`)
+export const getMigrationComparisons = () =>
+  request<{ comparisons: MigrationComparison[] }>('/api/v1/migration/comparisons')
+export const getMigrationReadonly = () =>
+  request<{ tables: string[]; count: number }>('/api/v1/migration/readonly')

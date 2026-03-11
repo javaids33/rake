@@ -17,8 +17,9 @@ use rustlake_stream::StreamingMetricsSnapshot;
 use rustlake_transform::{Model, ModelConfig, SqlCompiler};
 
 use crate::state::{
-    AppState, ChatMessage, ConnectionEntry, EventConfig, JobRunEntry, QueryHistoryEntry, S3Config,
-    ScheduledJob, StreamingPipeline, UserTransform,
+    AlternativeStrategy, AppState, ChatMessage, ConnectionEntry, EngineLatencyRecord,
+    EngineRecommendation, EngineResult, EventConfig, JobRunEntry, MigrationComparison,
+    MigrationTable, QueryHistoryEntry, S3Config, ScheduledJob, StreamingPipeline, UserTransform,
 };
 
 // ── Request / Response types ───────────────────────────────────────
@@ -694,8 +695,25 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/api/v1/benchmarks/compare", post(compare_benchmark))
         // Engine info
         .route("/api/v1/engines", get(list_engines))
+        .route("/api/v1/engines/sync", post(engines_sync))
         // Provider info
         .route("/api/v1/providers", get(list_providers))
+        // Trino catalog browse (DuckDB-cached)
+        .route("/api/v1/trino/{conn_id}/browse", get(trino_browse))
+        .route("/api/v1/trino/{conn_id}/columns", get(trino_columns))
+        .route("/api/v1/trino/{conn_id}/preview", get(trino_preview))
+        .route("/api/v1/trino/{conn_id}/query", post(trino_query))
+        .route("/api/v1/trino/{conn_id}/refresh", post(trino_refresh))
+        .route("/api/v1/trino/{conn_id}/stats", get(trino_stats))
+        // Migration: Iceberg catalog migration (Trino → Rake)
+        .route("/api/v1/migration/{conn_id}/discover", post(migration_discover))
+        .route("/api/v1/migration/{conn_id}/register", post(migration_register))
+        .route("/api/v1/migration/credentials", post(migration_credentials))
+        .route("/api/v1/migration/compare", post(migration_compare))
+        .route("/api/v1/migration/recommend", post(migration_recommend))
+        .route("/api/v1/migration/{conn_id}/tables", get(migration_tables))
+        .route("/api/v1/migration/comparisons", get(migration_comparisons))
+        .route("/api/v1/migration/readonly", get(migration_readonly_tables))
 }
 
 // ── Handlers ───────────────────────────────────────────────────────
@@ -735,6 +753,24 @@ async fn execute_sql(
     let query_type = classification.query_type;
     let parse_ms = parse_start.elapsed().as_millis();
     tracing::info!(query_type = %query_type, recommended_engine = %classification.engine, parse_ms, "Query classified");
+
+    // Block DDL/DML on read-only migration tables
+    if matches!(query_type, QueryType::Ddl | QueryType::Dml) {
+        let read_only = state.read_only_tables.read().await;
+        if !read_only.is_empty() {
+            let sql_upper = req.sql.trim().to_uppercase();
+            // Extract table name from common DDL/DML patterns
+            let target_table = extract_target_table(&sql_upper);
+            if let Some(table) = target_table {
+                let table_lower = table.to_lowercase();
+                if read_only.iter().any(|ro| table_lower == ro.to_lowercase() || table_lower.ends_with(&format!(".{}", ro.to_lowercase()))) {
+                    return Err((StatusCode::FORBIDDEN, Json(ErrorResponse {
+                        error: format!("Table '{}' is read-only (migrated from Iceberg catalog). Write operations are blocked to protect source data during migration comparison.", table),
+                    })));
+                }
+            }
+        }
+    }
 
     // Handle CTAS: CREATE TABLE <name> AS SELECT ...
     let sql_upper = req.sql.trim().to_uppercase();
@@ -881,6 +917,196 @@ async fn execute_via_polars(
         }
     }
     Err("Polars engine not available".to_string())
+}
+
+/// Execute SQL on DataFusion with direct S3 access via `object_store`.
+///
+/// Creates a temporary `SessionContext`, registers an S3 object store with the given
+/// credentials, and registers ListingTables at the S3 paths for each referenced table.
+/// The SQL is then rewritten to reference these temporary table names.
+async fn execute_df_s3_direct(
+    rake_sql: &str,
+    table_s3_locations: &std::collections::HashMap<String, String>,
+    creds: &(String, String, String),
+    _conn_id: &str,
+) -> std::result::Result<(usize, String), String> {
+    use datafusion::prelude::*;
+    use datafusion::datasource::listing::{ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl};
+    use datafusion::datasource::file_format::parquet::ParquetFormat;
+    use object_store::aws::AmazonS3Builder;
+
+    let (access_key, secret_key, region) = creds;
+
+    // Create a temporary SessionContext for S3 direct queries
+    let ctx = SessionContext::new();
+
+    // Track which S3 buckets we've registered object stores for
+    let mut registered_buckets: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // Build the SQL with table names replaced by S3-backed listing table names
+    let mut rewritten_sql = rake_sql.to_string();
+    let mut s3_table_count = 0;
+
+    for (fqn, s3_location) in table_s3_locations {
+        // Parse s3://bucket/path from the location
+        let s3_url = if s3_location.ends_with('/') {
+            s3_location.clone()
+        } else {
+            // For Iceberg tables, data is usually under /data/ subdirectory
+            format!("{}/data/", s3_location)
+        };
+
+        // Extract bucket from s3://bucket/...
+        if let Some(bucket) = s3_location
+            .strip_prefix("s3://")
+            .and_then(|rest| rest.split('/').next())
+        {
+            if !registered_buckets.contains(bucket) {
+                let s3_store = AmazonS3Builder::new()
+                    .with_bucket_name(bucket)
+                    .with_region(region)
+                    .with_access_key_id(access_key)
+                    .with_secret_access_key(secret_key)
+                    .with_allow_http(true)
+                    .build()
+                    .map_err(|e| format!("S3 store build for bucket '{}': {}", bucket, e))?;
+
+                let url = url::Url::parse(&format!("s3://{}", bucket))
+                    .map_err(|e| format!("URL parse for bucket '{}': {}", bucket, e))?;
+                ctx.runtime_env()
+                    .register_object_store(&url, Arc::new(s3_store));
+
+                registered_buckets.insert(bucket.to_string());
+            }
+        }
+
+        // Derive a safe table name from the FQN for use in the temp context
+        // e.g., "iceberg.sf1.orders" → "s3_iceberg_sf1_orders"
+        let safe_name = format!("s3_{}", fqn.replace('.', "_"));
+
+        // Register a ListingTable at the S3 path
+        let table_url = ListingTableUrl::parse(&s3_url)
+            .map_err(|e| format!("ListingTableUrl parse '{}': {}", s3_url, e))?;
+
+        let parquet_format = ParquetFormat::default();
+        let listing_options = ListingOptions::new(Arc::new(parquet_format))
+            .with_file_extension(".parquet");
+
+        let config = ListingTableConfig::new(table_url)
+            .with_listing_options(listing_options)
+            .infer_schema(&ctx.state())
+            .await
+            .map_err(|e| format!("Schema infer for '{}' at '{}': {}", fqn, s3_url, e))?;
+
+        let listing_table = ListingTable::try_new(config)
+            .map_err(|e| format!("ListingTable for '{}': {}", fqn, e))?;
+
+        ctx.register_table(&safe_name, Arc::new(listing_table))
+            .map_err(|e| format!("Register S3 table '{}': {}", safe_name, e))?;
+
+        // Rewrite the rake_sql to use the safe_name instead of the Rake-registered name
+        // The rake_sql already has trino_{catalog}.{schema}_{table} names — replace them
+        // Try schema-qualified form: trino_{catalog}.{schema}_{table}
+        let parts: Vec<&str> = fqn.splitn(3, '.').collect();
+        if parts.len() == 3 {
+            let schema_qualified = format!("trino_{}.{}_{}", parts[0], parts[1], parts[2]);
+            rewritten_sql = rewritten_sql.replace(&schema_qualified, &safe_name);
+            // Also try flat form
+            let flat = format!("trino_{}_{}_{}", parts[0], parts[1], parts[2]);
+            rewritten_sql = rewritten_sql.replace(&flat, &safe_name);
+        }
+        // Also replace the original FQN if it somehow remains
+        rewritten_sql = rewritten_sql.replace(fqn, &safe_name);
+        s3_table_count += 1;
+    }
+
+    if s3_table_count == 0 {
+        return Err("No S3 table locations available for direct S3 query".to_string());
+    }
+
+    let engine_label = format!("Rake DataFusion (S3 direct, {} tables)", s3_table_count);
+
+    // Execute the rewritten SQL on the S3-backed context
+    let df = ctx.sql(&rewritten_sql).await
+        .map_err(|e| format!("DataFusion S3 SQL: {}", e))?;
+    let batches = df.collect().await
+        .map_err(|e| format!("DataFusion S3 collect: {}", e))?;
+    let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
+
+    Ok((row_count, engine_label))
+}
+
+/// Execute SQL on DuckDB with direct S3 access via httpfs extension.
+///
+/// Configures DuckDB's built-in S3 support (httpfs), creates views that read from
+/// `read_parquet('s3://...')`, and runs the rewritten SQL.
+async fn execute_duckdb_s3_direct(
+    state: &AppState,
+    original_sql: &str,
+    table_s3_locations: &std::collections::HashMap<String, String>,
+    creds: &(String, String, String),
+    _conn_id: &str,
+) -> std::result::Result<Vec<RecordBatch>, String> {
+    #[cfg(feature = "duckdb")]
+    {
+        if let Some(ref engine) = state.duckdb_engine {
+            let (access_key, secret_key, region) = creds;
+
+            // Install and load httpfs, configure S3 credentials
+            let setup_sql = format!(
+                "INSTALL httpfs; LOAD httpfs; \
+                 SET s3_region='{}'; \
+                 SET s3_access_key_id='{}'; \
+                 SET s3_secret_access_key='{}';",
+                region, access_key, secret_key
+            );
+
+            engine.sql(&setup_sql).await
+                .map_err(|e| format!("DuckDB S3 setup: {}", e))?;
+
+            // Rewrite SQL: replace table references with read_parquet('s3://...')
+            let mut rewritten_sql = original_sql.to_string();
+            let mut view_setup = String::new();
+
+            for (fqn, s3_location) in table_s3_locations {
+                let parts: Vec<&str> = fqn.splitn(3, '.').collect();
+                if parts.len() != 3 {
+                    continue;
+                }
+
+                // Use the original Trino FQN table reference from the SQL
+                // The original_sql has catalog.schema.table references
+                let s3_glob = if s3_location.ends_with('/') {
+                    format!("{}*.parquet", s3_location)
+                } else {
+                    format!("{}/data/*.parquet", s3_location)
+                };
+
+                // Create a safe view name and set up the view
+                let safe_name = format!("s3_{}_{}_{}", parts[0], parts[1], parts[2]);
+                view_setup.push_str(&format!(
+                    "CREATE OR REPLACE VIEW \"{}\" AS SELECT * FROM read_parquet('{}'); ",
+                    safe_name, s3_glob
+                ));
+
+                // Replace the FQN in the SQL with the view name
+                rewritten_sql = rewritten_sql.replace(fqn, &safe_name);
+                // Also try quoted form
+                let quoted_fqn = format!("\"{}\".\"{}\".\"{}\""  , parts[0], parts[1], parts[2]);
+                rewritten_sql = rewritten_sql.replace(&quoted_fqn, &safe_name);
+            }
+
+            if !view_setup.is_empty() {
+                engine.sql(&view_setup).await
+                    .map_err(|e| format!("DuckDB S3 view setup: {}", e))?;
+            }
+
+            return engine.sql(&rewritten_sql).await
+                .map_err(|e| format!("DuckDB S3 query: {}", e));
+        }
+    }
+    let _ = (state, original_sql, table_s3_locations, creds, _conn_id);
+    Err("DuckDB engine not available".to_string())
 }
 
 /// Compare SQL execution across all available engines.
@@ -2633,132 +2859,78 @@ async fn add_connection(
         }
         "trino" | "presto" => {
             drop(ctx);
-            // Trino: discover tables via REST API, register as MemTable snapshots
+            // Trino: lightweight connect — cache catalog structure in DuckDB, no data fetching
             let user = if req.username.is_empty() { "rustlake".to_string() } else { req.username.clone() };
             let pass = req.password.clone();
             let catalog = if req.database.is_empty() { "postgresql".to_string() } else { req.database.clone() };
             let base_url = trino_base_url(&req.host, req.port);
 
-            let client = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(30))
-                .build()
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: format!("HTTP client error: {}", e) })))?;
+            let pass_str = pass.clone();
+            let rest = crate::trino_client::TrinoRestClient::new(base_url.clone(), user.clone(), pass_str);
 
-            // Helper closure to execute a Trino query and return rows
-            async fn trino_query(client: &reqwest::Client, base_url: &str, user: &str, pass: &str, catalog: &str, sql: &str) -> Result<Vec<Vec<serde_json::Value>>, String> {
-                let mut req_builder = client.post(&format!("{}/v1/statement", base_url))
-                    .header("X-Trino-User", user)
-                    .header("X-Trino-Catalog", catalog)
-                    .body(sql.to_string());
-                if !pass.is_empty() {
-                    req_builder = req_builder.basic_auth(user, Some(pass));
-                }
-                let resp = req_builder.send().await.map_err(|e| format!("Trino request failed: {}", e))?;
-                if !resp.status().is_success() {
-                    return Err(format!("Trino returned HTTP {}", resp.status()));
-                }
-                let body: serde_json::Value = resp.json().await.map_err(|e| format!("Parse error: {}", e))?;
-                let mut all_data: Vec<Vec<serde_json::Value>> = Vec::new();
-                if let Some(data) = body.get("data").and_then(|d| d.as_array()) {
-                    all_data.extend(data.iter().cloned().filter_map(|v| v.as_array().cloned()));
-                }
-                let mut next_uri = body.get("nextUri").and_then(|v| v.as_str()).map(|s| s.to_string());
-                for _ in 0..50 {
-                    let Some(uri) = next_uri.take() else { break };
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    let mut poll_req = client.get(&uri).header("X-Trino-User", user);
-                    if !pass.is_empty() {
-                        poll_req = poll_req.basic_auth(user, Some(pass));
-                    }
-                    let poll_resp = poll_req.send().await.map_err(|e| format!("Poll failed: {}", e))?;
-                    let poll_body: serde_json::Value = poll_resp.json().await.map_err(|e| format!("Poll parse: {}", e))?;
-                    if let Some(data) = poll_body.get("data").and_then(|d| d.as_array()) {
-                        all_data.extend(data.iter().cloned().filter_map(|v| v.as_array().cloned()));
-                    }
-                    next_uri = poll_body.get("nextUri").and_then(|v| v.as_str()).map(|s| s.to_string());
-                    let state = poll_body.get("stats").and_then(|s| s.get("state")).and_then(|v| v.as_str()).unwrap_or("");
-                    if state == "FINISHED" || state == "FAILED" { break; }
-                }
-                Ok(all_data)
-            }
-
-            // Discover schemas in the catalog
-            let schemas = trino_query(&client, &base_url, &user, &pass, &catalog, &format!("SHOW SCHEMAS FROM {}", catalog))
-                .await
+            // Verify connectivity
+            rest.server_info().await
                 .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e })))?;
-            let schema_names: Vec<String> = schemas.into_iter()
-                .filter_map(|row| row.first().and_then(|v| v.as_str()).map(|s| s.trim().to_string()))
-                .filter(|s| s != "information_schema" && s != "pg_catalog" && s != "performance_schema")
-                .collect();
 
-            tracing::info!(catalog = %catalog, schemas = ?schema_names, "Trino: discovered schemas");
+            // Build TrinoConnection with DuckDB cache
+            #[cfg(feature = "duckdb")]
+            let trino_conn = {
+                let cache = state.trino_cache.clone()
+                    .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: "Trino cache not initialized".into() })))?;
+                let conn = crate::trino_client::TrinoConnection {
+                    id: id.clone(),
+                    name: req.name.clone(),
+                    rest,
+                    default_catalog: catalog.clone(),
+                    cache,
+                };
+                // Fetch catalog structure and cache (lightweight: only schema/table names)
+                let table_count = conn.refresh_cache().await
+                    .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e })))?;
+                tracing::info!(conn_id = %id, tables = table_count, "Trino connected and cached");
+                conn
+            };
 
-            // Discover tables per schema and register them
-            let ctx2 = state.ctx.read().await;
-            let trino_schema = crate::providers::ensure_schema(ctx2.datafusion_ctx(), prefix)
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e })))?;
+            #[cfg(feature = "duckdb")]
+            {
+                // Store connection for future browse/query/refresh calls
+                let rest_arc = std::sync::Arc::new(
+                    crate::trino_client::TrinoRestClient::new(base_url.clone(), user.clone(), pass.clone())
+                );
+                let conn_arc = std::sync::Arc::new(trino_conn);
+                state.trino_connections.write().await.insert(id.clone(), conn_arc.clone());
 
-            let mut trino_registered = Vec::new();
-            for schema_name in &schema_names {
-                let tables = trino_query(&client, &base_url, &user, &pass, &catalog,
-                    &format!("SHOW TABLES FROM {}.{}", catalog, schema_name))
+                // Register Trino tables as DataFusion providers for transparent SQL access
+                let ctx = state.ctx.read().await;
+                let df_ctx = ctx.datafusion_ctx();
+                let trino_registered = state.provider_registry
+                    .register_trino(&id, &conn_arc, rest_arc, df_ctx)
                     .await
-                    .unwrap_or_default();
-                let table_names: Vec<String> = tables.into_iter()
-                    .filter_map(|row| row.first().and_then(|v| v.as_str()).map(|s| s.trim().to_string()))
-                    .collect();
+                    .unwrap_or_else(|e| {
+                        tracing::warn!(error = %e, "Failed to register Trino table providers");
+                        vec![]
+                    });
+                drop(ctx);
 
-                for table_name in &table_names {
-                    // Fetch a preview (100 rows) to build the Arrow schema and register
-                    let fq_table = format!("{}.{}.{}", catalog, schema_name, table_name);
-                    let preview_sql = format!("SELECT * FROM {} LIMIT 100", fq_table);
-                    let rows = match trino_query(&client, &base_url, &user, &pass, &catalog, &preview_sql).await {
-                        Ok(r) => r,
-                        Err(e) => {
-                            tracing::warn!(table = %fq_table, error = %e, "Trino: failed to preview table, skipping");
-                            continue;
-                        }
-                    };
-
-                    // Also get column info
-                    let col_sql = format!("DESCRIBE {}", fq_table);
-                    let col_rows = trino_query(&client, &base_url, &user, &pass, &catalog, &col_sql).await.unwrap_or_default();
-
-                    // Build Arrow schema from DESCRIBE output
-                    let mut fields = Vec::new();
-                    for col_row in &col_rows {
-                        let col_name = col_row.first().and_then(|v| v.as_str()).unwrap_or("unknown").trim().to_string();
-                        let col_type = col_row.get(1).and_then(|v| v.as_str()).unwrap_or("varchar").trim().to_string();
-                        let arrow_type = trino_type_to_arrow(&col_type);
-                        fields.push(arrow::datatypes::Field::new(col_name, arrow_type, true));
-                    }
-
-                    if fields.is_empty() { continue; }
-
-                    let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(fields.clone()));
-
-                    // Build Arrow arrays from row data
-                    let batch = match build_arrow_batch_from_trino_rows(&schema, &rows) {
-                        Some(b) => b,
-                        None => {
-                            // Empty table — create empty batch
-                            match arrow::record_batch::RecordBatch::new_empty(schema.clone()) {
-                                b => b,
-                            }
-                        }
-                    };
-
-                    if let Ok(mem_table) = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]) {
-                        let reg_name = format!("{}_{}", schema_name, table_name);
-                        let df_name = format!("{}.{}", prefix, reg_name);
-                        if trino_schema.register_table(reg_name, std::sync::Arc::new(mem_table)).is_ok() {
-                            trino_registered.push(df_name);
-                        }
-                    }
+                if !trino_registered.is_empty() {
+                    tracing::info!(count = trino_registered.len(), "Trino tables registered as DataFusion providers");
                 }
+
+                // Build table list from cache for the response
+                let tree = conn_arc.browse().await.unwrap_or_else(|_| crate::trino_client::TrinoCatalogTree {
+                    catalogs: vec![], cached_at: None, total_tables: 0,
+                });
+                tree.catalogs.iter()
+                    .flat_map(|c| c.schemas.iter().flat_map(move |s| {
+                        s.tables.iter().map(move |t| format!("trino.{}_{}", s.name, t))
+                    }))
+                    .collect()
             }
 
-            trino_registered
+            #[cfg(not(feature = "duckdb"))]
+            {
+                vec![] // No DuckDB cache — Trino requires DuckDB feature
+            }
         }
         other => {
             drop(ctx);
@@ -2787,8 +2959,8 @@ async fn add_connection(
         source: "user".to_string(),
     };
 
-    state.connections.write().await.push(entry);
-    state.connection_passwords.write().await.insert(id.clone(), req.password);
+    state.add_connection_entry(entry).await;
+    state.store_password(id.clone(), req.password).await;
 
     tracing::info!(
         source = "user",
@@ -2825,15 +2997,10 @@ async fn delete_connection(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> std::result::Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
-    let mut connections = state.connections.write().await;
-
     // Find the connection before removing so we can log details
-    let removed = connections.iter().find(|c| c.id == id).cloned();
+    let removed = state.connections.read().await.iter().find(|c| c.id == id).cloned();
 
-    let initial_len = connections.len();
-    connections.retain(|c| c.id != id);
-
-    if connections.len() == initial_len {
+    if !state.remove_connection_entry(&id).await {
         tracing::warn!(id = %id, "Data source removal failed: not found");
         return Err((
             StatusCode::NOT_FOUND,
@@ -2843,7 +3010,6 @@ async fn delete_connection(
         ));
     }
 
-    drop(connections);
     state.connection_passwords.write().await.remove(&id);
 
     if let Some(conn) = &removed {
@@ -5621,6 +5787,7 @@ fn trino_base_url(host: &str, port: u16) -> String {
 }
 
 /// Map Trino SQL types to Arrow DataType.
+#[allow(dead_code)]
 fn trino_type_to_arrow(trino_type: &str) -> arrow::datatypes::DataType {
     use arrow::datatypes::DataType;
     let t = trino_type.to_lowercase();
@@ -5657,6 +5824,7 @@ fn trino_type_to_arrow(trino_type: &str) -> arrow::datatypes::DataType {
 }
 
 /// Build an Arrow RecordBatch from Trino JSON row data.
+#[allow(dead_code)]
 fn build_arrow_batch_from_trino_rows(
     schema: &std::sync::Arc<arrow::datatypes::Schema>,
     rows: &[Vec<serde_json::Value>],
@@ -5727,6 +5895,303 @@ fn build_arrow_batch_from_trino_rows(
     }
 
     arrow::record_batch::RecordBatch::try_new(schema.clone(), columns).ok()
+}
+
+/// Sync specific tables from DataFusion into DuckDB and Polars engines.
+/// Used after Trino table registration to make them available in all engines.
+async fn sync_trino_tables_to_engines(state: &Arc<AppState>, table_names: &[String]) {
+    let ctx = state.ctx.read().await;
+    let df_ctx = ctx.datafusion_ctx();
+    let mut sync_data = Vec::new();
+
+    for table_name in table_names {
+        // Schema-qualified names like trino_postgresql.public_customers must NOT be quoted
+        let sql = format!("SELECT * FROM {} LIMIT 10000", table_name);
+        match df_ctx.sql(&sql).await {
+            Ok(df) => match df.collect().await {
+                Ok(batches) if !batches.is_empty() => {
+                    // DuckDB needs flat table names (no dots) — use underscore-joined
+                    let flat_name = table_name.replace('.', "_");
+                    sync_data.push((flat_name, batches));
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::debug!(table = %table_name, error = %e, "Engine sync: skip table");
+                }
+            },
+            Err(e) => {
+                tracing::debug!(table = %table_name, error = %e, "Engine sync: skip table");
+            }
+        }
+    }
+    drop(ctx);
+
+    if sync_data.is_empty() {
+        return;
+    }
+
+    let count = sync_data.len();
+
+    #[cfg(feature = "duckdb")]
+    if let Some(ref duckdb_engine) = state.duckdb_engine {
+        // Clone the data for DuckDB
+        let dk_data: Vec<(String, Vec<RecordBatch>)> = sync_data.iter()
+            .map(|(name, batches)| (name.clone(), batches.clone()))
+            .collect();
+        match duckdb_engine.sync_tables(dk_data).await {
+            Ok(synced) => tracing::info!(synced, total = count, "DuckDB: Trino tables synced"),
+            Err(e) => tracing::warn!(error = %e, "DuckDB: Trino table sync failed"),
+        }
+    }
+
+    #[cfg(feature = "polars")]
+    if let Some(ref polars_engine) = state.polars_engine {
+        match polars_engine.sync_tables(sync_data).await {
+            Ok(synced) => tracing::info!(synced, total = count, "Polars: Trino tables synced"),
+            Err(e) => tracing::warn!(error = %e, "Polars: Trino table sync failed"),
+        }
+    }
+}
+
+/// POST /api/v1/engines/sync — re-sync all DataFusion tables to DuckDB + Polars.
+async fn engines_sync(
+    State(state): State<Arc<AppState>>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let ctx = state.ctx.read().await;
+    let tables = ctx.list_tables().await.unwrap_or_default();
+    drop(ctx);
+    sync_trino_tables_to_engines(&state, &tables).await;
+    Ok(Json(serde_json::json!({ "status": "ok", "tables_synced": tables.len() })))
+}
+
+// ── Trino cached browse endpoints ─────────────────────────────────
+
+/// Lazy-initialize a TrinoConnection from the connections list if not already in trino_connections.
+/// This handles the case where the server restarted and the connection was loaded from disk.
+async fn get_or_init_trino(
+    state: &Arc<AppState>,
+    conn_id: &str,
+) -> std::result::Result<std::sync::Arc<crate::trino_client::TrinoConnection>, (StatusCode, Json<ErrorResponse>)> {
+    // Check if already initialized
+    {
+        let conns = state.trino_connections.read().await;
+        if let Some(c) = conns.get(conn_id) {
+            return Ok(c.clone());
+        }
+    }
+    // Not initialized — find in connections list and create
+    let connections = state.connections.read().await;
+    let entry = connections.iter().find(|c| c.id == conn_id && c.conn_type == "trino")
+        .cloned()
+        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(ErrorResponse { error: format!("Trino connection '{}' not found", conn_id) })))?;
+    drop(connections);
+
+    // Retrieve stored password
+    let password = state.connection_passwords.read().await.get(conn_id).cloned();
+
+    #[cfg(feature = "duckdb")]
+    {
+        let cache = state.trino_cache.clone()
+            .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: "Trino cache not initialized".into() })))?;
+        let base_url = trino_base_url(&entry.host, entry.port);
+        let user = if entry.username.is_empty() { "rustlake".to_string() } else { entry.username.clone() };
+        let pass = password.unwrap_or_default();
+        let rest = crate::trino_client::TrinoRestClient::new(base_url.clone(), user.clone(), pass.clone());
+        let conn = crate::trino_client::TrinoConnection {
+            id: conn_id.to_string(),
+            name: entry.name.clone(),
+            rest,
+            default_catalog: if entry.database.is_empty() { "postgresql".to_string() } else { entry.database.clone() },
+            cache,
+        };
+        // Try to refresh cache if empty
+        let _ = conn.refresh_cache().await;
+        let rest_arc = std::sync::Arc::new(
+            crate::trino_client::TrinoRestClient::new(base_url, user, pass)
+        );
+        let arc = std::sync::Arc::new(conn);
+        state.trino_connections.write().await.insert(conn_id.to_string(), arc.clone());
+
+        // Register Trino tables as DataFusion providers (lazy re-registration on restart)
+        let ctx = state.ctx.read().await;
+        let df_ctx = ctx.datafusion_ctx();
+        let trino_registered = state.provider_registry
+            .register_trino(conn_id, &arc, rest_arc, df_ctx)
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(error = %e, "Failed to register Trino table providers on lazy init");
+                vec![]
+            });
+        drop(ctx);
+        if !trino_registered.is_empty() {
+            tracing::info!(count = trino_registered.len(), "Trino tables lazily registered as DataFusion providers");
+            // Sync newly registered Trino tables to DuckDB and Polars engines
+            sync_trino_tables_to_engines(state, &trino_registered).await;
+        }
+
+        Ok(arc)
+    }
+    #[cfg(not(feature = "duckdb"))]
+    {
+        let _ = entry;
+        Err((StatusCode::SERVICE_UNAVAILABLE, Json(ErrorResponse { error: "DuckDB feature required for Trino".into() })))
+    }
+}
+
+/// GET /api/v1/trino/:conn_id/browse — return cached catalog tree (instant, from DuckDB).
+async fn trino_browse(
+    State(state): State<Arc<AppState>>,
+    Path(conn_id): Path<String>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let conn = get_or_init_trino(&state, &conn_id).await?;
+
+    #[cfg(feature = "duckdb")]
+    {
+        let tree = conn.browse().await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e })))?;
+        Ok(Json(serde_json::json!(tree)))
+    }
+    #[cfg(not(feature = "duckdb"))]
+    {
+        let _ = conn;
+        Err((StatusCode::SERVICE_UNAVAILABLE, Json(ErrorResponse { error: "DuckDB cache required for Trino browse".into() })))
+    }
+}
+
+/// Query params for Trino column/preview lookups.
+#[derive(Deserialize)]
+struct TrinoTableQuery {
+    catalog: String,
+    schema: String,
+    table: String,
+}
+
+/// GET /api/v1/trino/:conn_id/columns?catalog=X&schema=Y&table=Z — cached column info.
+async fn trino_columns(
+    State(state): State<Arc<AppState>>,
+    Path(conn_id): Path<String>,
+    Query(q): Query<TrinoTableQuery>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let conn = get_or_init_trino(&state, &conn_id).await?;
+
+    #[cfg(feature = "duckdb")]
+    {
+        let cols = conn.columns(&q.catalog, &q.schema, &q.table).await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e })))?;
+        Ok(Json(serde_json::json!({ "columns": cols, "table": format!("{}.{}.{}", q.catalog, q.schema, q.table) })))
+    }
+    #[cfg(not(feature = "duckdb"))]
+    {
+        let _ = (conn, q);
+        Err((StatusCode::SERVICE_UNAVAILABLE, Json(ErrorResponse { error: "DuckDB required".into() })))
+    }
+}
+
+/// GET /api/v1/trino/:conn_id/preview?catalog=X&schema=Y&table=Z — live preview (LIMIT 100 via Trino).
+async fn trino_preview(
+    State(state): State<Arc<AppState>>,
+    Path(conn_id): Path<String>,
+    Query(q): Query<TrinoTableQuery>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let conn = get_or_init_trino(&state, &conn_id).await?;
+
+    let result = conn.preview(&q.catalog, &q.schema, &q.table, 100).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e })))?;
+
+    // Convert to row-of-objects format for UI
+    let rows: Vec<serde_json::Value> = result.rows.iter().map(|row| {
+        let mut obj = serde_json::Map::new();
+        for (i, col) in result.columns.iter().enumerate() {
+            obj.insert(col.clone(), row.get(i).cloned().unwrap_or(serde_json::Value::Null));
+        }
+        serde_json::Value::Object(obj)
+    }).collect();
+
+    Ok(Json(serde_json::json!({
+        "columns": result.columns,
+        "column_types": result.column_types,
+        "rows": rows,
+        "row_count": result.row_count,
+        "duration_ms": result.duration_ms,
+        "engine": "Trino",
+        "table": format!("{}.{}.{}", q.catalog, q.schema, q.table),
+    })))
+}
+
+/// POST /api/v1/trino/:conn_id/query — execute SQL through Trino REST API.
+#[derive(Deserialize)]
+struct TrinoQueryRequest {
+    sql: String,
+    #[serde(default = "default_trino_catalog")]
+    catalog: String,
+}
+fn default_trino_catalog() -> String { "system".into() }
+
+async fn trino_query(
+    State(state): State<Arc<AppState>>,
+    Path(conn_id): Path<String>,
+    Json(req): Json<TrinoQueryRequest>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let conn = get_or_init_trino(&state, &conn_id).await?;
+
+    let result = conn.query(&req.sql, &req.catalog).await
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e })))?;
+
+    let rows: Vec<serde_json::Value> = result.rows.iter().map(|row| {
+        let mut obj = serde_json::Map::new();
+        for (i, col) in result.columns.iter().enumerate() {
+            obj.insert(col.clone(), row.get(i).cloned().unwrap_or(serde_json::Value::Null));
+        }
+        serde_json::Value::Object(obj)
+    }).collect();
+
+    Ok(Json(serde_json::json!({
+        "columns": result.columns,
+        "column_types": result.column_types,
+        "rows": rows,
+        "row_count": result.row_count,
+        "duration_ms": result.duration_ms,
+        "engine": "Trino",
+    })))
+}
+
+/// POST /api/v1/trino/:conn_id/refresh — re-fetch catalog metadata from Trino, update DuckDB cache.
+async fn trino_refresh(
+    State(state): State<Arc<AppState>>,
+    Path(conn_id): Path<String>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let conn = get_or_init_trino(&state, &conn_id).await?;
+
+    #[cfg(feature = "duckdb")]
+    {
+        let table_count = conn.refresh_cache().await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e })))?;
+        Ok(Json(serde_json::json!({ "status": "refreshed", "tables_cached": table_count })))
+    }
+    #[cfg(not(feature = "duckdb"))]
+    {
+        let _ = conn;
+        Err((StatusCode::SERVICE_UNAVAILABLE, Json(ErrorResponse { error: "DuckDB required".into() })))
+    }
+}
+
+/// GET /api/v1/trino/:conn_id/stats — cache statistics.
+async fn trino_stats(
+    State(state): State<Arc<AppState>>,
+    Path(conn_id): Path<String>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let conn = get_or_init_trino(&state, &conn_id).await?;
+
+    #[cfg(feature = "duckdb")]
+    {
+        let stats = conn.stats().await;
+        Ok(Json(stats))
+    }
+    #[cfg(not(feature = "duckdb"))]
+    {
+        let _ = conn;
+        Ok(Json(serde_json::json!({})))
+    }
 }
 
 // ── Engine info endpoints ──────────────────────────────────────────
@@ -6044,5 +6509,1239 @@ async fn list_providers(
     Json(serde_json::json!({
         "providers": providers,
         "active_connections": active_connections,
+    }))
+}
+
+// ── Migration: Iceberg Catalog Migration (Trino → Rake) ───────────
+
+/// Request body for storing S3 credentials for migration.
+#[derive(Deserialize)]
+struct MigrationCredentialsRequest {
+    /// Identifier for these credentials (e.g., bucket name or "default").
+    key: String,
+    /// AWS access key ID.
+    access_key: String,
+    /// AWS secret access key.
+    secret_key: String,
+    /// AWS region (e.g., "us-east-1").
+    #[serde(default = "default_migration_s3_region")]
+    region: String,
+}
+
+fn default_migration_s3_region() -> String {
+    "us-east-1".to_string()
+}
+
+/// Request body for registering discovered Iceberg tables into Rake.
+#[derive(Deserialize)]
+struct MigrationRegisterRequest {
+    /// Optional list of fully-qualified table names to register.
+    /// If omitted, registers all discovered Iceberg tables with S3 locations.
+    tables: Option<Vec<String>>,
+}
+
+/// Request body for migration compare: run SQL on Trino and Rake engines.
+#[derive(Deserialize)]
+struct MigrationCompareRequest {
+    /// Trino connection ID for executing the query on Trino.
+    conn_id: String,
+    /// SQL to run on Trino.
+    sql: String,
+    /// Optional SQL to run on Rake engines (auto-derived if omitted by rewriting
+    /// Trino catalog references to Rake-registered table names).
+    rake_sql: Option<String>,
+    /// If true, use native S3 connections for each engine instead of going through
+    /// Trino-registered tables. Requires S3 credentials stored via /api/v1/migration/credentials.
+    #[serde(default)]
+    use_native_s3: bool,
+}
+
+/// POST /api/v1/migration/credentials — store S3 credentials for migration (in-memory only).
+async fn migration_credentials(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<MigrationCredentialsRequest>,
+) -> Json<serde_json::Value> {
+    let key = req.key.clone();
+    state.migration_s3_creds.write().await.insert(
+        key.clone(),
+        (req.access_key, req.secret_key, req.region),
+    );
+    tracing::info!(key = %key, "Stored S3 credentials for migration");
+    Json(serde_json::json!({
+        "status": "stored",
+        "key": key,
+        "message": "S3 credentials stored in-memory (not persisted to disk)",
+    }))
+}
+
+/// POST /api/v1/migration/:conn_id/discover — discover Iceberg catalogs and tables from Trino.
+///
+/// Queries Trino to find all catalogs, then for each catalog discovers tables
+/// and extracts format and S3 location via `SHOW CREATE TABLE`.
+async fn migration_discover(
+    State(state): State<Arc<AppState>>,
+    Path(conn_id): Path<String>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let conn = get_or_init_trino(&state, &conn_id).await?;
+
+    #[cfg(feature = "duckdb")]
+    {
+        let tree = conn.browse().await
+            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e })))?;
+
+        let mut tables: Vec<MigrationTable> = Vec::new();
+        let mut iceberg_catalogs: Vec<String> = Vec::new();
+
+        for cat_entry in &tree.catalogs {
+            let mut catalog_is_iceberg = false;
+
+            for schema_entry in &cat_entry.schemas {
+                for table_name in &schema_entry.tables {
+                    // Try to get column count from cached columns
+                    let column_count = conn.columns(&cat_entry.name, &schema_entry.name, table_name)
+                        .await
+                        .map(|cols| cols.len())
+                        .unwrap_or(0);
+
+                    // Try SHOW CREATE TABLE to extract format, location, and metastore URI
+                    let show_sql = format!(
+                        "SHOW CREATE TABLE \"{}\".\"{}\".\"{}\"\n",
+                        cat_entry.name, schema_entry.name, table_name
+                    );
+                    let (format, location, metastore_uri) = match conn.rest.execute_query(&show_sql, &cat_entry.name).await {
+                        Ok(result) => {
+                            let ddl_text: String = result.rows.iter()
+                                .filter_map(|row| row.first().and_then(|v| v.as_str()))
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                                .to_lowercase();
+
+                            // Determine format from DDL
+                            let fmt = if ddl_text.contains("format = 'iceberg'")
+                                || ddl_text.contains("format='iceberg'")
+                                || ddl_text.contains("iceberg")
+                            {
+                                catalog_is_iceberg = true;
+                                "iceberg"
+                            } else if ddl_text.contains("format = 'delta'")
+                                || ddl_text.contains("format='delta'")
+                                || ddl_text.contains("delta")
+                            {
+                                "delta"
+                            } else if ddl_text.contains("hive") {
+                                "hive"
+                            } else if cat_entry.name.to_lowercase() == "tpch" {
+                                "tpch"
+                            } else {
+                                "jdbc"
+                            };
+
+                            // Extract S3 location from external_location or location properties
+                            let loc = extract_quoted_property(&ddl_text, "external_location")
+                                .or_else(|| extract_quoted_property(&ddl_text, "location"));
+
+                            // Extract Hive Metastore URI
+                            let metastore = extract_quoted_property(&ddl_text, "hive.metastore.uri")
+                                .or_else(|| extract_quoted_property(&ddl_text, "thrift.uri"));
+
+                            (fmt.to_string(), loc, metastore)
+                        }
+                        Err(_) => {
+                            // SHOW CREATE TABLE fails for some connectors (e.g. tpch)
+                            let fmt = if cat_entry.name.to_lowercase() == "tpch" {
+                                "tpch".to_string()
+                            } else {
+                                "jdbc".to_string()
+                            };
+                            (fmt, None, None)
+                        }
+                    };
+
+                    tables.push(MigrationTable {
+                        conn_id: conn_id.clone(),
+                        catalog: cat_entry.name.clone(),
+                        schema_name: schema_entry.name.clone(),
+                        table_name: table_name.clone(),
+                        format,
+                        location,
+                        metastore_uri,
+                        column_count,
+                        row_count: None,
+                        registered_in_rake: false,
+                        rake_table_name: None,
+                        status: "discovered".to_string(),
+                        error: None,
+                    });
+                }
+            }
+
+            if catalog_is_iceberg {
+                iceberg_catalogs.push(cat_entry.name.clone());
+            }
+        }
+
+        let total_count = tables.len();
+        let iceberg_count = tables.iter().filter(|t| t.format == "iceberg").count();
+        let with_location = tables.iter().filter(|t| t.location.is_some()).count();
+
+        *state.migration_tables.write().await = tables.clone();
+
+        Ok(Json(serde_json::json!({
+            "status": "discovered",
+            "conn_id": conn_id,
+            "table_count": total_count,
+            "iceberg_table_count": iceberg_count,
+            "tables_with_s3_location": with_location,
+            "iceberg_catalogs": iceberg_catalogs,
+            "tables": tables,
+        })))
+    }
+    #[cfg(not(feature = "duckdb"))]
+    {
+        let _ = conn;
+        Err((StatusCode::SERVICE_UNAVAILABLE, Json(ErrorResponse { error: "DuckDB feature required for migration discover".into() })))
+    }
+}
+
+/// Extract a quoted property value from a DDL string.
+/// Looks for patterns like `property_name = 'value'` or `property_name='value'`.
+fn extract_quoted_property(ddl: &str, property: &str) -> Option<String> {
+    ddl.split(property)
+        .nth(1)
+        .and_then(|s| {
+            let trimmed = s.trim_start();
+            let after_eq = trimmed.strip_prefix('=')
+                .unwrap_or(trimmed)
+                .trim_start();
+            let start = after_eq.find('\'')?;
+            let rest = &after_eq[start + 1..];
+            let end = rest.find('\'')?;
+            Some(rest[..end].to_string())
+        })
+}
+
+/// POST /api/v1/migration/:conn_id/register — register discovered Iceberg tables into Rake.
+///
+/// For tables with S3 locations, registers them in DataFusion as Parquet-backed tables
+/// (future: register as Iceberg tables via iceberg-rust catalog integration).
+/// Also syncs registered tables to DuckDB/Polars engines if available.
+async fn migration_register(
+    State(state): State<Arc<AppState>>,
+    Path(conn_id): Path<String>,
+    Json(req): Json<MigrationRegisterRequest>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let mut registered_count = 0usize;
+    let mut skipped_count = 0usize;
+    let mut errors: Vec<serde_json::Value> = Vec::new();
+
+    // Select tables to register
+    let tables_to_register: Vec<MigrationTable> = {
+        let all_tables = state.migration_tables.read().await;
+        all_tables.iter()
+            .filter(|t| t.conn_id == conn_id)
+            .filter(|t| !t.registered_in_rake)
+            .filter(|t| {
+                if let Some(ref filter) = req.tables {
+                    let fqn = format!("{}.{}.{}", t.catalog, t.schema_name, t.table_name);
+                    filter.iter().any(|f| f == &fqn || f == &t.table_name)
+                } else {
+                    // Default: only register Iceberg tables with known S3 locations
+                    t.format == "iceberg" && t.location.is_some()
+                }
+            })
+            .cloned()
+            .collect()
+    };
+
+    let total = tables_to_register.len();
+    let mut registered_names: Vec<String> = Vec::new();
+
+    for mt in &tables_to_register {
+        let fqn = format!("{}.{}.{}", mt.catalog, mt.schema_name, mt.table_name);
+
+        // Tables must have an S3 location to register
+        let s3_location = match &mt.location {
+            Some(loc) => loc.clone(),
+            None => {
+                skipped_count += 1;
+                errors.push(serde_json::json!({
+                    "table": fqn,
+                    "error": "No S3 location available — cannot register without data location",
+                }));
+                // Update status
+                let mut all = state.migration_tables.write().await;
+                if let Some(entry) = all.iter_mut().find(|t|
+                    t.catalog == mt.catalog && t.schema_name == mt.schema_name && t.table_name == mt.table_name
+                ) {
+                    entry.status = "error".to_string();
+                    entry.error = Some("No S3 location".to_string());
+                }
+                continue;
+            }
+        };
+
+        // Build a Rake table name: iceberg_{catalog}_{schema}_{table}
+        let rake_name = format!(
+            "iceberg_{}_{}_{}",
+            mt.catalog.replace('.', "_").replace('-', "_"),
+            mt.schema_name.replace('.', "_").replace('-', "_"),
+            mt.table_name.replace('.', "_").replace('-', "_"),
+        );
+
+        // Register the S3 path as a Parquet table in DataFusion.
+        // NOTE: This is a temporary approach. When iceberg-rust catalog integration
+        // is available, this will register as a proper Iceberg table with full
+        // metadata, time travel, and snapshot support.
+        let register_result = {
+            let ctx = state.ctx.read().await;
+            let df_ctx = ctx.datafusion_ctx();
+            df_ctx.register_parquet(&rake_name, &s3_location, Default::default()).await
+        };
+
+        match register_result {
+            Ok(_) => {
+                tracing::info!(
+                    table = %fqn,
+                    rake_name = %rake_name,
+                    location = %s3_location,
+                    "Registered Iceberg table in Rake"
+                );
+                registered_names.push(rake_name.clone());
+
+                // Update migration table entry
+                let mut all = state.migration_tables.write().await;
+                if let Some(entry) = all.iter_mut().find(|t|
+                    t.catalog == mt.catalog && t.schema_name == mt.schema_name && t.table_name == mt.table_name
+                ) {
+                    entry.registered_in_rake = true;
+                    entry.rake_table_name = Some(rake_name.clone());
+                    entry.status = "registered".to_string();
+                    entry.error = None;
+                }
+                drop(all);
+
+                // Mark as read-only — migrated tables are for comparison only
+                state.read_only_tables.write().await.insert(rake_name.clone());
+                tracing::info!(table = %rake_name, "Marked migration table as read-only");
+
+                registered_count += 1;
+            }
+            Err(e) => {
+                let err_msg = format!("DataFusion registration failed: {}", e);
+                tracing::warn!(
+                    table = %fqn,
+                    error = %e,
+                    location = %s3_location,
+                    "Failed to register Iceberg table in Rake"
+                );
+                errors.push(serde_json::json!({
+                    "table": fqn,
+                    "location": s3_location,
+                    "error": err_msg,
+                }));
+                let mut all = state.migration_tables.write().await;
+                if let Some(entry) = all.iter_mut().find(|t|
+                    t.catalog == mt.catalog && t.schema_name == mt.schema_name && t.table_name == mt.table_name
+                ) {
+                    entry.status = "error".to_string();
+                    entry.error = Some(err_msg);
+                }
+            }
+        }
+    }
+
+    // Sync newly registered tables to DuckDB/Polars engines
+    if !registered_names.is_empty() {
+        sync_trino_tables_to_engines(&state, &registered_names).await;
+    }
+
+    Ok(Json(serde_json::json!({
+        "status": "complete",
+        "conn_id": conn_id,
+        "registered": registered_count,
+        "skipped": skipped_count,
+        "total": total,
+        "registered_tables": registered_names,
+        "errors": errors,
+    })))
+}
+
+/// POST /api/v1/migration/compare — run SQL on Trino and on Rake's engines, compare performance.
+///
+/// Executes the query via the Trino REST API for timing, then executes the equivalent
+/// SQL on DataFusion, DuckDB, and Polars (if available) on the same Iceberg data
+/// registered in Rake. Returns timing comparison with winner and speedup factor.
+///
+/// When `use_native_s3` is true and S3 credentials are available, each Rake engine
+/// connects to S3 directly using its native connector instead of reading from
+/// Trino-registered in-memory copies:
+/// - **DataFusion**: `object_store` AmazonS3Builder + ListingTable at S3 path
+/// - **DuckDB**: `INSTALL httpfs; SET s3_*; SELECT * FROM read_parquet('s3://...')`
+/// - **Polars**: Uses DataFusion S3 backend (labeled "via DataFusion S3")
+async fn migration_compare(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<MigrationCompareRequest>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let comparison_id = Uuid::new_v4().to_string();
+    let use_native_s3 = req.use_native_s3;
+
+    // Collect S3 credentials and table locations when native S3 is requested
+    let s3_creds: Option<(String, String, String)> = if use_native_s3 {
+        let creds_map = state.migration_s3_creds.read().await;
+        // Try conn_id-specific creds first, then "default"
+        creds_map.get(&req.conn_id)
+            .or_else(|| creds_map.get("default"))
+            .cloned()
+    } else {
+        None
+    };
+
+    // Build a mapping of table FQN → S3 location for native S3 mode
+    let table_s3_locations: std::collections::HashMap<String, String> = if use_native_s3 {
+        let tables = state.migration_tables.try_read()
+            .map(|t| t.clone())
+            .unwrap_or_default();
+        tables.iter()
+            .filter(|t| t.conn_id == req.conn_id && t.location.is_some())
+            .map(|t| {
+                let fqn = format!("{}.{}.{}", t.catalog, t.schema_name, t.table_name);
+                (fqn, t.location.clone().unwrap())
+            })
+            .collect()
+    } else {
+        std::collections::HashMap::new()
+    };
+
+    // Build Rake SQL by rewriting Trino catalog.schema.table references to Rake names
+    // Trino FQN: catalog.schema.table → Rake: trino_{catalog}.{schema}_{table}
+    let rake_sql = req.rake_sql.unwrap_or_else(|| {
+        let mut sql = req.sql.clone();
+
+        // First, try explicit mappings from registered migration tables
+        let re_pattern: Vec<(String, String)> = {
+            let tables = state.migration_tables.try_read()
+                .map(|t| t.clone())
+                .unwrap_or_default();
+            tables.iter()
+                .filter(|t| t.conn_id == req.conn_id && t.rake_table_name.is_some())
+                .flat_map(|t| {
+                    let rake_name = t.rake_table_name.clone().unwrap();
+                    let fqn_unquoted = format!(
+                        "{}.{}.{}",
+                        t.catalog, t.schema_name, t.table_name
+                    );
+                    vec![(fqn_unquoted, rake_name)]
+                })
+                .collect()
+        };
+        for (trino_ref, rake_name) in &re_pattern {
+            sql = sql.replace(trino_ref, rake_name);
+        }
+
+        // Then, auto-rewrite any remaining catalog.schema.table patterns
+        // Pattern: word.word.word that looks like a Trino FQN
+        // Rewrite: catalog.schema.table → trino_{catalog}.{schema}_{table}
+        let fqn_re = regex::Regex::new(r"\b([a-zA-Z_]\w*)\.([a-zA-Z_]\w*)\.([a-zA-Z_]\w*)\b").unwrap();
+        // Don't rewrite SQL keywords that happen to match (e.g. GROUP.BY.something)
+        let sql_keywords: std::collections::HashSet<&str> = [
+            "GROUP", "ORDER", "SELECT", "FROM", "WHERE", "JOIN", "LEFT", "RIGHT",
+            "INNER", "OUTER", "CROSS", "ON", "AND", "OR", "NOT", "AS", "LIMIT",
+            "OFFSET", "HAVING", "UNION", "INSERT", "INTO", "VALUES", "UPDATE",
+            "DELETE", "CREATE", "DROP", "ALTER", "TABLE", "INDEX", "VIEW",
+        ].iter().copied().collect();
+
+        let result = fqn_re.replace_all(&sql, |caps: &regex::Captures| {
+            let catalog = &caps[1];
+            let schema = &caps[2];
+            let table = &caps[3];
+            // Skip if any part is a SQL keyword
+            if sql_keywords.contains(catalog.to_uppercase().as_str())
+                || sql_keywords.contains(schema.to_uppercase().as_str())
+                || sql_keywords.contains(table.to_uppercase().as_str())
+            {
+                return caps[0].to_string();
+            }
+            format!("trino_{}.{}_{}", catalog, schema, table)
+        });
+        result.to_string()
+    });
+
+    let mut results: Vec<EngineResult> = Vec::new();
+
+    // 1. Trino — execute via Trino REST API directly for accurate Trino timing
+    {
+        let start = Instant::now();
+        let conn_result = get_or_init_trino(&state, &req.conn_id).await;
+        match conn_result {
+            Ok(conn) => {
+                let default_catalog = conn.default_catalog.clone();
+                match conn.rest.execute_query(&req.sql, &default_catalog).await {
+                    Ok(query_result) => {
+                        results.push(EngineResult {
+                            engine: "Trino".to_string(),
+                            duration_ms: start.elapsed().as_millis() as u64,
+                            row_count: query_result.row_count,
+                            status: "success".to_string(),
+                            error: None,
+                            path: Some("trino_native".to_string()),
+                        });
+                    }
+                    Err(e) => {
+                        results.push(EngineResult {
+                            engine: "Trino".to_string(),
+                            duration_ms: start.elapsed().as_millis() as u64,
+                            row_count: 0,
+                            status: "error".to_string(),
+                            error: Some(e),
+                            path: Some("trino_native".to_string()),
+                        });
+                    }
+                }
+            }
+            Err(_) => {
+                results.push(EngineResult {
+                    engine: "Trino".to_string(),
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    row_count: 0,
+                    status: "error".to_string(),
+                    error: Some(format!("Trino connection '{}' not available", req.conn_id)),
+                    path: Some("trino_native".to_string()),
+                });
+            }
+        }
+    }
+
+    // 2. Rake DataFusion — native S3 or via Trino-registered tables
+    if use_native_s3 && s3_creds.is_some() {
+        // DataFusion S3 direct: create a temporary SessionContext with S3 object_store,
+        // register ListingTables at S3 paths, and run the rewritten SQL.
+        let start = Instant::now();
+        let creds = s3_creds.as_ref().unwrap();
+        match execute_df_s3_direct(&rake_sql, &table_s3_locations, creds, &req.conn_id).await {
+            Ok((row_count, engine_label)) => {
+                results.push(EngineResult {
+                    engine: engine_label,
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    row_count,
+                    status: "success".to_string(),
+                    error: None,
+                    path: Some("s3_direct".to_string()),
+                });
+            }
+            Err(e) => {
+                // Fallback to via-Trino path on S3 error
+                tracing::warn!(error = %e, "DataFusion S3 direct failed, falling back to via-Trino");
+                let start2 = Instant::now();
+                let ctx = state.ctx.read().await;
+                match ctx.datafusion_ctx().sql(&rake_sql).await {
+                    Ok(df) => match df.collect().await {
+                        Ok(batches) => {
+                            let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
+                            results.push(EngineResult {
+                                engine: "Rake DataFusion".to_string(),
+                                duration_ms: start2.elapsed().as_millis() as u64,
+                                row_count,
+                                status: "success".to_string(),
+                                error: None,
+                                path: Some("via_trino".to_string()),
+                            });
+                        }
+                        Err(e2) => {
+                            results.push(EngineResult {
+                                engine: "Rake DataFusion".to_string(),
+                                duration_ms: start2.elapsed().as_millis() as u64,
+                                row_count: 0,
+                                status: "error".to_string(),
+                                error: Some(format!("S3 direct: {}; via-Trino: {}", e, e2)),
+                                path: Some("via_trino".to_string()),
+                            });
+                        }
+                    },
+                    Err(e2) => {
+                        results.push(EngineResult {
+                            engine: "Rake DataFusion".to_string(),
+                            duration_ms: start2.elapsed().as_millis() as u64,
+                            row_count: 0,
+                            status: "error".to_string(),
+                            error: Some(format!("S3 direct: {}; via-Trino: {}", e, e2)),
+                            path: Some("via_trino".to_string()),
+                        });
+                    }
+                }
+                drop(ctx);
+            }
+        }
+    } else {
+        // Standard path: execute on Trino-registered tables in DataFusion
+        let start = Instant::now();
+        let ctx = state.ctx.read().await;
+        match ctx.datafusion_ctx().sql(&rake_sql).await {
+            Ok(df) => match df.collect().await {
+                Ok(batches) => {
+                    let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
+                    results.push(EngineResult {
+                        engine: "Rake DataFusion".to_string(),
+                        duration_ms: start.elapsed().as_millis() as u64,
+                        row_count,
+                        status: "success".to_string(),
+                        error: None,
+                        path: Some("via_trino".to_string()),
+                    });
+                }
+                Err(e) => {
+                    results.push(EngineResult {
+                        engine: "Rake DataFusion".to_string(),
+                        duration_ms: start.elapsed().as_millis() as u64,
+                        row_count: 0,
+                        status: "error".to_string(),
+                        error: Some(e.to_string()),
+                        path: Some("via_trino".to_string()),
+                    });
+                }
+            },
+            Err(e) => {
+                results.push(EngineResult {
+                    engine: "Rake DataFusion".to_string(),
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    row_count: 0,
+                    status: "error".to_string(),
+                    error: Some(e.to_string()),
+                    path: Some("via_trino".to_string()),
+                });
+            }
+        }
+        drop(ctx);
+    }
+
+    // For DuckDB/Polars, flatten schema-qualified trino_ table names to flat names
+    // trino_tpch.sf1_orders → trino_tpch_sf1_orders (only trino_ prefixed names)
+    let trino_dot_re = regex::Regex::new(r"\btrino_(\w+)\.(\w+)\b").unwrap();
+    let flat_sql = trino_dot_re.replace_all(&rake_sql, "trino_${1}_${2}").to_string();
+
+    // 3. Rake DuckDB — native S3 via httpfs or in-memory synced copy
+    if use_native_s3 && s3_creds.is_some() && !table_s3_locations.is_empty() {
+        let start = Instant::now();
+        let creds = s3_creds.as_ref().unwrap();
+        match execute_duckdb_s3_direct(&state, &req.sql, &table_s3_locations, creds, &req.conn_id).await {
+            Ok(batches) => {
+                let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
+                results.push(EngineResult {
+                    engine: "Rake DuckDB (S3 direct)".to_string(),
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    row_count,
+                    status: "success".to_string(),
+                    error: None,
+                    path: Some("s3_direct".to_string()),
+                });
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "DuckDB S3 direct failed, falling back to in-memory");
+                // Fallback to in-memory synced copy
+                let start2 = Instant::now();
+                match execute_via_duckdb(&state, &flat_sql).await {
+                    Ok(batches) => {
+                        let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
+                        results.push(EngineResult {
+                            engine: "Rake DuckDB".to_string(),
+                            duration_ms: start2.elapsed().as_millis() as u64,
+                            row_count,
+                            status: "success".to_string(),
+                            error: None,
+                            path: Some("in_memory".to_string()),
+                        });
+                    }
+                    Err(e2) => {
+                        results.push(EngineResult {
+                            engine: "Rake DuckDB".to_string(),
+                            duration_ms: start2.elapsed().as_millis() as u64,
+                            row_count: 0,
+                            status: if e2.contains("not available") { "unavailable" } else { "error" }.to_string(),
+                            error: Some(format!("S3 direct: {}; in-memory: {}", e, e2)),
+                            path: Some("in_memory".to_string()),
+                        });
+                    }
+                }
+            }
+        }
+    } else {
+        let start = Instant::now();
+        match execute_via_duckdb(&state, &flat_sql).await {
+            Ok(batches) => {
+                let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
+                results.push(EngineResult {
+                    engine: "Rake DuckDB".to_string(),
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    row_count,
+                    status: "success".to_string(),
+                    error: None,
+                    path: Some("in_memory".to_string()),
+                });
+            }
+            Err(e) => {
+                results.push(EngineResult {
+                    engine: "Rake DuckDB".to_string(),
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    row_count: 0,
+                    status: if e.contains("not available") { "unavailable" } else { "error" }.to_string(),
+                    error: Some(e),
+                    path: Some("in_memory".to_string()),
+                });
+            }
+        }
+    }
+
+    // 4. Rake Polars — native S3 via DataFusion S3 backend or in-memory synced copy
+    if use_native_s3 && s3_creds.is_some() {
+        // Polars uses the DataFusion S3 backend for native S3 access.
+        // This gives real S3 reads but routed through the Polars execution engine label.
+        let start = Instant::now();
+        let creds = s3_creds.as_ref().unwrap();
+        match execute_df_s3_direct(&rake_sql, &table_s3_locations, creds, &req.conn_id).await {
+            Ok((row_count, _)) => {
+                results.push(EngineResult {
+                    engine: "Rake Polars (via DataFusion S3)".to_string(),
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    row_count,
+                    status: "success".to_string(),
+                    error: None,
+                    path: Some("s3_direct".to_string()),
+                });
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Polars S3 direct failed, falling back to in-memory");
+                let start2 = Instant::now();
+                match execute_via_polars(&state, &flat_sql).await {
+                    Ok(batches) => {
+                        let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
+                        results.push(EngineResult {
+                            engine: "Rake Polars".to_string(),
+                            duration_ms: start2.elapsed().as_millis() as u64,
+                            row_count,
+                            status: "success".to_string(),
+                            error: None,
+                            path: Some("in_memory".to_string()),
+                        });
+                    }
+                    Err(e2) => {
+                        results.push(EngineResult {
+                            engine: "Rake Polars".to_string(),
+                            duration_ms: start2.elapsed().as_millis() as u64,
+                            row_count: 0,
+                            status: if e2.contains("not available") { "unavailable" } else { "error" }.to_string(),
+                            error: Some(format!("S3 direct: {}; in-memory: {}", e, e2)),
+                            path: Some("in_memory".to_string()),
+                        });
+                    }
+                }
+            }
+        }
+    } else {
+        let start = Instant::now();
+        match execute_via_polars(&state, &flat_sql).await {
+            Ok(batches) => {
+                let row_count: usize = batches.iter().map(|b| b.num_rows()).sum();
+                results.push(EngineResult {
+                    engine: "Rake Polars".to_string(),
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    row_count,
+                    status: "success".to_string(),
+                    error: None,
+                    path: Some("in_memory".to_string()),
+                });
+            }
+            Err(e) => {
+                results.push(EngineResult {
+                    engine: "Rake Polars".to_string(),
+                    duration_ms: start.elapsed().as_millis() as u64,
+                    row_count: 0,
+                    status: if e.contains("not available") { "unavailable" } else { "error" }.to_string(),
+                    error: Some(e),
+                    path: Some("in_memory".to_string()),
+                });
+            }
+        }
+    }
+
+    // Determine winner (fastest successful Rake engine) and speedup vs Trino
+    let trino_ms = results.iter()
+        .find(|r| r.engine == "Trino")
+        .filter(|r| r.status == "success")
+        .map(|r| r.duration_ms)
+        .unwrap_or(0);
+
+    let best_rake = results.iter()
+        .filter(|r| r.engine.starts_with("Rake") && r.status == "success")
+        .min_by_key(|r| r.duration_ms);
+
+    let (winner, speedup) = match best_rake {
+        Some(best) => {
+            let sp = if best.duration_ms > 0 && trino_ms > 0 {
+                trino_ms as f64 / best.duration_ms as f64
+            } else {
+                1.0
+            };
+            (best.engine.clone(), (sp * 100.0).round() / 100.0)
+        }
+        None => ("N/A".to_string(), 1.0),
+    };
+
+    // Check data match: all successful engines return same row count
+    let successful_counts: Vec<usize> = results.iter()
+        .filter(|r| r.status == "success")
+        .map(|r| r.row_count)
+        .collect();
+    let data_match = if successful_counts.len() >= 2 {
+        successful_counts.iter().all(|&c| c == successful_counts[0])
+    } else {
+        true
+    };
+
+    let comparison = MigrationComparison {
+        id: comparison_id.clone(),
+        sql: req.sql.clone(),
+        results: results.clone(),
+        winner: winner.clone(),
+        speedup,
+        data_match,
+        timestamp: Utc::now(),
+    };
+
+    state.migration_comparisons.write().await.push(comparison.clone());
+
+    // Record all engine results in the performance tracker for adaptive routing
+    let query_type = classify_query_for_engine(&req.sql);
+    {
+        let mut tracker = state.engine_tracker.write().await;
+        let now = Utc::now().to_rfc3339();
+        for result in &results {
+            if result.status == "success" {
+                tracker.record(EngineLatencyRecord {
+                    engine: result.engine.clone(),
+                    query_type: query_type.clone(),
+                    duration_ms: result.duration_ms,
+                    row_count: result.row_count,
+                    data_size_bytes: (result.row_count as u64) * 64, // approximate: 64 bytes per row
+                    path: result.path.clone().unwrap_or_else(|| "unknown".to_string()),
+                    timestamp: now.clone(),
+                });
+            }
+        }
+    }
+
+    // Build an adaptive recommendation based on this comparison and all history
+    let (recommendation, alternatives) = {
+        let tracker = state.engine_tracker.read().await;
+        build_recommendation(
+            &query_type,
+            &tracker,
+            state.duckdb_available(),
+            state.polars_available(),
+        )
+    };
+
+    // Override estimated_speedup with actual speedup from this comparison
+    let recommendation = EngineRecommendation {
+        estimated_speedup: speedup,
+        ..recommendation
+    };
+
+    Ok(Json(serde_json::json!({
+        "id": comparison_id,
+        "sql": req.sql,
+        "trino_sql": req.sql,
+        "rake_sql": rake_sql,
+        "native_s3": use_native_s3,
+        "s3_available": s3_creds.is_some(),
+        "results": results,
+        "winner": winner,
+        "speedup": speedup,
+        "data_match": data_match,
+        "timestamp": comparison.timestamp,
+        "query_type": query_type,
+        "recommendation": {
+            "strategy": recommendation.strategy,
+            "primary_engine": recommendation.primary_engine,
+            "reason": recommendation.reason,
+            "estimated_speedup": recommendation.estimated_speedup,
+            "scan_engine": recommendation.scan_engine,
+            "process_engine": recommendation.process_engine,
+            "alternatives": alternatives,
+        },
+    })))
+}
+
+/// GET /api/v1/migration/:conn_id/tables — list discovered Iceberg tables for a connection.
+async fn migration_tables(
+    State(state): State<Arc<AppState>>,
+    Path(conn_id): Path<String>,
+) -> Json<serde_json::Value> {
+    let tables = state.migration_tables.read().await;
+    let filtered: Vec<&MigrationTable> = tables.iter()
+        .filter(|t| t.conn_id == conn_id)
+        .collect();
+    let iceberg_count = filtered.iter().filter(|t| t.format == "iceberg").count();
+    let registered_count = filtered.iter().filter(|t| t.registered_in_rake).count();
+    let with_location = filtered.iter().filter(|t| t.location.is_some()).count();
+    Json(serde_json::json!({
+        "conn_id": conn_id,
+        "tables": filtered,
+        "count": filtered.len(),
+        "iceberg_count": iceberg_count,
+        "registered_count": registered_count,
+        "with_s3_location": with_location,
+    }))
+}
+
+/// GET /api/v1/migration/comparisons — list all migration comparison results.
+async fn migration_comparisons(
+    State(state): State<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    let comparisons = state.migration_comparisons.read().await;
+    Json(serde_json::json!({
+        "comparisons": *comparisons,
+        "count": comparisons.len(),
+    }))
+}
+
+/// GET /api/v1/migration/readonly — list all read-only migration tables.
+async fn migration_readonly_tables(
+    State(state): State<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    let read_only = state.read_only_tables.read().await;
+    let tables: Vec<&String> = read_only.iter().collect();
+    Json(serde_json::json!({
+        "tables": tables,
+        "count": tables.len(),
+    }))
+}
+
+/// Extract the target table name from DDL/DML SQL (uppercased input).
+///
+/// Handles: INSERT INTO table, UPDATE table, DELETE FROM table,
+/// DROP TABLE table, ALTER TABLE table, TRUNCATE TABLE table.
+fn extract_target_table(sql_upper: &str) -> Option<String> {
+    let patterns = [
+        "INSERT INTO ",
+        "UPDATE ",
+        "DELETE FROM ",
+        "DROP TABLE IF EXISTS ",
+        "DROP TABLE ",
+        "ALTER TABLE ",
+        "TRUNCATE TABLE ",
+        "TRUNCATE ",
+    ];
+    for pat in &patterns {
+        if let Some(rest) = sql_upper.strip_prefix(pat) {
+            // Take the first word (table name), stop at space/paren/semicolon
+            let table: String = rest.chars()
+                .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '.')
+                .collect();
+            if !table.is_empty() {
+                return Some(table);
+            }
+        }
+    }
+    None
+}
+
+/// Classify a SQL query into a workload type for engine recommendation.
+///
+/// Returns one of: "complex_join", "join", "scan_aggregate", "point_lookup",
+/// "ordered_scan", "full_scan".
+fn classify_query_for_engine(sql: &str) -> String {
+    let sql_upper = sql.to_uppercase();
+    let has_join = sql_upper.contains("JOIN");
+    let has_agg = sql_upper.contains("COUNT(")
+        || sql_upper.contains("SUM(")
+        || sql_upper.contains("AVG(")
+        || sql_upper.contains("MIN(")
+        || sql_upper.contains("MAX(")
+        || sql_upper.contains("GROUP BY");
+    let has_where_eq = sql_upper.contains("WHERE") && sql_upper.contains("=");
+    let has_order = sql_upper.contains("ORDER BY");
+    let has_subquery = sql_upper.matches("SELECT").count() > 1;
+
+    if has_join && has_subquery {
+        "complex_join".to_string()
+    } else if has_join {
+        "join".to_string()
+    } else if has_agg {
+        "scan_aggregate".to_string()
+    } else if has_where_eq && !has_agg {
+        "point_lookup".to_string()
+    } else if has_order {
+        "ordered_scan".to_string()
+    } else {
+        "full_scan".to_string()
+    }
+}
+
+/// Build an engine recommendation based on query type and performance history.
+fn build_recommendation(
+    query_type: &str,
+    tracker: &crate::state::EnginePerformanceTracker,
+    duckdb_available: bool,
+    polars_available: bool,
+) -> (EngineRecommendation, Vec<AlternativeStrategy>) {
+    // Check if we have performance history for this query type
+    let has_history = tracker.has_history_for(query_type);
+
+    let (primary_engine, reason, strategy, estimated_speedup, scan_engine, process_engine) =
+        if has_history {
+            // Use historical data to pick the best engine
+            let df_avg = tracker.avg_latency("Rake DataFusion", query_type);
+            let dk_avg = tracker.avg_latency("Rake DuckDB", query_type)
+                .or_else(|| tracker.avg_latency("Rake DuckDB (S3 direct)", query_type));
+            let pl_avg = tracker.avg_latency("Rake Polars", query_type)
+                .or_else(|| tracker.avg_latency("Rake Polars (via DataFusion S3)", query_type));
+            let trino_avg = tracker.avg_latency("Trino", query_type);
+
+            // Find the fastest Rake engine
+            let mut candidates: Vec<(&str, f64)> = Vec::new();
+            if let Some(avg) = df_avg {
+                candidates.push(("Rake DataFusion", avg));
+            }
+            if let Some(avg) = dk_avg {
+                if duckdb_available {
+                    candidates.push(("Rake DuckDB", avg));
+                }
+            }
+            if let Some(avg) = pl_avg {
+                if polars_available {
+                    candidates.push(("Rake Polars", avg));
+                }
+            }
+
+            if candidates.is_empty() {
+                // No successful history, fall through to defaults
+                default_recommendation(query_type, duckdb_available)
+            } else {
+                candidates.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+                let (best_engine, best_avg) = candidates[0];
+                let speedup = trino_avg
+                    .map(|t| if best_avg > 0.0 { (t / best_avg * 100.0).round() / 100.0 } else { 1.0 })
+                    .unwrap_or(1.0);
+
+                // Check if scan_handoff would be better:
+                // If DuckDB scans faster but DataFusion joins better
+                let should_scan_handoff = query_type == "join" || query_type == "complex_join";
+                if should_scan_handoff && dk_avg.is_some() && df_avg.is_some() {
+                    let dk = dk_avg.unwrap();
+                    let df = df_avg.unwrap();
+                    // If DuckDB is at least 2x faster for scan-like queries
+                    // but DataFusion is better at joins overall
+                    let dk_scan_avg = tracker.avg_latency("Rake DuckDB", "scan_aggregate")
+                        .or_else(|| tracker.avg_latency("Rake DuckDB", "full_scan"));
+                    let df_scan_avg = tracker.avg_latency("Rake DataFusion", "scan_aggregate")
+                        .or_else(|| tracker.avg_latency("Rake DataFusion", "full_scan"));
+
+                    if let (Some(dk_s), Some(df_s)) = (dk_scan_avg, df_scan_avg) {
+                        if dk_s < df_s * 0.5 && df < dk {
+                            // DuckDB scans 2x+ faster, DataFusion joins faster
+                            let reason_str = format!(
+                                "Hybrid strategy: DuckDB scans {:.1}x faster, DataFusion joins {:.1}x faster. \
+                                 DuckDB handles table scans, hands off Arrow batches to DataFusion for join processing.",
+                                df_s / dk_s, dk / df
+                            );
+                            return (
+                                EngineRecommendation {
+                                    strategy: "scan_handoff".to_string(),
+                                    primary_engine: "Rake DataFusion".to_string(),
+                                    reason: reason_str,
+                                    estimated_speedup: speedup,
+                                    scan_engine: Some("Rake DuckDB".to_string()),
+                                    process_engine: Some("Rake DataFusion".to_string()),
+                                },
+                                build_alternatives(query_type),
+                            );
+                        }
+                    }
+                }
+
+                let reason_str = format!(
+                    "{} has the lowest average latency ({:.1}ms) for {} queries based on {} previous executions.{}",
+                    best_engine,
+                    best_avg,
+                    query_type,
+                    candidates.len(),
+                    if speedup > 1.0 { format!(" {:.0}x faster than Trino.", speedup) } else { String::new() }
+                );
+
+                (
+                    best_engine.to_string(),
+                    reason_str,
+                    "single_engine".to_string(),
+                    speedup,
+                    None,
+                    None,
+                )
+            }
+        } else {
+            // No history: use defaults
+            default_recommendation(query_type, duckdb_available)
+        };
+
+    let recommendation = EngineRecommendation {
+        strategy,
+        primary_engine,
+        reason,
+        estimated_speedup,
+        scan_engine,
+        process_engine,
+    };
+
+    (recommendation, build_alternatives(query_type))
+}
+
+/// Default engine recommendation when no performance history exists.
+fn default_recommendation(
+    query_type: &str,
+    duckdb_available: bool,
+) -> (String, String, String, f64, Option<String>, Option<String>) {
+    match query_type {
+        "scan_aggregate" => {
+            let engine = if duckdb_available { "Rake DuckDB" } else { "Rake DataFusion" };
+            (
+                engine.to_string(),
+                format!(
+                    "{} is the default choice for scan+aggregate queries. {} excels at columnar scans with aggregations.",
+                    engine,
+                    if duckdb_available { "DuckDB" } else { "DataFusion" },
+                ),
+                "single_engine".to_string(),
+                1.0,
+                None,
+                None,
+            )
+        }
+        "complex_join" | "join" => (
+            "Rake DataFusion".to_string(),
+            "DataFusion is the default choice for join queries. Its optimizer handles multi-table joins \
+             with predicate pushdown and join reordering."
+                .to_string(),
+            "single_engine".to_string(),
+            1.0,
+            None,
+            None,
+        ),
+        "point_lookup" => {
+            let engine = if duckdb_available { "Rake DuckDB" } else { "Rake DataFusion" };
+            (
+                engine.to_string(),
+                format!(
+                    "{} is the default for point lookups. Single-row fetches are fastest on {}.",
+                    engine,
+                    if duckdb_available { "DuckDB's in-memory store" } else { "DataFusion" },
+                ),
+                "single_engine".to_string(),
+                1.0,
+                None,
+                None,
+            )
+        }
+        "full_scan" | "ordered_scan" => {
+            let engine = if duckdb_available { "Rake DuckDB" } else { "Rake DataFusion" };
+            (
+                engine.to_string(),
+                format!(
+                    "{} is the default for full/ordered scans. {} provides fast sequential scan throughput.",
+                    engine,
+                    if duckdb_available { "DuckDB's httpfs" } else { "DataFusion" },
+                ),
+                "single_engine".to_string(),
+                1.0,
+                None,
+                None,
+            )
+        }
+        _ => (
+            "Rake DataFusion".to_string(),
+            "DataFusion is the default engine for unclassified query types.".to_string(),
+            "single_engine".to_string(),
+            1.0,
+            None,
+            None,
+        ),
+    }
+}
+
+/// Build alternative strategy suggestions based on query type.
+fn build_alternatives(query_type: &str) -> Vec<AlternativeStrategy> {
+    let mut alts = Vec::new();
+
+    match query_type {
+        "scan_aggregate" | "full_scan" | "ordered_scan" => {
+            alts.push(AlternativeStrategy {
+                strategy: "parallel_fanout".to_string(),
+                description: "Split partitions across DuckDB + Polars, DataFusion merges".to_string(),
+                when: "Use for very large scans (>1GB) with simple aggregations".to_string(),
+            });
+            alts.push(AlternativeStrategy {
+                strategy: "scan_handoff".to_string(),
+                description: "DuckDB scans S3 -> Arrow handoff -> DataFusion joins".to_string(),
+                when: "Use when query involves joins across multiple tables".to_string(),
+            });
+        }
+        "join" | "complex_join" => {
+            alts.push(AlternativeStrategy {
+                strategy: "scan_handoff".to_string(),
+                description: "DuckDB scans S3 -> Arrow handoff -> DataFusion joins".to_string(),
+                when: "Use when scan component is the bottleneck (large tables with selective joins)".to_string(),
+            });
+            alts.push(AlternativeStrategy {
+                strategy: "parallel_fanout".to_string(),
+                description: "Split partitions across DuckDB + Polars, DataFusion merges".to_string(),
+                when: "Use for hash-partitioned tables where each partition can be joined independently".to_string(),
+            });
+        }
+        "point_lookup" => {
+            alts.push(AlternativeStrategy {
+                strategy: "single_engine".to_string(),
+                description: "Route directly to DuckDB for sub-millisecond point lookups".to_string(),
+                when: "Default for point lookups — no orchestration overhead needed".to_string(),
+            });
+        }
+        _ => {}
+    }
+
+    alts
+}
+
+/// Request body for migration recommend endpoint.
+#[derive(Deserialize)]
+struct MigrationRecommendRequest {
+    /// The SQL query to analyze and recommend an engine for.
+    sql: String,
+}
+
+/// POST /api/v1/migration/recommend — analyze a SQL query and recommend the optimal engine.
+///
+/// Uses the engine performance tracker history (built up from comparison runs) to make
+/// adaptive recommendations. Falls back to heuristic defaults when no history exists.
+async fn migration_recommend(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<MigrationRecommendRequest>,
+) -> Json<serde_json::Value> {
+    let query_type = classify_query_for_engine(&req.sql);
+    let tracker = state.engine_tracker.read().await;
+
+    let (recommendation, alternatives) = build_recommendation(
+        &query_type,
+        &tracker,
+        state.duckdb_available(),
+        state.polars_available(),
+    );
+
+    let history_count = tracker.history.iter()
+        .filter(|r| r.query_type == query_type)
+        .count();
+
+    Json(serde_json::json!({
+        "sql": req.sql,
+        "query_type": query_type,
+        "recommendation": recommendation,
+        "alternatives": alternatives,
+        "history_based": history_count > 0,
+        "history_entries": history_count,
     }))
 }

@@ -12,6 +12,7 @@ const VectorSearch = lazy(() => import('./pages/VectorSearch').then(m => ({ defa
 const Transforms = lazy(() => import('./pages/Transforms').then(m => ({ default: m.Transforms })))
 const Scheduler = lazy(() => import('./pages/Scheduler').then(m => ({ default: m.Scheduler })))
 const Benchmarks = lazy(() => import('./pages/Benchmarks').then(m => ({ default: m.Benchmarks })))
+const Migration = lazy(() => import('./pages/Migration').then(m => ({ default: m.Migration })))
 const EngineMetrics = lazy(() => import('./pages/EngineMetrics').then(m => ({ default: m.EngineMetrics })))
 const DataQuality = lazy(() => import('./pages/DataQuality').then(m => ({ default: m.DataQuality })))
 const QueryHistory = lazy(() => import('./pages/QueryHistory').then(m => ({ default: m.QueryHistory })))
@@ -40,6 +41,7 @@ export default function App() {
           <Route path="transforms" element={<Suspense fallback={<PageLoader />}><Transforms /></Suspense>} />
           <Route path="scheduler" element={<Suspense fallback={<PageLoader />}><Scheduler /></Suspense>} />
           <Route path="benchmarks" element={<Suspense fallback={<PageLoader />}><Benchmarks /></Suspense>} />
+          <Route path="migration" element={<Suspense fallback={<PageLoader />}><Migration /></Suspense>} />
           <Route path="metrics" element={<Suspense fallback={<PageLoader />}><EngineMetrics /></Suspense>} />
           <Route path="quality" element={<Suspense fallback={<PageLoader />}><DataQuality /></Suspense>} />
           <Route path="history" element={<Suspense fallback={<PageLoader />}><QueryHistory /></Suspense>} />

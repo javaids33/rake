@@ -22,6 +22,8 @@ mod mongodb_conn;
 mod providers;
 mod routes;
 mod state;
+mod trino_client;
+mod trino_provider;
 
 use state::{
     load_chat_messages_from_file, load_scheduled_jobs_from_file, load_user_transforms_from_file,
@@ -703,6 +705,12 @@ async fn main() -> anyhow::Result<()> {
     if !jobs.is_empty() {
         tracing::info!(count = jobs.len(), "Loaded persisted scheduled jobs from scheduled_jobs.jsonl");
         *state.scheduled_jobs.get_mut() = jobs;
+    }
+
+    let connections = state::load_connections_from_file();
+    if !connections.is_empty() {
+        tracing::info!(count = connections.len(), "Loaded persisted connections from connections.jsonl");
+        *state.connections.get_mut() = connections;
     }
 
     let state = Arc::new(state);
