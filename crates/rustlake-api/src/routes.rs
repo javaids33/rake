@@ -2637,7 +2637,7 @@ async fn add_connection(
             let user = if req.username.is_empty() { "rustlake".to_string() } else { req.username.clone() };
             let pass = req.password.clone();
             let catalog = if req.database.is_empty() { "postgresql".to_string() } else { req.database.clone() };
-            let base_url = format!("http://{}:{}", req.host, req.port);
+            let base_url = trino_base_url(&req.host, req.port);
 
             let client = reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
@@ -5276,7 +5276,12 @@ async fn test_connection(
     }
 
     // ── Check 2: DNS resolution ──
-    let addr_str = format!("{}:{}", req.host, port);
+    // Strip scheme from host if user passed a full URL (e.g. https://trino.example.com)
+    let clean_host = req.host
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_end_matches('/');
+    let addr_str = format!("{}:{}", clean_host, port);
     let dns_ok = match tokio::net::lookup_host(&addr_str).await {
         Ok(mut addrs) => {
             if let Some(addr) = addrs.next() {
@@ -5296,7 +5301,7 @@ async fn test_connection(
     if !dns_ok {
         return Json(ConnectionTestResponse {
             success: false,
-            message: format!("Cannot resolve host '{}'", req.host),
+            message: format!("Cannot resolve host '{}'", clean_host),
             latency_ms: Some(start.elapsed().as_millis()),
             server_version: None,
             tables_found: None,
@@ -5327,7 +5332,7 @@ async fn test_connection(
     if !tcp_ok {
         return Json(ConnectionTestResponse {
             success: false,
-            message: format!("Cannot reach {}:{}", req.host, port),
+            message: format!("Cannot reach {}:{}", clean_host, port),
             latency_ms: Some(start.elapsed().as_millis()),
             server_version: None,
             tables_found: None,
@@ -5392,7 +5397,7 @@ async fn test_connection(
         "trino" | "presto" => {
             let user = req.username.as_deref().unwrap_or("rustlake");
             let pass = req.password.as_deref().unwrap_or("");
-            let base_url = format!("http://{}:{}", req.host, port);
+            let base_url = trino_base_url(&req.host, port);
 
             // Check 4a: HTTP /v1/info — server status
             let client = reqwest::Client::builder()
@@ -5597,6 +5602,23 @@ fn required_fields_for(conn_type: &str) -> Vec<String> {
 }
 
 // ── Trino helpers ─────────────────────────────────────────────────
+
+/// Build the base URL for a Trino connection.
+///
+/// Handles:
+/// - Full URLs: `https://trino.example.com` → used as-is
+/// - Port 443 → defaults to HTTPS
+/// - Everything else → HTTP with explicit port
+fn trino_base_url(host: &str, port: u16) -> String {
+    // If the host already includes a scheme, use it directly
+    if host.starts_with("http://") || host.starts_with("https://") {
+        host.trim_end_matches('/').to_string()
+    } else if port == 443 {
+        format!("https://{}", host)
+    } else {
+        format!("http://{}:{}", host, port)
+    }
+}
 
 /// Map Trino SQL types to Arrow DataType.
 fn trino_type_to_arrow(trino_type: &str) -> arrow::datatypes::DataType {

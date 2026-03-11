@@ -331,8 +331,8 @@ enum QueryAnalysis {
     },
     /// A join query (SELECT ... FROM t1 JOIN t2 ON ...).
     JoinQuery {
-        left_table: String,
-        right_table: String,
+        _left_table: String,
+        _right_table: String,
     },
     /// Simple expression (SELECT 1+1, no tables).
     Simple,
@@ -396,8 +396,8 @@ fn analyze_plan(plan: &LogicalPlan) -> QueryAnalysis {
             };
 
             QueryAnalysis::JoinQuery {
-                left_table,
-                right_table,
+                _left_table: left_table,
+                _right_table: right_table,
             }
         }
         LogicalPlan::TableScan(scan) => {

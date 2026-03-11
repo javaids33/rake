@@ -53,6 +53,7 @@ pub struct QueryHistoryEntry {
     pub engine: String,
 }
 
+#[allow(dead_code)] // Used by serde(default) on QueryHistoryEntry::engine
 fn default_engine_name() -> String {
     "DataFusion".to_string()
 }
@@ -246,6 +247,7 @@ pub struct S3Config {
     pub endpoint: String,
     pub access_key: String,
     #[serde(skip_serializing)]
+    #[allow(dead_code)] // Written on creation, read when initiating S3 operations
     pub secret_key: String,
     pub bucket: String,
     pub region: String,
