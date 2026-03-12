@@ -9,7 +9,8 @@ import { Tabs } from '../components/ui/Tabs'
 import { EmptyState } from '../components/ui/EmptyState'
 import { StatusDot } from '../components/ui/StatusDot'
 import { cn } from '../lib/utils'
-import { getConnections, addConnection, deleteConnection, getConnectionStatus, getS3Configs, addS3Config, deleteS3Config, uploadFile, registerTable, testConnection } from '../api/client'
+import { getConnections, addConnection, deleteConnection, getS3Configs, addS3Config, deleteS3Config, uploadFile, registerTable, testConnection } from '../api/client'
+import { useServerEvents } from '../components/layout/Shell'
 import type { ConnectionEntry, S3Config, ConnectionTestResponse } from '../types'
 import {
   FolderInput, Database, HardDrive, Upload, Plus, Trash2,
@@ -242,51 +243,29 @@ export function DataSources() {
     setTesting(false)
   }
 
-  // Poll syncing connections for status updates
-  const syncingRef = useRef<Set<string>>(new Set())
+  // Subscribe to SSE connection sync events instead of polling
+  const { onConnectionSync } = useServerEvents()
 
-  const pollSyncStatus = useCallback(async (connId: string) => {
-    if (syncingRef.current.has(connId)) return // already polling
-    syncingRef.current.add(connId)
-    const poll = async () => {
-      try {
-        const status = await getConnectionStatus(connId)
-        if (status.sync_status === 'ready') {
-          syncingRef.current.delete(connId)
-          setConnections(prev => prev.map(c =>
-            c.id === connId ? { ...c, tables: status.tables, sync_status: 'ready', sync_error: undefined } : c
-          ))
-          toast.success(`${status.table_count} tables discovered`, { id: `sync-${connId}` })
-          return
-        }
-        if (status.sync_status === 'error') {
-          syncingRef.current.delete(connId)
-          setConnections(prev => prev.map(c =>
-            c.id === connId ? { ...c, sync_status: 'error', sync_error: status.sync_error || 'Unknown error' } : c
-          ))
-          toast.error(`Sync failed: ${status.sync_error}`, { id: `sync-${connId}` })
-          return
-        }
-        // Still syncing — update table count if growing
-        setConnections(prev => prev.map(c =>
-          c.id === connId && status.tables.length > (c.tables?.length || 0)
-            ? { ...c, tables: status.tables }
-            : c
-        ))
-        setTimeout(poll, 2000) // poll every 2s
-      } catch {
-        syncingRef.current.delete(connId)
-      }
-    }
-    poll()
-  }, [])
-
-  // On mount, start polling any connections that are still syncing
   useEffect(() => {
-    connections.forEach(c => {
-      if (c.sync_status === 'syncing') pollSyncStatus(c.id)
+    const unsub = onConnectionSync((event) => {
+      setConnections(prev => prev.map(c => {
+        if (c.id !== event.id) return c
+        if (event.sync_status === 'ready') {
+          toast.success(`${event.table_count} tables discovered`, { id: `sync-${event.id}` })
+          return { ...c, tables: event.tables, sync_status: 'ready', sync_error: undefined }
+        }
+        if (event.sync_status === 'error') {
+          toast.error(`Sync failed: ${event.sync_error}`, { id: `sync-${event.id}` })
+          return { ...c, sync_status: 'error', sync_error: event.sync_error || 'Unknown error' }
+        }
+        // Still syncing — update tables if growing
+        return event.tables.length > (c.tables?.length || 0)
+          ? { ...c, tables: event.tables }
+          : c
+      }))
     })
-  }, [connections.length]) // eslint-disable-line react-hooks/exhaustive-deps
+    return unsub
+  }, [onConnectionSync])
 
   const handleConnect = async () => {
     if (!selectedConnector || !connName.trim()) return
@@ -330,10 +309,7 @@ export function DataSources() {
         setConnections(prev => [...prev, newConn])
         setTab('active')
         toast.loading('Discovering tables in background...', { id: `sync-${result.id}`, duration: 30000 })
-        // Start polling for this connection
-        if (result.sync_status === 'syncing') {
-          pollSyncStatus(result.id)
-        }
+        // SSE will push sync status updates automatically
       } else if (selectedConnector.category === 'format') {
         if (configValues.path || configValues.catalog_uri) {
           await registerTable(configValues.path || configValues.catalog_uri)

@@ -5445,6 +5445,7 @@ dependencies = [
  "arrow-cast 57.3.0",
  "arrow-json",
  "arrow-schema 57.3.0",
+ "async-stream",
  "async-trait",
  "axum",
  "chrono",

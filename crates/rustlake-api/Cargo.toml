@@ -52,4 +52,5 @@ object_store = { workspace = true }
 url = "2"
 futures = { workspace = true }
 async-trait = { workspace = true }
+async-stream = { workspace = true }
 regex = "1"

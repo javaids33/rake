@@ -5,6 +5,7 @@ use std::time::Instant;
 use arrow::array::{Array, RecordBatch};
 use axum::extract::{Multipart, Path, Query, State};
 use axum::http::StatusCode;
+use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use chrono::{DateTime, Utc};
@@ -712,10 +713,10 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/api/v1/migration/{conn_id}/register", post(migration_register))
         .route("/api/v1/migration/credentials", post(migration_credentials))
         .route("/api/v1/migration/compare", post(migration_compare))
-        .route("/api/v1/migration/recommend", post(migration_recommend))
         .route("/api/v1/migration/{conn_id}/tables", get(migration_tables))
         .route("/api/v1/migration/comparisons", get(migration_comparisons))
-        .route("/api/v1/migration/readonly", get(migration_readonly_tables))
+        // Server-Sent Events — replaces polling for metrics/health/tables
+        .route("/api/v1/events", get(event_stream))
 }
 
 // ── Handlers ───────────────────────────────────────────────────────
@@ -734,6 +735,91 @@ async fn health() -> Json<HealthResponse> {
         version: env!("CARGO_PKG_VERSION").to_string(),
         engine: "DataFusion".to_string(),
     })
+}
+
+/// GET /api/v1/events — Server-Sent Events stream.
+///
+/// Pushes a combined `status` event every 5 seconds containing health, system
+/// metrics, table count, and engine info. Replaces 3+ polling intervals on the
+/// frontend with a single persistent connection. Also pushes one-off events
+/// for connection sync status changes.
+async fn event_stream(
+    State(state): State<Arc<AppState>>,
+) -> Sse<impl futures::Stream<Item = Result<Event, std::convert::Infallible>>> {
+    let stream = async_stream::stream! {
+        // Track last-seen connection sync statuses so we can push deltas
+        let mut last_sync: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+
+        loop {
+            // ── Build combined status payload ─────────────────────
+            let total_queries = state.query_count.load(Ordering::Relaxed);
+            let uptime = state.start_time.elapsed().as_secs();
+            let (load_1m, _load_5m, cpu_percent) = get_load_average();
+            let (mem_used, mem_total) = get_memory_usage();
+            let mem_pct = if mem_total > 0 { (mem_used as f64 / mem_total as f64) * 100.0 } else { 0.0 };
+
+            // Table count (lightweight — just counts, doesn't serialize all table info)
+            let table_count = {
+                let ctx = state.ctx.read().await;
+                ctx.list_tables().await.map(|t| t.len()).unwrap_or(0)
+            };
+
+            // Engine info
+            let mut engines_arr = vec![serde_json::json!({
+                "name": "DataFusion", "version": "51", "status": "running"
+            })];
+            #[cfg(feature = "duckdb")]
+            if let Some(ref dk) = state.duckdb_engine {
+                engines_arr.push(serde_json::json!({
+                    "name": "DuckDB", "version": dk.version(), "status": "running"
+                }));
+            }
+            #[cfg(feature = "polars")]
+            if let Some(ref pl) = state.polars_engine {
+                engines_arr.push(serde_json::json!({
+                    "name": "Polars", "version": pl.version(), "status": "running"
+                }));
+            }
+
+            let payload = serde_json::json!({
+                "health": "ok",
+                "cpu": (cpu_percent * 10.0).round() / 10.0,
+                "mem_used": mem_used,
+                "mem_total": mem_total,
+                "mem_pct": (mem_pct * 10.0).round() / 10.0,
+                "load_1m": load_1m,
+                "total_queries": total_queries,
+                "uptime": uptime,
+                "tables": table_count,
+                "engines": engines_arr,
+            });
+
+            yield Ok(Event::default().event("status").data(payload.to_string()));
+
+            // ── Check connection sync status changes ──────────────
+            {
+                let conns = state.connections.read().await;
+                for conn in conns.iter() {
+                    let prev = last_sync.get(&conn.id).map(|s| s.as_str()).unwrap_or("");
+                    if conn.sync_status != prev {
+                        last_sync.insert(conn.id.clone(), conn.sync_status.clone());
+                        let sync_event = serde_json::json!({
+                            "id": conn.id,
+                            "sync_status": conn.sync_status,
+                            "sync_error": conn.sync_error,
+                            "tables": conn.tables,
+                            "table_count": conn.tables.len(),
+                        });
+                        yield Ok(Event::default().event("connection_sync").data(sync_event.to_string()));
+                    }
+                }
+            }
+
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        }
+    };
+
+    Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
 async fn execute_sql(
@@ -6679,11 +6765,14 @@ async fn migration_credentials(
 /// POST /api/v1/migration/:conn_id/discover — discover Iceberg tables.
 ///
 /// Strategy (fast path first):
-/// 1. Query `system.metadata.catalogs` to find Iceberg catalogs (1 Trino query)
-/// 2. Get warehouse location from catalog properties (1 Trino query per catalog)
-/// 3. Scan S3 warehouse directly for databases/tables (no more Trino queries)
-/// 4. Read Iceberg metadata.json from S3 for schema info
-/// 5. Fallback: if no S3 creds or warehouse location, use Trino SHOW CREATE TABLE
+/// Minimal-stress Trino migration discovery. Two phases:
+///
+/// **Phase 1 (no S3 creds)**: Query Trino for Iceberg catalog names and warehouse
+/// locations only. Return the required S3 buckets so the UI can prompt for credentials.
+///
+/// **Phase 2 (S3 creds available)**: Re-discover catalogs + warehouses (same light
+/// Trino queries), then scan S3 directly via `scan_warehouse()`. If S3 scan fails
+/// for a catalog, log a warning and skip it — never fall back to Trino.
 async fn migration_discover(
     State(state): State<Arc<AppState>>,
     Path(conn_id): Path<String>,
@@ -6693,154 +6782,166 @@ async fn migration_discover(
 
     #[cfg(feature = "duckdb")]
     {
-        // Step 1: Find Iceberg catalogs via system.metadata.catalogs (1 fast query)
+        // ── Phase 1: Discover Iceberg catalogs and warehouse locations (light Trino queries) ──
+        tracing::info!("Phase 1: Querying Trino for Iceberg catalogs");
+
         let iceberg_catalogs = conn.rest.list_iceberg_catalogs().await
             .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e })))?;
 
-        tracing::info!(catalogs = ?iceberg_catalogs, "Migration discovery: Iceberg catalogs found");
+        tracing::info!(count = iceberg_catalogs.len(), catalogs = ?iceberg_catalogs, "Found Iceberg catalogs");
 
-        // Check if we have S3 credentials for direct scanning
+        // For each Iceberg catalog, get the warehouse location (1 Trino query per catalog)
+        let mut warehouse_locations: Vec<(String, String)> = Vec::new(); // (catalog, warehouse_path)
+        let mut required_buckets: Vec<String> = Vec::new();
+
+        for catalog in &iceberg_catalogs {
+            tracing::info!(catalog = %catalog, "Getting warehouse location for catalog");
+            let warehouse = crate::iceberg_s3::get_warehouse_location_from_trino(&conn.rest, catalog).await;
+
+            if let Some(warehouse_path) = warehouse {
+                tracing::info!(catalog = %catalog, warehouse = %warehouse_path, "Catalog warehouse location");
+                // Extract bucket name from s3://bucket/path
+                if let Some(bucket) = warehouse_path.strip_prefix("s3://")
+                    .or_else(|| warehouse_path.strip_prefix("s3a://"))
+                    .and_then(|rest| rest.split('/').next())
+                {
+                    if !required_buckets.contains(&bucket.to_string()) {
+                        required_buckets.push(bucket.to_string());
+                    }
+                }
+                warehouse_locations.push((catalog.clone(), warehouse_path));
+            } else {
+                tracing::warn!(catalog = %catalog, "No warehouse location found, skipping catalog");
+            }
+        }
+
+        tracing::info!(buckets = ?required_buckets, "Required S3 buckets");
+
+        // ── Check for S3 credentials ──
         let s3_creds = state.migration_s3_creds.read().await;
         let has_s3_creds = !s3_creds.is_empty();
         let default_creds = s3_creds.values().next().cloned();
         drop(s3_creds);
 
-        let mut tables: Vec<MigrationTable> = Vec::new();
-        let mut discovery_method = "trino";
+        if !has_s3_creds {
+            // Phase 1 response: return catalog info so UI can prompt for S3 keys
+            let elapsed_ms = start.elapsed().as_millis();
+            tracing::info!(elapsed_ms = elapsed_ms, "Phase 1 complete — awaiting S3 credentials");
 
-        if has_s3_creds {
-            if let Some(default_bucket_creds) = default_creds {
-                let access_key = default_bucket_creds.access_key.clone();
-                let secret_key = default_bucket_creds.secret_key.clone();
-                let region = default_bucket_creds.region.clone();
-                // Fast path: S3 direct scanning for each Iceberg catalog
-                for catalog in &iceberg_catalogs {
-                    // Get warehouse location (1 Trino query per catalog)
-                    let warehouse = crate::iceberg_s3::get_warehouse_location_from_trino(&conn.rest, catalog).await;
-
-                    if let Some(warehouse_path) = warehouse {
-                        // Extract bucket from s3://bucket/path
-                        if let Some(bucket) = warehouse_path.strip_prefix("s3://")
-                            .or_else(|| warehouse_path.strip_prefix("s3a://"))
-                            .and_then(|rest| rest.split('/').next())
-                        {
-                            // Check if we have creds for this specific bucket, or use default
-                            let s3_creds = state.migration_s3_creds.read().await;
-                            let bucket_creds = s3_creds.get(bucket).cloned();
-                            drop(s3_creds);
-                            let ak = bucket_creds.as_ref().map(|c| c.access_key.as_str()).unwrap_or(&access_key);
-                            let sk = bucket_creds.as_ref().map(|c| c.secret_key.as_str()).unwrap_or(&secret_key);
-                            let reg = bucket_creds.as_ref().map(|c| c.region.as_str()).unwrap_or(&region);
-
-                            match crate::iceberg_s3::build_s3_store(bucket, ak, sk, reg, None) {
-                                Ok(store) => {
-                                    match crate::iceberg_s3::scan_warehouse(&store, &warehouse_path).await {
-                                        Ok(scan_result) => {
-                                            discovery_method = "s3_direct";
-                                            tracing::info!(
-                                                catalog = %catalog,
-                                                tables = scan_result.total_tables,
-                                                databases = scan_result.databases.len(),
-                                                elapsed_ms = scan_result.scan_duration_ms,
-                                                "S3 direct scan complete for catalog"
-                                            );
-
-                                            for table_info in &scan_result.tables {
-                                                tables.push(MigrationTable {
-                                                    conn_id: conn_id.clone(),
-                                                    catalog: catalog.clone(),
-                                                    schema_name: table_info.database.clone(),
-                                                    table_name: table_info.table_name.clone(),
-                                                    format: "iceberg".to_string(),
-                                                    location: Some(table_info.s3_location.clone()),
-                                                    metastore_uri: None,
-                                                    column_count: table_info.column_count,
-                                                    row_count: None,
-                                                    registered_in_rake: false,
-                                                    rake_table_name: None,
-                                                    status: "discovered".to_string(),
-                                                    error: None,
-                                                });
-                                            }
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!(catalog = %catalog, error = %e, "S3 scan failed, falling back to Trino");
-                                            // Fall through to Trino-based discovery for this catalog
-                                            discover_via_trino(&conn, catalog, &conn_id, &mut tables).await;
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::warn!(bucket = %bucket, error = %e, "S3 store build failed");
-                                    discover_via_trino(&conn, catalog, &conn_id, &mut tables).await;
-                                }
-                            }
-                        } else {
-                            discover_via_trino(&conn, catalog, &conn_id, &mut tables).await;
-                        }
-                    } else {
-                        tracing::info!(catalog = %catalog, "No warehouse location found, using Trino discovery");
-                        discover_via_trino(&conn, catalog, &conn_id, &mut tables).await;
-                    }
-                }
-
-                // Also scan non-Iceberg catalogs via Trino browse (they won't have S3 warehouses)
-                let tree = conn.browse().await.unwrap_or_else(|_| crate::trino_client::TrinoCatalogTree {
-                    catalogs: vec![], cached_at: None, total_tables: 0,
-                });
-                for cat_entry in &tree.catalogs {
-                    if iceberg_catalogs.contains(&cat_entry.name) {
-                        continue; // Already handled via S3
-                    }
-                    for schema_entry in &cat_entry.schemas {
-                        for table_name in &schema_entry.tables {
-                            tables.push(MigrationTable {
-                                conn_id: conn_id.clone(),
-                                catalog: cat_entry.name.clone(),
-                                schema_name: schema_entry.name.clone(),
-                                table_name: table_name.clone(),
-                                format: if cat_entry.name.to_lowercase() == "tpch" { "tpch" } else { "jdbc" }.to_string(),
-                                location: None,
-                                metastore_uri: None,
-                                column_count: 0,
-                                row_count: None,
-                                registered_in_rake: false,
-                                rake_table_name: None,
-                                status: "discovered".to_string(),
-                                error: None,
-                            });
-                        }
-                    }
-                }
-            }
+            return Ok(Json(serde_json::json!({
+                "status": "awaiting_credentials",
+                "conn_id": conn_id,
+                "discovery_method": "trino_metadata_only",
+                "phase": 1,
+                "iceberg_catalogs": iceberg_catalogs,
+                "warehouse_locations": warehouse_locations.iter()
+                    .map(|(cat, wh)| serde_json::json!({"catalog": cat, "warehouse": wh}))
+                    .collect::<Vec<_>>(),
+                "required_s3_buckets": required_buckets,
+                "table_count": 0,
+                "tables": [],
+                "elapsed_ms": elapsed_ms,
+            })));
         }
 
-        // Fallback: no S3 creds — use full Trino discovery
-        if tables.is_empty() && !has_s3_creds {
-            discovery_method = "trino";
-            let tree = conn.browse().await
-                .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e })))?;
+        // ── Phase 2: Scan S3 directly for each Iceberg catalog ──
+        let default_bucket_creds = default_creds.unwrap(); // safe: has_s3_creds is true
+        let access_key = default_bucket_creds.access_key.clone();
+        let secret_key = default_bucket_creds.secret_key.clone();
+        let region = default_bucket_creds.region.clone();
 
-            for cat_entry in &tree.catalogs {
-                discover_via_trino(&conn, &cat_entry.name, &conn_id, &mut tables).await;
+        let mut tables: Vec<MigrationTable> = Vec::new();
+
+        for (catalog, warehouse_path) in &warehouse_locations {
+            tracing::info!(catalog = %catalog, warehouse = %warehouse_path, "Phase 2: Scanning S3 directly for catalog");
+
+            let bucket = match warehouse_path.strip_prefix("s3://")
+                .or_else(|| warehouse_path.strip_prefix("s3a://"))
+                .and_then(|rest| rest.split('/').next())
+            {
+                Some(b) => b,
+                None => {
+                    tracing::warn!(catalog = %catalog, warehouse = %warehouse_path, "Could not extract bucket from warehouse path, skipping");
+                    continue;
+                }
+            };
+
+            // Use bucket-specific creds if available, otherwise default
+            let s3_creds = state.migration_s3_creds.read().await;
+            let bucket_creds = s3_creds.get(bucket).cloned();
+            drop(s3_creds);
+            let ak = bucket_creds.as_ref().map(|c| c.access_key.as_str()).unwrap_or(&access_key);
+            let sk = bucket_creds.as_ref().map(|c| c.secret_key.as_str()).unwrap_or(&secret_key);
+            let reg = bucket_creds.as_ref().map(|c| c.region.as_str()).unwrap_or(&region);
+
+            let store = match crate::iceberg_s3::build_s3_store(bucket, ak, sk, reg, None) {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(catalog = %catalog, bucket = %bucket, error = %e, "S3 store build failed, skipping catalog");
+                    continue;
+                }
+            };
+
+            match crate::iceberg_s3::scan_warehouse(&store, warehouse_path).await {
+                Ok(scan_result) => {
+                    tracing::info!(
+                        catalog = %catalog,
+                        tables = scan_result.total_tables,
+                        databases = scan_result.databases.len(),
+                        elapsed_ms = scan_result.scan_duration_ms,
+                        "S3 direct scan complete for catalog"
+                    );
+
+                    for table_info in &scan_result.tables {
+                        tables.push(MigrationTable {
+                            conn_id: conn_id.clone(),
+                            catalog: catalog.clone(),
+                            schema_name: table_info.database.clone(),
+                            table_name: table_info.table_name.clone(),
+                            format: "iceberg".to_string(),
+                            location: Some(table_info.s3_location.clone()),
+                            metastore_uri: None,
+                            column_count: table_info.column_count,
+                            row_count: None,
+                            registered_in_rake: false,
+                            rake_table_name: None,
+                            status: "discovered".to_string(),
+                            error: None,
+                        });
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(catalog = %catalog, error = %e, "S3 scan failed, skipping catalog (no Trino fallback)");
+                }
             }
         }
 
         let total_count = tables.len();
-        let iceberg_count = tables.iter().filter(|t| t.format == "iceberg").count();
         let with_location = tables.iter().filter(|t| t.location.is_some()).count();
         let elapsed_ms = start.elapsed().as_millis();
+
+        tracing::info!(
+            total_tables = total_count,
+            with_location = with_location,
+            elapsed_ms = elapsed_ms,
+            "Phase 2 complete"
+        );
 
         *state.migration_tables.write().await = tables.clone();
 
         Ok(Json(serde_json::json!({
             "status": "discovered",
             "conn_id": conn_id,
-            "discovery_method": discovery_method,
+            "discovery_method": "s3_direct",
+            "phase": 2,
             "table_count": total_count,
-            "iceberg_table_count": iceberg_count,
+            "iceberg_table_count": total_count,
             "tables_with_s3_location": with_location,
             "iceberg_catalogs": iceberg_catalogs,
+            "warehouse_locations": warehouse_locations.iter()
+                .map(|(cat, wh)| serde_json::json!({"catalog": cat, "warehouse": wh}))
+                .collect::<Vec<_>>(),
+            "required_s3_buckets": required_buckets,
             "tables": tables,
             "elapsed_ms": elapsed_ms,
         })))
@@ -6850,109 +6951,6 @@ async fn migration_discover(
         let _ = (conn, start);
         Err((StatusCode::SERVICE_UNAVAILABLE, Json(ErrorResponse { error: "DuckDB feature required for migration discover".into() })))
     }
-}
-
-/// Trino-based table discovery fallback: SHOW CREATE TABLE per table.
-/// Used when S3 credentials aren't available or S3 scan fails.
-#[cfg(feature = "duckdb")]
-async fn discover_via_trino(
-    conn: &crate::trino_client::TrinoConnection,
-    catalog: &str,
-    conn_id: &str,
-    tables: &mut Vec<MigrationTable>,
-) {
-    use futures::stream::{self, StreamExt};
-
-    // Get schemas and tables from cache
-    let schemas = conn.rest.list_schemas(catalog).await.unwrap_or_default();
-
-    // Collect all (schema, table) pairs
-    let mut schema_tables: Vec<(String, String)> = Vec::new();
-    for schema in &schemas {
-        let tbl_names = conn.rest.list_tables(catalog, schema).await.unwrap_or_default();
-        for t in tbl_names {
-            schema_tables.push((schema.clone(), t));
-        }
-    }
-
-    // Run SHOW CREATE TABLE in parallel (up to 8 concurrent) for Iceberg detection
-    let results: Vec<MigrationTable> = stream::iter(schema_tables)
-        .map(|(schema, table_name)| {
-            let rest = &conn.rest;
-            let catalog = catalog.to_string();
-            let conn_id = conn_id.to_string();
-            async move {
-                let show_sql = format!("SHOW CREATE TABLE \"{}\".\"{}\".\"{}\"\n", catalog, schema, table_name);
-                let (format, location, metastore_uri) = match rest.execute_query(&show_sql, &catalog).await {
-                    Ok(result) => {
-                        let ddl_text: String = result.rows.iter()
-                            .filter_map(|row| row.first().and_then(|v| v.as_str()))
-                            .collect::<Vec<_>>().join("\n").to_lowercase();
-
-                        let fmt = if ddl_text.contains("iceberg") {
-                            "iceberg"
-                        } else if ddl_text.contains("delta") {
-                            "delta"
-                        } else if ddl_text.contains("hive") {
-                            "hive"
-                        } else if catalog.to_lowercase() == "tpch" {
-                            "tpch"
-                        } else {
-                            "jdbc"
-                        };
-
-                        let loc = extract_quoted_property(&ddl_text, "external_location")
-                            .or_else(|| extract_quoted_property(&ddl_text, "location"));
-                        let metastore = extract_quoted_property(&ddl_text, "hive.metastore.uri")
-                            .or_else(|| extract_quoted_property(&ddl_text, "thrift.uri"));
-
-                        (fmt.to_string(), loc, metastore)
-                    }
-                    Err(_) => {
-                        let fmt = if catalog.to_lowercase() == "tpch" { "tpch" } else { "jdbc" };
-                        (fmt.to_string(), None, None)
-                    }
-                };
-
-                MigrationTable {
-                    conn_id,
-                    catalog: catalog.clone(),
-                    schema_name: schema,
-                    table_name,
-                    format,
-                    location,
-                    metastore_uri,
-                    column_count: 0,
-                    row_count: None,
-                    registered_in_rake: false,
-                    rake_table_name: None,
-                    status: "discovered".to_string(),
-                    error: None,
-                }
-            }
-        })
-        .buffer_unordered(8)
-        .collect()
-        .await;
-
-    tables.extend(results);
-}
-
-/// Extract a quoted property value from a DDL string.
-/// Looks for patterns like `property_name = 'value'` or `property_name='value'`.
-fn extract_quoted_property(ddl: &str, property: &str) -> Option<String> {
-    ddl.split(property)
-        .nth(1)
-        .and_then(|s| {
-            let trimmed = s.trim_start();
-            let after_eq = trimmed.strip_prefix('=')
-                .unwrap_or(trimmed)
-                .trim_start();
-            let start = after_eq.find('\'')?;
-            let rest = &after_eq[start + 1..];
-            let end = rest.find('\'')?;
-            Some(rest[..end].to_string())
-        })
 }
 
 /// POST /api/v1/migration/:conn_id/register — register discovered Iceberg tables into Rake.
@@ -7638,18 +7636,6 @@ async fn migration_comparisons(
     }))
 }
 
-/// GET /api/v1/migration/readonly — list all read-only migration tables.
-async fn migration_readonly_tables(
-    State(state): State<Arc<AppState>>,
-) -> Json<serde_json::Value> {
-    let read_only = state.read_only_tables.read().await;
-    let tables: Vec<&String> = read_only.iter().collect();
-    Json(serde_json::json!({
-        "tables": tables,
-        "count": tables.len(),
-    }))
-}
-
 /// Extract the target table name from DDL/DML SQL (uppercased input).
 ///
 /// Handles: INSERT INTO table, UPDATE table, DELETE FROM table,
@@ -7942,41 +7928,3 @@ fn build_alternatives(query_type: &str) -> Vec<AlternativeStrategy> {
     alts
 }
 
-/// Request body for migration recommend endpoint.
-#[derive(Deserialize)]
-struct MigrationRecommendRequest {
-    /// The SQL query to analyze and recommend an engine for.
-    sql: String,
-}
-
-/// POST /api/v1/migration/recommend — analyze a SQL query and recommend the optimal engine.
-///
-/// Uses the engine performance tracker history (built up from comparison runs) to make
-/// adaptive recommendations. Falls back to heuristic defaults when no history exists.
-async fn migration_recommend(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<MigrationRecommendRequest>,
-) -> Json<serde_json::Value> {
-    let query_type = classify_query_for_engine(&req.sql);
-    let tracker = state.engine_tracker.read().await;
-
-    let (recommendation, alternatives) = build_recommendation(
-        &query_type,
-        &tracker,
-        state.duckdb_available(),
-        state.polars_available(),
-    );
-
-    let history_count = tracker.history.iter()
-        .filter(|r| r.query_type == query_type)
-        .count();
-
-    Json(serde_json::json!({
-        "sql": req.sql,
-        "query_type": query_type,
-        "recommendation": recommendation,
-        "alternatives": alternatives,
-        "history_based": history_count > 0,
-        "history_entries": history_count,
-    }))
-}

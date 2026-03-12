@@ -8,8 +8,9 @@ import { cn, formatDuration, formatNumber, formatBytes, formatRelativeTime, infe
 import {
   getSystemInfo, getSystemResources, getFlightInfo, getQueryHistory,
   getStreamStatus, getPipelines, getSchedules, getScheduleRuns,
-  getTables, getConnections, getVectorStatus, getSystemMetrics,
+  getTables, getConnections, getVectorStatus,
 } from '../api/client'
+import { useServerEvents } from '../components/layout/Shell'
 import type {
   SystemInfoResponse, SystemResourcesResponse, FlightInfoResponse,
   QueryHistoryEntry, StreamStatusResponse, StreamingPipeline,
@@ -75,14 +76,24 @@ export function EngineMetrics() {
   const [tables, setTables] = useState<TableInfo[]>([])
   const [connections, setConnections] = useState<ConnectionEntry[]>([])
   const [vectorStatus, setVectorStatus] = useState<VectorStatusResponse | null>(null)
-  const [metrics, setMetrics] = useState<SystemMetricsResponse | null>(null)
+  const { status: sseStatus } = useServerEvents()
 
-  useEffect(() => {
-    const load = () => getSystemMetrics().then(setMetrics).catch(() => {})
-    load()
-    const interval = setInterval(load, 5000)
-    return () => clearInterval(interval)
-  }, [])
+  // Derive SystemMetricsResponse-like shape from SSE status
+  const metrics = sseStatus ? {
+    cpu_usage_percent: sseStatus.cpu,
+    memory_used_bytes: sseStatus.mem_used,
+    memory_total_bytes: sseStatus.mem_total,
+    memory_usage_percent: sseStatus.mem_pct,
+    disk_used_bytes: 0,
+    disk_total_bytes: 0,
+    disk_usage_percent: 0,
+    load_avg_1m: sseStatus.load_1m,
+    load_avg_5m: 0,
+    active_queries: 0,
+    total_queries: sseStatus.total_queries,
+    queries_per_second: 0,
+    uptime_seconds: sseStatus.uptime,
+  } : null
 
   useEffect(() => {
     const calls = [

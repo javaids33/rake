@@ -1,8 +1,9 @@
 import { useEffect, useState } from 'react'
-import { getHealth, getSystemMetrics, getEngines, getTables } from '../../api/client'
+import { getEngines } from '../../api/client'
 import { useAppStore } from '../../stores/app'
 import { cn } from '../../lib/utils'
 import type { EngineInfo } from '../../types'
+import type { ServerStatus } from '../../hooks/useEventStream'
 import { Cpu, HardDrive, Database, Zap, Server, Timer } from 'lucide-react'
 
 function formatBytes(bytes: number): string {
@@ -19,68 +20,41 @@ function formatUptime(s: number): string {
   return `${h}h ${m}m`
 }
 
-export function Header() {
-  const [healthy, setHealthy] = useState<boolean | null>(null)
-  const [latency, setLatency] = useState<number | null>(null)
-  const [metrics, setMetrics] = useState<{
-    cpu: number; memUsed: number; memTotal: number; memPct: number
-    totalQueries: number; uptime: number
-  } | null>(null)
+interface HeaderProps {
+  serverStatus: ServerStatus | null
+  sseConnected: boolean
+}
+
+export function Header({ serverStatus, sseConnected }: HeaderProps) {
   const [engines, setEngines] = useState<EngineInfo[]>([])
-  const [tables, setTables] = useState<number>(0)
   const { darkMode } = useAppStore()
 
+  // Fetch full engine info once on mount (SSE gives us a lighter version)
   useEffect(() => {
-    const check = async () => {
-      const start = performance.now()
-      try {
-        await getHealth()
-        setLatency(Math.round(performance.now() - start))
-        setHealthy(true)
-      } catch {
-        setHealthy(false)
-        setLatency(null)
-      }
-    }
-
-    const fetchMetrics = async () => {
-      try {
-        const m = await getSystemMetrics()
-        setMetrics({
-          cpu: m.cpu_usage_percent,
-          memUsed: m.memory_used_bytes,
-          memTotal: m.memory_total_bytes,
-          memPct: m.memory_usage_percent,
-          totalQueries: m.total_queries,
-          uptime: m.uptime_seconds,
-        })
-      } catch {}
-    }
-
-    const fetchEngines = async () => {
-      try {
-        const r = await getEngines()
-        setEngines(r.engines)
-      } catch {}
-    }
-
-    const fetchTables = async () => {
-      try {
-        const r = await getTables()
-        setTables(r.tables?.length ?? 0)
-      } catch {}
-    }
-
-    check()
-    fetchMetrics()
-    fetchEngines()
-    fetchTables()
-    const hId = setInterval(check, 15000)
-    const mId = setInterval(() => { fetchMetrics(); fetchTables() }, 10000)
-    return () => { clearInterval(hId); clearInterval(mId) }
+    getEngines().then(r => setEngines(r.engines)).catch(() => {})
   }, [])
 
-  const runningEngines = engines.filter(e => e.status === 'running')
+  // Derive metrics from SSE status
+  const healthy = sseConnected && serverStatus?.health === 'ok'
+  const metrics = serverStatus ? {
+    cpu: serverStatus.cpu,
+    memUsed: serverStatus.mem_used,
+    memTotal: serverStatus.mem_total,
+    memPct: serverStatus.mem_pct,
+    totalQueries: serverStatus.total_queries,
+    uptime: serverStatus.uptime,
+  } : null
+  const tables = serverStatus?.tables ?? 0
+
+  // Merge SSE engine data with the full engine info fetched once
+  const displayEngines = engines.length > 0 ? engines : (serverStatus?.engines ?? []).map(e => ({
+    name: e.name,
+    version: e.version,
+    status: e.status,
+    role: 'general',
+  }))
+
+  const runningEngines = displayEngines.filter(e => e.status === 'running')
 
   const dim = darkMode ? 'text-zinc-600' : 'text-slate-400'
   const label = darkMode ? 'text-zinc-500' : 'text-slate-500'
@@ -132,7 +106,7 @@ export function Header() {
         <div className="flex items-center gap-1.5">
           <Server className={cn('w-3 h-3', accent)} />
           <div className="flex items-center gap-1">
-            {engines.map(e => (
+            {displayEngines.map(e => (
               <div
                 key={e.name}
                 title={`${e.name} ${e.version} — ${e.status}`}
@@ -151,7 +125,7 @@ export function Header() {
               </div>
             ))}
           </div>
-          <span className={cn('text-2xs', label)}>{runningEngines.length}/{engines.length}</span>
+          <span className={cn('text-2xs', label)}>{runningEngines.length}/{displayEngines.length}</span>
         </div>
 
         {/* Tables */}
@@ -182,16 +156,10 @@ export function Header() {
           </div>
         )}
 
-        {latency !== null && (
-          <div className={cn('flex items-center gap-1.5 text-2xs', dim)}>
-            <span className={cn('font-mono readout', label)}>{latency}ms</span>
-          </div>
-        )}
-
         <div className="flex items-center gap-2">
           <div className="relative">
             <div className={`w-2 h-2 rounded-full ${
-              healthy === null ? 'bg-zinc-500' : healthy ? 'bg-emerald-400' : 'bg-rose-400'
+              serverStatus === null ? 'bg-zinc-500' : healthy ? 'bg-emerald-400' : 'bg-rose-400'
             }`} />
             {healthy && (
               <>
@@ -201,14 +169,14 @@ export function Header() {
             )}
           </div>
           <span className={cn('text-2xs font-medium tracking-wide', {
-            'text-zinc-500': healthy === null && darkMode,
-            'text-slate-400': healthy === null && !darkMode,
+            'text-zinc-500': serverStatus === null && darkMode,
+            'text-slate-400': serverStatus === null && !darkMode,
             'text-emerald-400/80': healthy && darkMode,
             'text-emerald-600': healthy && !darkMode,
-            'text-rose-400': healthy === false && darkMode,
-            'text-rose-600': healthy === false && !darkMode,
+            'text-rose-400': !healthy && serverStatus !== null && darkMode,
+            'text-rose-600': !healthy && serverStatus !== null && !darkMode,
           })}>
-            {healthy === null ? 'CHECKING' : healthy ? 'ONLINE' : 'OFFLINE'}
+            {serverStatus === null ? 'CONNECTING' : healthy ? 'ONLINE' : 'OFFLINE'}
           </span>
         </div>
       </div>
