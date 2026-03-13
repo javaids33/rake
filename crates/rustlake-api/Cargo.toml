@@ -54,3 +54,6 @@ futures = { workspace = true }
 async-trait = { workspace = true }
 async-stream = { workspace = true }
 regex = "1"
+aes-gcm = { workspace = true }
+sha2 = { workspace = true }
+hostname = { workspace = true }

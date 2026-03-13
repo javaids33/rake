@@ -12,13 +12,15 @@ import { Modal } from '../components/ui/Modal'
 import { Input } from '../components/ui/Input'
 import { cn, formatDuration, QUERY_TYPE_COLORS, FORMAT_COLORS, inferFormat } from '../lib/utils'
 import { executeSql, explainSql, estimateQuery, compareSql, getTables, getTableSchema, getConnections, getS3Configs, trinoBrowse, trinoColumns, trinoRefresh } from '../api/client'
+import { useWebSocket } from '../hooks/useWebSocket'
+import type { SqlResponse } from '../types'
 import type { SqlCompareResponse } from '../api/client'
 import type { ChartType, ColumnSchema, ConnectionEntry, S3Config, ExplainResponse, QueryEstimateResponse } from '../types'
 import { Tooltip } from '../components/ui/Tooltip'
 import {
   Play, Plus, X, Table2, BarChart3, LineChart, ScatterChart, PieChart,
   AreaChart, Save, BookOpen, Zap, Clock, Rows3, Terminal, FileSearch, Gauge, ArrowLeftRight, Trophy,
-  ChevronDown, ChevronRight, GitBranch, Radio, Workflow, Database, Plug, Search, Columns3, MousePointerClick, HardDrive, Trash2, RefreshCw, Layers,
+  ChevronDown, ChevronRight, GitBranch, Radio, Workflow, Database, Plug, Search, Columns3, MousePointerClick, HardDrive, Trash2, RefreshCw, Layers, Square, Wifi,
 } from 'lucide-react'
 
 const chartOptions: Array<{ type: ChartType; icon: React.ReactNode; label: string }> = [
@@ -72,6 +74,13 @@ export function SqlEditorPage() {
   const containerRef = useRef<HTMLDivElement>(null)
   const workflowRef = useRef<HTMLDivElement>(null)
   const demoRef = useRef<HTMLDivElement>(null)
+
+  // WebSocket streaming
+  const { connected: wsConnected, sendQuery, cancelQuery } = useWebSocket()
+  const activeQueryIdRef = useRef<string | null>(null)
+  const streamedRowsRef = useRef<Record<string, unknown>[]>([])
+  const streamedColumnsRef = useRef<string[]>([])
+  const rafRef = useRef<number>(0)
 
   // Panel resizer
   const startResize = useCallback((e: React.MouseEvent) => {
@@ -144,21 +153,96 @@ export function SqlEditorPage() {
     getS3Configs().then(r => setS3Configs(r.configs || [])).catch(() => {})
   }, [])
 
+  const handleCancelQuery = useCallback(() => {
+    if (activeQueryIdRef.current) {
+      cancelQuery(activeQueryIdRef.current)
+      activeQueryIdRef.current = null
+    }
+  }, [cancelQuery])
+
   const runQuery = useCallback(async () => {
     const sql = activeTab.sql.trim()
     if (!sql) return
-    store.setLoading(store.activeTabId, true)
-    store.setError(store.activeTabId, null)
+    const tabId = store.activeTabId
+    store.setLoading(tabId, true)
+    store.setError(tabId, null)
+
+    // ── WebSocket streaming path ──
+    if (wsConnected) {
+      const queryId = crypto.randomUUID()
+      activeQueryIdRef.current = queryId
+      streamedRowsRef.current = []
+      streamedColumnsRef.current = []
+
+      sendQuery(queryId, sql, engineChoice, {
+        onStart: () => {
+          store.setResult(tabId, null)
+        },
+        onRows: (msg) => {
+          streamedRowsRef.current = streamedRowsRef.current.concat(msg.rows)
+          if (streamedColumnsRef.current.length === 0) {
+            streamedColumnsRef.current = msg.columns
+          }
+          // Batch UI updates via rAF to avoid per-chunk re-renders
+          cancelAnimationFrame(rafRef.current)
+          rafRef.current = requestAnimationFrame(() => {
+            const partial: SqlResponse = {
+              query_id: queryId,
+              columns: streamedColumnsRef.current,
+              rows: streamedRowsRef.current,
+              row_count: streamedRowsRef.current.length,
+              query_type: 'STREAMING',
+              duration_ms: 0,
+              engine: engineChoice === 'auto' ? 'datafusion' : engineChoice,
+            }
+            store.setResult(tabId, partial)
+          })
+        },
+        onComplete: (msg) => {
+          cancelAnimationFrame(rafRef.current)
+          activeQueryIdRef.current = null
+          const final: SqlResponse = {
+            query_id: msg.query_id,
+            columns: streamedColumnsRef.current,
+            rows: streamedRowsRef.current,
+            row_count: msg.row_count,
+            query_type: msg.query_type,
+            duration_ms: msg.duration_ms,
+            parse_ms: msg.parse_ms,
+            exec_ms: msg.exec_ms,
+            engine: msg.engine,
+          }
+          store.setResult(tabId, final)
+          store.setLoading(tabId, false)
+        },
+        onError: (msg) => {
+          cancelAnimationFrame(rafRef.current)
+          activeQueryIdRef.current = null
+          store.setError(tabId, msg.error)
+          store.setResult(tabId, null)
+          store.setLoading(tabId, false)
+        },
+        onCancelled: () => {
+          cancelAnimationFrame(rafRef.current)
+          activeQueryIdRef.current = null
+          store.setError(tabId, 'Query cancelled')
+          store.setLoading(tabId, false)
+        },
+      })
+      return
+    }
+
+    // ── HTTP fallback path ──
     try {
       const res = await executeSql(sql, engineChoice)
-      store.setResult(store.activeTabId, res)
+      store.setResult(tabId, res)
     } catch (e) {
-      store.setError(store.activeTabId, (e as Error).message)
-      store.setResult(store.activeTabId, null)
+      store.setError(tabId, (e as Error).message)
+      store.setResult(tabId, null)
     } finally {
-      store.setLoading(store.activeTabId, false)
+      store.setLoading(tabId, false)
     }
-  }, [activeTab, store, engineChoice])
+  }, [activeTab, store, engineChoice, wsConnected, sendQuery])
 
   const runExplain = useCallback(async () => {
     const sql = activeTab.sql.trim()
@@ -449,9 +533,22 @@ export function SqlEditorPage() {
             <option value="duckdb">DuckDB</option>
             <option value="polars">Polars</option>
           </select>
+          {wsConnected && (
+            <Tooltip content="WebSocket connected — streaming results enabled">
+              <span className="flex items-center gap-1 px-1.5 py-0.5 rounded text-2xs font-medium text-emerald-400/80 border border-emerald-500/20 bg-emerald-500/5">
+                <Wifi className="w-3 h-3" />
+                <span>Live</span>
+              </span>
+            </Tooltip>
+          )}
           <Button variant="primary" size="sm" icon={<Play className="w-3.5 h-3.5" />} onClick={runQuery} loading={loading}>
             Run
           </Button>
+          {loading && wsConnected && (
+            <Button variant="ghost" size="sm" icon={<Square className="w-3.5 h-3.5 text-red-400" />} onClick={handleCancelQuery}>
+              <span className="text-red-400">Cancel</span>
+            </Button>
+          )}
           <Button variant="ghost" size="sm" icon={<ArrowLeftRight className="w-3.5 h-3.5 text-cyan-400" />} onClick={handleCompare} loading={comparing}>
             <span className="text-cyan-400">Compare All</span>
           </Button>

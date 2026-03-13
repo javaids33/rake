@@ -20,8 +20,10 @@ benchmarks/
 *.swp
 *.swo
 migration_data/
-# Environment (secrets)
+# Environment and credentials (secrets)
 .env
 .env.local
+credentials.enc
+credentials.enc.tmp
 CLAUDE.md
 .gitignore

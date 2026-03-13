@@ -717,6 +717,8 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/api/v1/migration/comparisons", get(migration_comparisons))
         // Server-Sent Events — replaces polling for metrics/health/tables
         .route("/api/v1/events", get(event_stream))
+        // WebSocket
+        .route("/api/v1/ws", get(crate::ws::ws_handler))
 }
 
 // ── Handlers ───────────────────────────────────────────────────────
@@ -979,7 +981,7 @@ async fn execute_sql(
 
 /// Determine which engine to use for this query.
 /// Returns an engine name: "DataFusion", "DuckDB", or "Polars".
-fn determine_engine(state: &AppState, engine_choice: &str, recommended: &EngineTarget) -> &'static str {
+pub(crate) fn determine_engine(state: &AppState, engine_choice: &str, recommended: &EngineTarget) -> &'static str {
     match engine_choice.to_lowercase().as_str() {
         "duckdb" if state.duckdb_available() => "DuckDB",
         "polars" if state.polars_available() => "Polars",
@@ -995,7 +997,7 @@ fn determine_engine(state: &AppState, engine_choice: &str, recommended: &EngineT
 }
 
 /// Execute SQL via DuckDB engine, returning batches or error string.
-async fn execute_via_duckdb(
+pub(crate) async fn execute_via_duckdb(
     state: &AppState,
     sql: &str,
 ) -> std::result::Result<Vec<RecordBatch>, String> {
@@ -1009,7 +1011,7 @@ async fn execute_via_duckdb(
 }
 
 /// Execute SQL via Polars engine, returning batches or error string.
-async fn execute_via_polars(
+pub(crate) async fn execute_via_polars(
     state: &AppState,
     sql: &str,
 ) -> std::result::Result<Vec<RecordBatch>, String> {
@@ -3220,6 +3222,295 @@ async fn discover_and_register_tables(
     }
 }
 
+/// Reconnect all previously saved connections on server restart.
+///
+/// For each connection with a persisted password, performs a health check and
+/// re-registers tables via the appropriate provider (Postgres, MySQL, MongoDB, Trino).
+/// Runs as a background task so it does not block server startup.
+pub(crate) async fn reconnect_saved_connections(state: Arc<AppState>) {
+    let connections = state.connections.read().await.clone();
+    let passwords = state.connection_passwords.read().await.clone();
+
+    if connections.is_empty() || passwords.is_empty() {
+        return;
+    }
+
+    let mut reconnected = 0u32;
+    let mut failed = 0u32;
+
+    for conn in &connections {
+        // Skip bootstrap connections — they are handled by bootstrap_demo_connections
+        if conn.source == "bootstrap" {
+            continue;
+        }
+
+        let password = match passwords.get(&conn.id) {
+            Some(p) => p.clone(),
+            None => {
+                tracing::debug!(conn_id = %conn.id, name = %conn.name, "No saved password, skipping reconnect");
+                continue;
+            }
+        };
+
+        tracing::info!(
+            conn_id = %conn.id,
+            name = %conn.name,
+            conn_type = %conn.conn_type,
+            "Reconnecting saved connection"
+        );
+
+        // Update status to syncing
+        state.update_connection_entry(&conn.id, |c| {
+            c.sync_status = "syncing".to_string();
+            c.sync_progress = Some("Reconnecting...".to_string());
+            c.status = "connecting".to_string();
+        }).await;
+
+        match conn.conn_type.as_str() {
+            #[cfg(feature = "postgres")]
+            "postgres" | "postgresql" => {
+                let ctx = state.ctx.read().await;
+                let df_ctx = ctx.datafusion_ctx();
+                match state.provider_registry.register_postgres(
+                    &conn.id, &conn.host, conn.port, &conn.database, &conn.username, &password,
+                    "pg", df_ctx,
+                ).await {
+                    Ok(tables) => {
+                        drop(ctx);
+                        state.update_connection_entry(&conn.id, |c| {
+                            c.status = "connected".to_string();
+                            c.sync_status = "ready".to_string();
+                            c.sync_progress = Some(format!("Reconnected: {} tables", tables.len()));
+                            c.tables = tables;
+                            c.sync_error = None;
+                        }).await;
+                        reconnected += 1;
+                        tracing::info!(conn_id = %conn.id, "Postgres reconnected");
+                    }
+                    Err(e) => {
+                        drop(ctx);
+                        state.update_connection_entry(&conn.id, |c| {
+                            c.status = "error".to_string();
+                            c.sync_status = "error".to_string();
+                            c.sync_error = Some(format!("Reconnect failed: {}", e));
+                            c.sync_progress = None;
+                        }).await;
+                        failed += 1;
+                        tracing::warn!(conn_id = %conn.id, error = %e, "Postgres reconnect failed");
+                    }
+                }
+            }
+            #[cfg(feature = "mysql")]
+            "mysql" | "mariadb" => {
+                let ctx = state.ctx.read().await;
+                let df_ctx = ctx.datafusion_ctx();
+                match state.provider_registry.register_mysql(
+                    &conn.id, &conn.host, conn.port, &conn.database, &conn.username, &password,
+                    "mysql", df_ctx,
+                ).await {
+                    Ok(tables) => {
+                        drop(ctx);
+                        state.update_connection_entry(&conn.id, |c| {
+                            c.status = "connected".to_string();
+                            c.sync_status = "ready".to_string();
+                            c.sync_progress = Some(format!("Reconnected: {} tables", tables.len()));
+                            c.tables = tables;
+                            c.sync_error = None;
+                        }).await;
+                        reconnected += 1;
+                        tracing::info!(conn_id = %conn.id, "MySQL reconnected");
+                    }
+                    Err(e) => {
+                        drop(ctx);
+                        state.update_connection_entry(&conn.id, |c| {
+                            c.status = "error".to_string();
+                            c.sync_status = "error".to_string();
+                            c.sync_error = Some(format!("Reconnect failed: {}", e));
+                            c.sync_progress = None;
+                        }).await;
+                        failed += 1;
+                        tracing::warn!(conn_id = %conn.id, error = %e, "MySQL reconnect failed");
+                    }
+                }
+            }
+            "mongodb" => {
+                let mongo_params = crate::mongodb_conn::MongoConnParams {
+                    host: conn.host.clone(),
+                    port: conn.port,
+                    database: conn.database.clone(),
+                    username: conn.username.clone(),
+                    password: password.clone(),
+                };
+                match crate::mongodb_conn::connect_and_discover(&mongo_params).await {
+                    Ok(collections) => {
+                        // Register each collection as a MemTable in the "mongo" schema
+                        let ctx = state.ctx.read().await;
+                        let df_ctx = ctx.datafusion_ctx();
+                        let mongo_schema = match crate::providers::ensure_schema(df_ctx, "mongo") {
+                            Ok(s) => s,
+                            Err(e) => {
+                                drop(ctx);
+                                tracing::warn!(error = %e, "Failed to ensure mongo schema");
+                                failed += 1;
+                                continue;
+                            }
+                        };
+
+                        let mut mongo_registered = Vec::new();
+                        for coll_name in &collections {
+                            if let Ok(batch) = crate::mongodb_conn::fetch_collection_as_arrow(&mongo_params, coll_name).await {
+                                let schema = batch.schema();
+                                if let Ok(mem_table) = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]) {
+                                    let df_name = format!("mongo.{}", coll_name);
+                                    if mongo_schema.register_table(coll_name.clone(), std::sync::Arc::new(mem_table)).is_ok() {
+                                        mongo_registered.push(df_name);
+                                    }
+                                }
+                            }
+                        }
+                        drop(ctx);
+
+                        state.update_connection_entry(&conn.id, |c| {
+                            c.status = "connected".to_string();
+                            c.sync_status = "ready".to_string();
+                            c.sync_progress = Some(format!("Reconnected: {} collections", mongo_registered.len()));
+                            c.tables = mongo_registered;
+                            c.sync_error = None;
+                        }).await;
+                        reconnected += 1;
+                        tracing::info!(conn_id = %conn.id, "MongoDB reconnected");
+                    }
+                    Err(e) => {
+                        state.update_connection_entry(&conn.id, |c| {
+                            c.status = "error".to_string();
+                            c.sync_status = "error".to_string();
+                            c.sync_error = Some(format!("Reconnect failed: {}", e));
+                            c.sync_progress = None;
+                        }).await;
+                        failed += 1;
+                        tracing::warn!(conn_id = %conn.id, error = %e, "MongoDB reconnect failed");
+                    }
+                }
+            }
+            "trino" | "presto" => {
+                #[cfg(feature = "duckdb")]
+                {
+                    let user = if conn.username.is_empty() { "rustlake".to_string() } else { conn.username.clone() };
+                    let catalog = if conn.database.is_empty() { "postgresql".to_string() } else { conn.database.clone() };
+                    let base_url = trino_base_url(&conn.host, conn.port);
+                    let rest = crate::trino_client::TrinoRestClient::new(base_url.clone(), user.clone(), password.clone());
+
+                    // Quick health check
+                    match rest.execute_query("SELECT 1", &catalog).await {
+                        Ok(_) => {
+                            let cache = match state.trino_cache.clone() {
+                                Some(c) => c,
+                                None => {
+                                    tracing::warn!(conn_id = %conn.id, "Trino cache not available, skipping");
+                                    failed += 1;
+                                    continue;
+                                }
+                            };
+                            let trino_conn = crate::trino_client::TrinoConnection {
+                                id: conn.id.clone(),
+                                name: conn.name.clone(),
+                                rest,
+                                default_catalog: catalog,
+                                cache,
+                            };
+                            let conn_arc = std::sync::Arc::new(trino_conn);
+                            state.trino_connections.write().await.insert(conn.id.clone(), conn_arc.clone());
+
+                            // Spawn background scan (same pattern as add_connection)
+                            let state_bg = state.clone();
+                            let conn_id = conn.id.clone();
+                            let conn_arc_bg = conn_arc.clone();
+                            let base_url_bg = base_url;
+                            let user_bg = user;
+                            let pass_bg = password;
+
+                            tokio::spawn(async move {
+                                state_bg.update_connection_entry(&conn_id, |entry| {
+                                    entry.sync_progress = Some("Discovering catalogs...".to_string());
+                                }).await;
+
+                                match conn_arc_bg.refresh_cache().await {
+                                    Ok(table_count) => {
+                                        state_bg.update_connection_entry(&conn_id, |entry| {
+                                            entry.sync_progress = Some(format!("Found {} tables, registering...", table_count));
+                                        }).await;
+                                    }
+                                    Err(e) => {
+                                        state_bg.update_connection_entry(&conn_id, |entry| {
+                                            entry.sync_status = "error".to_string();
+                                            entry.sync_error = Some(format!("Cache refresh failed: {}", e));
+                                            entry.sync_progress = None;
+                                        }).await;
+                                        return;
+                                    }
+                                }
+
+                                let rest_arc = std::sync::Arc::new(
+                                    crate::trino_client::TrinoRestClient::new(base_url_bg, user_bg, pass_bg)
+                                );
+                                let ctx = state_bg.ctx.read().await;
+                                let df_ctx = ctx.datafusion_ctx();
+                                let _registered = state_bg.provider_registry
+                                    .register_trino(&conn_id, &conn_arc_bg, rest_arc, df_ctx)
+                                    .await
+                                    .unwrap_or_default();
+                                drop(ctx);
+
+                                let tree = conn_arc_bg.browse().await.unwrap_or_else(|_| crate::trino_client::TrinoCatalogTree {
+                                    catalogs: vec![], cached_at: None, total_tables: 0,
+                                });
+                                let tables: Vec<String> = tree.catalogs.iter()
+                                    .flat_map(|c| c.schemas.iter().flat_map(move |s| {
+                                        s.tables.iter().map(move |t| format!("trino.{}_{}", s.name, t))
+                                    }))
+                                    .collect();
+
+                                let table_count = tables.len();
+                                state_bg.update_connection_entry(&conn_id, |entry| {
+                                    entry.status = "connected".to_string();
+                                    entry.sync_status = "ready".to_string();
+                                    entry.sync_progress = Some(format!("Reconnected: {} tables", table_count));
+                                    entry.tables = tables;
+                                    entry.sync_error = None;
+                                }).await;
+                                tracing::info!(conn_id = %conn_id, tables = table_count, "Trino reconnected");
+                            });
+                            reconnected += 1;
+                        }
+                        Err(e) => {
+                            state.update_connection_entry(&conn.id, |c| {
+                                c.status = "error".to_string();
+                                c.sync_status = "error".to_string();
+                                c.sync_error = Some(format!("Trino unreachable: {}", e));
+                                c.sync_progress = None;
+                            }).await;
+                            failed += 1;
+                            tracing::warn!(conn_id = %conn.id, error = %e, "Trino reconnect failed");
+                        }
+                    }
+                }
+                #[cfg(not(feature = "duckdb"))]
+                {
+                    let _ = password;
+                    tracing::debug!(conn_id = %conn.id, "Trino reconnect requires DuckDB feature");
+                }
+            }
+            _ => {
+                tracing::debug!(conn_id = %conn.id, conn_type = %conn.conn_type, "Skipping reconnect for unsupported type");
+            }
+        }
+    }
+
+    if reconnected > 0 || failed > 0 {
+        tracing::info!(reconnected, failed, "Saved connection reconnection complete");
+    }
+}
+
 /// GET /api/v1/connections — list all connections.
 async fn list_connections(
     State(state): State<Arc<AppState>>,
@@ -3249,6 +3540,9 @@ async fn delete_connection(
     }
 
     state.connection_passwords.write().await.remove(&id);
+    if let Err(e) = state.credential_store.remove_password(&id) {
+        tracing::warn!(error = %e, conn_id = %id, "Failed to remove encrypted password");
+    }
 
     if let Some(conn) = &removed {
         tracing::info!(
@@ -4139,7 +4433,7 @@ fn write_events_csv(path: &str, events: &[rustlake_stream::StreamEvent]) -> std:
     Ok(())
 }
 
-fn batches_to_json(
+pub(crate) fn batches_to_json(
     batches: &[RecordBatch],
 ) -> std::result::Result<Vec<serde_json::Value>, arrow::error::ArrowError> {
     let mut buf = Vec::new();
@@ -6837,11 +7131,20 @@ async fn migration_credentials(
             region: req.region,
         },
     );
+    // Persist encrypted to disk
+    {
+        let creds = state.migration_s3_creds.read().await;
+        if let Some(creds_val) = creds.get(&key) {
+            if let Err(e) = state.credential_store.store_s3_creds(&key, creds_val) {
+                tracing::warn!(error = %e, "Failed to persist encrypted S3 credentials");
+            }
+        }
+    }
     tracing::info!(key = %key, "Stored S3 credentials for migration");
     Json(serde_json::json!({
         "status": "stored",
         "key": key,
-        "message": "S3 credentials stored in-memory (not persisted to disk)",
+        "message": "S3 credentials stored (encrypted on disk)",
     }))
 }
 
@@ -7723,7 +8026,7 @@ async fn migration_comparisons(
 ///
 /// Handles: INSERT INTO table, UPDATE table, DELETE FROM table,
 /// DROP TABLE table, ALTER TABLE table, TRUNCATE TABLE table.
-fn extract_target_table(sql_upper: &str) -> Option<String> {
+pub(crate) fn extract_target_table(sql_upper: &str) -> Option<String> {
     let patterns = [
         "INSERT INTO ",
         "UPDATE ",

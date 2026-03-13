@@ -275,7 +275,7 @@ pub struct S3Config {
 }
 
 /// S3 credentials for a set of buckets, fetched from the credentials API.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct S3BucketCreds {
     pub account_id: String,
     pub access_key: String,
@@ -593,6 +593,8 @@ pub struct AppState {
     pub engine_tracker: RwLock<EnginePerformanceTracker>,
     /// Read-only tables from migration — DDL/DML blocked to protect source data.
     pub read_only_tables: RwLock<std::collections::HashSet<String>>,
+    /// Encrypted credential store for persisting passwords and S3 credentials.
+    pub credential_store: crate::credential_store::CredentialStore,
 }
 
 impl AppState {
@@ -667,6 +669,7 @@ impl AppState {
             migration_s3_creds: RwLock::new(std::collections::HashMap::new()),
             engine_tracker: RwLock::new(EnginePerformanceTracker::new()),
             read_only_tables: RwLock::new(std::collections::HashSet::new()),
+            credential_store: crate::credential_store::CredentialStore::new(),
         }
     }
 
@@ -717,6 +720,7 @@ impl AppState {
             migration_s3_creds: RwLock::new(std::collections::HashMap::new()),
             engine_tracker: RwLock::new(EnginePerformanceTracker::new()),
             read_only_tables: RwLock::new(std::collections::HashSet::new()),
+            credential_store: crate::credential_store::CredentialStore::new(),
         }
     }
 
@@ -781,8 +785,11 @@ impl AppState {
         }
     }
 
-    /// Store a connection password (in-memory only, never persisted to disk).
+    /// Store a connection password (in-memory + encrypted on disk).
     pub async fn store_password(&self, id: String, password: String) -> Option<String> {
+        if let Err(e) = self.credential_store.store_password(&id, &password) {
+            tracing::warn!(error = %e, conn_id = %id, "Failed to persist encrypted password");
+        }
         self.connection_passwords.write().await.insert(id, password)
     }
 

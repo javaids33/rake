@@ -25,6 +25,8 @@ mod routes;
 mod state;
 mod trino_client;
 mod trino_provider;
+mod credential_store;
+mod ws;
 
 use state::{
     load_chat_messages_from_file, load_scheduled_jobs_from_file, load_user_transforms_from_file,
@@ -723,6 +725,21 @@ async fn main() -> anyhow::Result<()> {
         *state.connections.get_mut() = connections;
     }
 
+    // Load encrypted credentials and restore passwords
+    {
+        let passwords = state.credential_store.load_all_passwords();
+        if !passwords.is_empty() {
+            tracing::info!(count = passwords.len(), "Loaded encrypted passwords from credentials.enc");
+            *state.connection_passwords.get_mut() = passwords;
+        }
+
+        let s3_creds = state.credential_store.load_all_s3_creds();
+        if !s3_creds.is_empty() {
+            tracing::info!(count = s3_creds.len(), "Loaded encrypted S3 credentials from credentials.enc");
+            *state.migration_s3_creds.get_mut() = s3_creds;
+        }
+    }
+
     // Fetch S3 credentials from external API if configured
     if let Ok(creds_url) = std::env::var("RUSTLAKE_S3_CREDENTIALS_URL") {
         if !creds_url.is_empty() {
@@ -740,6 +757,14 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let state = Arc::new(state);
+
+    // Auto-reconnect previously saved connections (non-blocking)
+    {
+        let reconnect_state = state.clone();
+        tokio::spawn(async move {
+            routes::reconnect_saved_connections(reconnect_state).await;
+        });
+    }
 
     // Auto-bootstrap is disabled — developers start with a clean slate.
     // Use POST /api/v1/bootstrap to connect Docker services on demand.
