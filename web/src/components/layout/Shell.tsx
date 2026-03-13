@@ -5,18 +5,20 @@ import { Header } from './Header'
 import { useAppStore } from '../../stores/app'
 import { cn } from '../../lib/utils'
 import { useEventStream } from '../../hooks/useEventStream'
-import type { ServerStatus, ConnectionSyncEvent } from '../../hooks/useEventStream'
+import type { ServerStatus, ConnectionSyncEvent, TrinoScanEvent } from '../../hooks/useEventStream'
 
 interface EventStreamContextValue {
   status: ServerStatus | null
   connected: boolean
   onConnectionSync: (listener: (event: ConnectionSyncEvent) => void) => () => void
+  onTrinoScan: (listener: (event: TrinoScanEvent) => void) => () => void
 }
 
 const EventStreamContext = createContext<EventStreamContextValue>({
   status: null,
   connected: false,
   onConnectionSync: () => () => {},
+  onTrinoScan: () => () => {},
 })
 
 /** Use the shared SSE event stream from any component. */

@@ -143,6 +143,9 @@ pub struct ConnectionEntry {
     /// Error message if sync failed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sync_error: Option<String>,
+    /// Progress detail for syncing connections.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_progress: Option<String>,
 }
 
 fn default_sync_ready() -> String {

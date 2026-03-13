@@ -23,13 +23,21 @@ export interface ConnectionSyncEvent {
   table_count: number
 }
 
+/** Trino catalog scan progress pushed via SSE. */
+export interface TrinoScanEvent {
+  id: string
+  phase: string | null
+  sync_status: string
+}
+
 type SyncListener = (event: ConnectionSyncEvent) => void
+type TrinoScanListener = (event: TrinoScanEvent) => void
 
 /**
  * Hook that maintains a single SSE connection to `/api/v1/events`.
  *
  * Returns the latest server status (health, metrics, tables, engines)
- * and a way to subscribe to connection sync events.
+ * and a way to subscribe to connection sync and trino scan events.
  *
  * Replaces 3 polling intervals (health 15s, metrics+tables 10s, engine 5s)
  * with a single persistent connection.
@@ -38,12 +46,19 @@ export function useEventStream() {
   const [status, setStatus] = useState<ServerStatus | null>(null)
   const [connected, setConnected] = useState(false)
   const syncListenersRef = useRef<Set<SyncListener>>(new Set())
+  const trinoScanListenersRef = useRef<Set<TrinoScanListener>>(new Set())
   const sourceRef = useRef<EventSource | null>(null)
 
   // Allow components to subscribe to connection sync events
   const onConnectionSync = useCallback((listener: SyncListener) => {
     syncListenersRef.current.add(listener)
     return () => { syncListenersRef.current.delete(listener) }
+  }, [])
+
+  // Allow components to subscribe to trino scan progress events
+  const onTrinoScan = useCallback((listener: TrinoScanListener) => {
+    trinoScanListenersRef.current.add(listener)
+    return () => { trinoScanListenersRef.current.delete(listener) }
   }, [])
 
   useEffect(() => {
@@ -69,6 +84,13 @@ export function useEventStream() {
         } catch { /* ignore parse errors */ }
       })
 
+      es.addEventListener('trino_scan', (e) => {
+        try {
+          const data: TrinoScanEvent = JSON.parse(e.data)
+          trinoScanListenersRef.current.forEach(fn => fn(data))
+        } catch { /* ignore parse errors */ }
+      })
+
       es.onerror = () => {
         setConnected(false)
         es.close()
@@ -86,5 +108,5 @@ export function useEventStream() {
     }
   }, [])
 
-  return { status, connected, onConnectionSync }
+  return { status, connected, onConnectionSync, onTrinoScan }
 }

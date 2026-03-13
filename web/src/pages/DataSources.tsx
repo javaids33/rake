@@ -11,6 +11,8 @@ import { StatusDot } from '../components/ui/StatusDot'
 import { cn } from '../lib/utils'
 import { getConnections, addConnection, deleteConnection, getS3Configs, addS3Config, deleteS3Config, uploadFile, registerTable, testConnection } from '../api/client'
 import { useServerEvents } from '../components/layout/Shell'
+import type { TrinoScanEvent } from '../hooks/useEventStream'
+import { useAppStore } from '../stores/app'
 import type { ConnectionEntry, S3Config, ConnectionTestResponse } from '../types'
 import {
   FolderInput, Database, HardDrive, Upload, Plus, Trash2,
@@ -244,7 +246,11 @@ export function DataSources() {
   }
 
   // Subscribe to SSE connection sync events instead of polling
-  const { onConnectionSync } = useServerEvents()
+  const { onConnectionSync, onTrinoScan } = useServerEvents()
+  const { darkMode } = useAppStore()
+
+  // Track Trino scan progress per connection
+  const [trinoScanState, setTrinoScanState] = useState<Record<string, { phase: string; status: string }>>({})
 
   useEffect(() => {
     const unsub = onConnectionSync((event) => {
@@ -266,6 +272,37 @@ export function DataSources() {
     })
     return unsub
   }, [onConnectionSync])
+
+  // Subscribe to Trino scan progress events
+  useEffect(() => {
+    const unsub = onTrinoScan((event: TrinoScanEvent) => {
+      if (event.sync_status === 'ready') {
+        // Scan complete — show toast and clear after brief delay for green transition
+        const phase = event.phase || 'Scan complete'
+        const tableMatch = phase.match(/(\d+)\s*tables?/i)
+        const tableCount = tableMatch ? tableMatch[1] : ''
+        toast.success(
+          tableCount ? `Trino scan complete: ${tableCount} tables` : 'Trino scan complete',
+          { id: `trino-scan-${event.id}` }
+        )
+        setTrinoScanState(prev => ({ ...prev, [event.id]: { phase, status: 'ready' } }))
+        // Clear the completed state after 3 seconds
+        setTimeout(() => {
+          setTrinoScanState(prev => {
+            const next = { ...prev }
+            delete next[event.id]
+            return next
+          })
+        }, 3000)
+      } else {
+        setTrinoScanState(prev => ({
+          ...prev,
+          [event.id]: { phase: event.phase || 'Scanning...', status: event.sync_status },
+        }))
+      }
+    })
+    return unsub
+  }, [onTrinoScan])
 
   const handleConnect = async () => {
     if (!selectedConnector || !connName.trim()) return
@@ -498,6 +535,38 @@ export function DataSources() {
                     {isSyncError && c.sync_error && (
                       <p className="text-2xs text-red-400/80 mt-1">{c.sync_error}</p>
                     )}
+                    {/* Trino scan progress indicator */}
+                    {c.conn_type === 'trino' && trinoScanState[c.id] && (() => {
+                      const scan = trinoScanState[c.id]
+                      const isComplete = scan.status === 'ready'
+                      return (
+                        <div className="mt-2 space-y-1">
+                          <div className={cn(
+                            "h-1.5 rounded-full overflow-hidden",
+                            darkMode ? "bg-white/[0.06]" : "bg-slate-200"
+                          )}>
+                            <div className={cn(
+                              "h-full rounded-full transition-all duration-700",
+                              isComplete
+                                ? "w-full bg-emerald-400"
+                                : "bg-amber-400 animate-trino-scan"
+                            )} style={!isComplete ? {
+                              backgroundImage: 'linear-gradient(90deg, transparent 0%, rgba(255,255,255,0.3) 50%, transparent 100%)',
+                              backgroundSize: '200% 100%',
+                              animation: 'trinoScanPulse 1.5s ease-in-out infinite',
+                            } : undefined} />
+                          </div>
+                          <p className={cn(
+                            "text-2xs font-mono transition-colors duration-300",
+                            isComplete
+                              ? "text-emerald-400/80"
+                              : darkMode ? "text-amber-400/70" : "text-amber-600/70"
+                          )}>
+                            {scan.phase}
+                          </p>
+                        </div>
+                      )
+                    })()}
                     {c.tables.length > 0 && (
                       <div className="flex items-center gap-1.5 mt-2 flex-wrap">
                         {c.tables.slice(0, 5).map(t => <Badge key={t} className="text-2xs">{t}</Badge>)}

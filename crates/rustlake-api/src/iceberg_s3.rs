@@ -462,14 +462,46 @@ pub async fn get_warehouse_location_from_trino(
         }
     }
 
-    // Fallback: try SHOW CREATE SCHEMA for the first schema
+    // Fallback 1: SHOW CREATE SCHEMA — Iceberg schemas often have a location property
     let schema_sql = format!("SHOW SCHEMAS FROM \"{}\"", catalog_name);
     if let Ok(rows) = rest.query(&schema_sql, catalog_name).await {
         for row in &rows {
             if let Some(schema) = row.first().and_then(|v| v.as_str()) {
                 let schema = schema.trim();
                 if schema == "information_schema" || schema == "pg_catalog" { continue; }
-                // Try SHOW CREATE TABLE on first table to extract location
+
+                let show_schema_sql = format!("SHOW CREATE SCHEMA \"{}\".\"{}\"", catalog_name, schema);
+                tracing::info!(catalog = %catalog_name, schema = %schema, "Trying SHOW CREATE SCHEMA for warehouse location");
+                if let Ok(create_result) = rest.query(&show_schema_sql, catalog_name).await {
+                    let ddl: String = create_result.iter()
+                        .filter_map(|r| r.first().and_then(|v| v.as_str()))
+                        .collect::<Vec<_>>().join("\n").to_lowercase();
+                    tracing::debug!(catalog = %catalog_name, schema = %schema, ddl = %ddl, "SHOW CREATE SCHEMA result");
+
+                    // Extract s3 location from schema DDL
+                    if let Some(loc) = extract_s3_location(&ddl) {
+                        // Schema location is usually s3://bucket/warehouse/db — parent is warehouse
+                        if let Some(warehouse) = derive_warehouse_from_schema_location(&loc) {
+                            tracing::info!(catalog = %catalog_name, warehouse = %warehouse, "Derived warehouse from SHOW CREATE SCHEMA");
+                            return Some(warehouse);
+                        }
+                        // If we can't derive parent, the schema location itself might be the warehouse
+                        tracing::info!(catalog = %catalog_name, warehouse = %loc, "Using schema location as warehouse");
+                        return Some(loc);
+                    }
+                }
+                break; // Only try the first real schema
+            }
+        }
+    }
+
+    // Fallback 2: SHOW CREATE TABLE on one table — extract location, strip table/db segments
+    tracing::info!(catalog = %catalog_name, "SHOW CREATE SCHEMA didn't yield location, trying SHOW CREATE TABLE on one table");
+    if let Ok(rows) = rest.query(&format!("SHOW SCHEMAS FROM \"{}\"", catalog_name), catalog_name).await {
+        for row in &rows {
+            if let Some(schema) = row.first().and_then(|v| v.as_str()) {
+                let schema = schema.trim();
+                if schema == "information_schema" || schema == "pg_catalog" { continue; }
                 let tables_sql = format!("SHOW TABLES FROM \"{}\".\"{}\"", catalog_name, schema);
                 if let Ok(table_rows) = rest.query(&tables_sql, catalog_name).await {
                     if let Some(table_row) = table_rows.first() {
@@ -479,9 +511,7 @@ pub async fn get_warehouse_location_from_trino(
                                 let ddl: String = create_result.iter()
                                     .filter_map(|r| r.first().and_then(|v| v.as_str()))
                                     .collect::<Vec<_>>().join("\n").to_lowercase();
-                                // Extract location and derive warehouse from it
                                 if let Some(loc) = extract_s3_location(&ddl) {
-                                    // Warehouse = location minus the last two path components (db/table)
                                     if let Some(warehouse) = derive_warehouse_from_location(&loc) {
                                         tracing::info!(catalog = %catalog_name, warehouse = %warehouse, "Derived warehouse from SHOW CREATE TABLE");
                                         return Some(warehouse);
@@ -496,12 +526,13 @@ pub async fn get_warehouse_location_from_trino(
         }
     }
 
+    tracing::warn!(catalog = %catalog_name, "Could not determine warehouse location from any method");
     None
 }
 
-/// Extract S3 location from DDL text.
+/// Extract S3 location from DDL text. Handles both s3:// and s3a:// prefixes.
 fn extract_s3_location(ddl: &str) -> Option<String> {
-    for pattern in &["external_location = '", "location = '", "'s3://"] {
+    for pattern in &["external_location = '", "location = '", "'s3://", "'s3a://"] {
         if let Some(idx) = ddl.find(pattern) {
             let start = if pattern.starts_with('\'') {
                 idx + 1
@@ -511,7 +542,7 @@ fn extract_s3_location(ddl: &str) -> Option<String> {
             let rest = &ddl[start..];
             if let Some(end) = rest.find('\'') {
                 let loc = rest[..end].trim().to_string();
-                if loc.starts_with("s3://") {
+                if loc.starts_with("s3://") || loc.starts_with("s3a://") {
                     return Some(loc);
                 }
             }
@@ -530,4 +561,18 @@ fn derive_warehouse_from_location(location: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// Derive warehouse root from a schema location.
+/// Schema locations are one level above table: s3://bucket/warehouse/db → s3://bucket/warehouse/
+fn derive_warehouse_from_schema_location(location: &str) -> Option<String> {
+    let trimmed = location.trim_end_matches('/');
+    if let Some(idx) = trimmed.rfind('/') {
+        let parent = &trimmed[..idx];
+        // Make sure we still have the s3:// prefix and at least a bucket
+        if parent.starts_with("s3://") || parent.starts_with("s3a://") {
+            return Some(format!("{}/", parent));
+        }
+    }
+    None
 }

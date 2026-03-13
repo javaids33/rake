@@ -749,6 +749,8 @@ async fn event_stream(
     let stream = async_stream::stream! {
         // Track last-seen connection sync statuses so we can push deltas
         let mut last_sync: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        // Track last-seen sync_progress so we can push trino_scan events on change
+        let mut last_progress: std::collections::HashMap<String, String> = std::collections::HashMap::new();
 
         loop {
             // ── Build combined status payload ─────────────────────
@@ -811,6 +813,19 @@ async fn event_stream(
                             "table_count": conn.tables.len(),
                         });
                         yield Ok(Event::default().event("connection_sync").data(sync_event.to_string()));
+                    }
+
+                    // ── Check sync progress changes (Trino scan phases) ──
+                    let progress = conn.sync_progress.clone().unwrap_or_default();
+                    let prev_progress = last_progress.get(&conn.id).map(|s| s.as_str()).unwrap_or("");
+                    if progress != prev_progress {
+                        last_progress.insert(conn.id.clone(), progress.clone());
+                        let scan_event = serde_json::json!({
+                            "id": conn.id,
+                            "phase": conn.sync_progress,
+                            "sync_status": conn.sync_status,
+                        });
+                        yield Ok(Event::default().event("trino_scan").data(scan_event.to_string()));
                     }
                 }
             }
@@ -2934,6 +2949,7 @@ async fn add_connection(
         source: "user".to_string(),
         sync_status: "syncing".to_string(),
         sync_error: None,
+        sync_progress: None,
     };
 
     state.add_connection_entry(entry).await;
@@ -3088,6 +3104,11 @@ async fn discover_and_register_tables(
                 let rest = crate::trino_client::TrinoRestClient::new(base_url.clone(), user.clone(), pass.clone());
                 let cache = state.trino_cache.clone()
                     .ok_or_else(|| "Trino cache not initialized".to_string())?;
+
+                // Quick validation: just check Trino is reachable with a lightweight query
+                rest.execute_query("SELECT 1", &catalog).await
+                    .map_err(|e| format!("Cannot reach Trino: {}", e))?;
+
                 let conn = crate::trino_client::TrinoConnection {
                     id: id.to_string(),
                     name: req.name.clone(),
@@ -3095,39 +3116,98 @@ async fn discover_and_register_tables(
                     default_catalog: catalog.clone(),
                     cache,
                 };
-                let table_count = conn.refresh_cache().await?;
-                tracing::info!(conn_id = %id, tables = table_count, "Trino connected and cached");
-
-                let rest_arc = std::sync::Arc::new(
-                    crate::trino_client::TrinoRestClient::new(base_url.clone(), user.clone(), pass.clone())
-                );
                 let conn_arc = std::sync::Arc::new(conn);
                 state.trino_connections.write().await.insert(id.to_string(), conn_arc.clone());
 
-                let ctx = state.ctx.read().await;
-                let df_ctx = ctx.datafusion_ctx();
-                let trino_registered = state.provider_registry
-                    .register_trino(id, &conn_arc, rest_arc, df_ctx)
-                    .await
-                    .unwrap_or_else(|e| {
-                        tracing::warn!(error = %e, "Failed to register Trino table providers");
-                        vec![]
+                // Update sync_progress to indicate scan is starting
+                state.update_connection_entry(id, |entry| {
+                    entry.sync_progress = Some("Connecting to Trino...".to_string());
+                }).await;
+
+                // Spawn background scan task — returns immediately to the caller
+                let state_bg = state.clone();
+                let conn_id_bg = id.to_string();
+                let conn_arc_bg = conn_arc.clone();
+                let base_url_bg = base_url.clone();
+                let user_bg = user.clone();
+                let pass_bg = pass.clone();
+
+                tokio::spawn(async move {
+                    tracing::info!(conn_id = %conn_id_bg, "Starting background Trino catalog scan");
+
+                    // Phase 1: Discover catalogs and cache metadata
+                    state_bg.update_connection_entry(&conn_id_bg, |entry| {
+                        entry.sync_progress = Some("Discovering catalogs...".to_string());
+                    }).await;
+
+                    match conn_arc_bg.refresh_cache().await {
+                        Ok(table_count) => {
+                            tracing::info!(conn_id = %conn_id_bg, tables = table_count, "Trino cache populated");
+                            state_bg.update_connection_entry(&conn_id_bg, |entry| {
+                                entry.sync_progress = Some(format!("Found {} tables, registering providers...", table_count));
+                            }).await;
+                        }
+                        Err(e) => {
+                            tracing::warn!(conn_id = %conn_id_bg, error = %e, "Trino cache refresh failed");
+                            state_bg.update_connection_entry(&conn_id_bg, |entry| {
+                                entry.sync_status = "error".to_string();
+                                entry.sync_error = Some(format!("Cache refresh failed: {}", e));
+                                entry.sync_progress = None;
+                            }).await;
+                            return;
+                        }
+                    }
+
+                    // Phase 2: Register Trino table providers in DataFusion
+                    state_bg.update_connection_entry(&conn_id_bg, |entry| {
+                        entry.sync_progress = Some("Registering table providers...".to_string());
+                    }).await;
+
+                    let rest_arc = std::sync::Arc::new(
+                        crate::trino_client::TrinoRestClient::new(base_url_bg, user_bg, pass_bg)
+                    );
+                    let ctx = state_bg.ctx.read().await;
+                    let df_ctx = ctx.datafusion_ctx();
+                    let trino_registered = state_bg.provider_registry
+                        .register_trino(&conn_id_bg, &conn_arc_bg, rest_arc, df_ctx)
+                        .await
+                        .unwrap_or_else(|e| {
+                            tracing::warn!(error = %e, "Failed to register Trino table providers");
+                            vec![]
+                        });
+                    drop(ctx);
+
+                    if !trino_registered.is_empty() {
+                        tracing::info!(count = trino_registered.len(), "Trino tables registered as DataFusion providers");
+                    }
+
+                    // Phase 3: Build catalog tree
+                    state_bg.update_connection_entry(&conn_id_bg, |entry| {
+                        entry.sync_progress = Some("Building catalog tree...".to_string());
+                    }).await;
+
+                    let tree = conn_arc_bg.browse().await.unwrap_or_else(|_| crate::trino_client::TrinoCatalogTree {
+                        catalogs: vec![], cached_at: None, total_tables: 0,
                     });
-                drop(ctx);
+                    let tables: Vec<String> = tree.catalogs.iter()
+                        .flat_map(|c| c.schemas.iter().flat_map(move |s| {
+                            s.tables.iter().map(move |t| format!("trino.{}_{}", s.name, t))
+                        }))
+                        .collect();
 
-                if !trino_registered.is_empty() {
-                    tracing::info!(count = trino_registered.len(), "Trino tables registered as DataFusion providers");
-                }
-
-                let tree = conn_arc.browse().await.unwrap_or_else(|_| crate::trino_client::TrinoCatalogTree {
-                    catalogs: vec![], cached_at: None, total_tables: 0,
+                    // Done — mark as ready with final table list
+                    let table_count = tables.len();
+                    state_bg.update_connection_entry(&conn_id_bg, |entry| {
+                        entry.sync_status = "ready".to_string();
+                        entry.sync_error = None;
+                        entry.sync_progress = Some(format!("Scan complete: {} tables", table_count));
+                        entry.tables = tables;
+                    }).await;
+                    tracing::info!(conn_id = %conn_id_bg, tables = table_count, "Trino background scan complete");
                 });
-                let tables: Vec<String> = tree.catalogs.iter()
-                    .flat_map(|c| c.schemas.iter().flat_map(move |s| {
-                        s.tables.iter().map(move |t| format!("trino.{}_{}", s.name, t))
-                    }))
-                    .collect();
-                Ok(tables)
+
+                // Return empty tables — the background task will populate them via update_connection_entry
+                Ok(vec![])
             }
 
             #[cfg(not(feature = "duckdb"))]
@@ -3737,6 +3817,7 @@ async fn run_bootstrap(
                     source: "bootstrap".to_string(),
                     sync_status: "ready".to_string(),
                     sync_error: None,
+                    sync_progress: None,
                 };
                 state.seed_connection(entry, pg_pass).await;
                 results.insert("postgres".to_string(), serde_json::json!({
@@ -3807,6 +3888,7 @@ async fn run_bootstrap(
                     source: "bootstrap".to_string(),
                     sync_status: "ready".to_string(),
                     sync_error: None,
+                    sync_progress: None,
                 };
                 state.seed_connection(entry, mysql_pass).await;
                 results.insert("mysql".to_string(), serde_json::json!({
@@ -3856,6 +3938,7 @@ async fn run_bootstrap(
                 source: "bootstrap".to_string(),
                 sync_status: "ready".to_string(),
                 sync_error: None,
+                sync_progress: None,
             };
             state.seed_connection(entry, "rustlake".to_string()).await;
 
