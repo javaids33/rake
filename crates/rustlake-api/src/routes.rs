@@ -5824,7 +5824,7 @@ async fn discover_s3_iceberg_tables(
             }
 
             let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(arrow_fields));
-            match datafusion::datasource::MemTable::try_new(schema, vec![]) {
+            match datafusion::datasource::MemTable::try_new(schema, vec![vec![]]) {
                 Ok(mem_table) => {
                     let provider: std::sync::Arc<dyn datafusion::datasource::TableProvider> =
                         std::sync::Arc::new(mem_table);
