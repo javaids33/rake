@@ -12,8 +12,8 @@ import { EmptyState } from '../components/ui/EmptyState'
 import { StatusDot } from '../components/ui/StatusDot'
 import { Tooltip } from '../components/ui/Tooltip'
 import { cn, formatNumber, formatDuration } from '../lib/utils'
-import { getStreamStatus, getStreamEvents, ingestStream, getPipelines, createPipeline, deletePipeline } from '../api/client'
-import type { StreamingMetrics, StreamEvent, StreamingPipeline } from '../types'
+import { getStreamStatus, getStreamEvents, ingestStream, getPipelines, createPipeline, deletePipeline, getConnections } from '../api/client'
+import type { StreamingMetrics, StreamEvent, StreamingPipeline, ConnectionEntry } from '../types'
 import {
   Radio, Activity, Zap, Clock, Plus, Play, Trash2, ArrowRightLeft,
   Gauge, Waves, Server, GitMerge, Database, ArrowDown, ArrowRight,
@@ -55,7 +55,10 @@ export function Streaming() {
   const [pipelines, setPipelines] = useState<StreamingPipeline[]>([])
   const [createOpen, setCreateOpen] = useState(false)
   const [selectedPipeline, setSelectedPipeline] = useState<string | null>(null)
-  const [form, setForm] = useState({ name: '', source_type: 'kafka', sink_table: '', transform_sql: '', broker: '', topic: '' })
+  const [form, setForm] = useState({ name: '', source_type: 'kafka', sink_table: '', transform_sql: '', broker: '', topic: '', connection_id: '', collection: '', full_document: 'updateLookup' })
+
+  // MongoDB connections for CDC pipeline creation
+  const [mongoConnections, setMongoConnections] = useState<ConnectionEntry[]>([])
 
   // Event tab state
   const [expandedEvent, setExpandedEvent] = useState<number | null>(null)
@@ -81,6 +84,7 @@ export function Streaming() {
     getStreamStatus().then(r => { if (r?.metrics) setMetrics(r.metrics) }).catch(() => {})
     getStreamEvents(100).then(r => setEvents(r.events || [])).catch(() => {})
     getPipelines().then(r => setPipelines(r.pipelines || [])).catch(() => {})
+    getConnections().then(r => setMongoConnections((r.connections || []).filter(c => c.conn_type === 'mongodb' || c.conn_type === 'cdc_mongodb'))).catch(() => {})
   }
   useEffect(loadAll, [])
 
@@ -95,19 +99,39 @@ export function Streaming() {
   const handleCreate = async () => {
     if (!form.name.trim()) { toast.error('Pipeline name is required'); return }
     if (!form.sink_table.trim()) { toast.error('Sink table is required'); return }
-    if (form.source_type === 'kafka' && !form.broker.trim()) { toast.error('Broker address is required for Kafka'); return }
-    if (!form.topic.trim()) { toast.error('Topic / collection is required'); return }
+    if (form.source_type === 'kafka') {
+      if (!form.broker.trim()) { toast.error('Broker address is required for Kafka'); return }
+      if (!form.topic.trim()) { toast.error('Topic is required'); return }
+    }
+    if (form.source_type === 'mongodb-cdc') {
+      if (!form.connection_id && !form.broker.trim()) { toast.error('Select a MongoDB connection or enter a URI'); return }
+      if (!form.collection.trim()) { toast.error('Collection name is required'); return }
+    }
+    if (form.source_type === 'postgres-cdc' && !form.broker.trim()) { toast.error('Host is required for Postgres CDC'); return }
     try {
+      let sourceConfig: Record<string, unknown>
+      if (form.source_type === 'mongodb-cdc') {
+        const selectedConn = mongoConnections.find(c => c.id === form.connection_id)
+        sourceConfig = {
+          connection_id: form.connection_id || undefined,
+          database: selectedConn?.database || form.broker.split('/').pop() || '',
+          collection: form.collection,
+          full_document: form.full_document,
+          ...(form.broker ? { broker: form.broker } : {}),
+        }
+      } else {
+        sourceConfig = { broker: form.broker, topic: form.topic }
+      }
       await createPipeline({
         name: form.name,
         source_type: form.source_type,
-        source_config: { broker: form.broker, topic: form.topic },
+        source_config: sourceConfig,
         transform_sql: form.transform_sql || undefined,
         sink_table: form.sink_table,
       })
       toast.success('Pipeline created')
       setCreateOpen(false)
-      setForm({ name: '', source_type: 'kafka', sink_table: '', transform_sql: '', broker: '', topic: '' })
+      setForm({ name: '', source_type: 'kafka', sink_table: '', transform_sql: '', broker: '', topic: '', connection_id: '', collection: '', full_document: 'updateLookup' })
       loadAll()
     } catch (e) { toast.error((e as Error).message) }
   }
@@ -554,8 +578,48 @@ export function Streaming() {
               ))}
             </div>
           </div>
-          <Input label="Broker / URI *" value={form.broker} onChange={e => setForm(f => ({ ...f, broker: e.target.value }))} placeholder={form.source_type === 'kafka' ? 'localhost:9092' : 'mongodb://localhost:27017'} />
-          <Input label="Topic / Collection *" value={form.topic} onChange={e => setForm(f => ({ ...f, topic: e.target.value }))} placeholder={form.source_type === 'kafka' ? 'events' : 'mydb.users'} />
+          {/* Source-specific fields */}
+          {form.source_type === 'mongodb-cdc' ? (
+            <>
+              {/* MongoDB connection selector */}
+              {mongoConnections.length > 0 && (
+                <Select
+                  label="MongoDB Connection"
+                  value={form.connection_id}
+                  onChange={e => setForm(f => ({ ...f, connection_id: e.target.value }))}
+                  options={[
+                    { value: '', label: 'Manual URI (below)' },
+                    ...mongoConnections.map(c => ({ value: c.id, label: `${c.name} (${c.host}/${c.database})` })),
+                  ]}
+                />
+              )}
+              {!form.connection_id && (
+                <Input label="MongoDB URI *" value={form.broker} onChange={e => setForm(f => ({ ...f, broker: e.target.value }))} placeholder="mongodb://localhost:27017/mydb" />
+              )}
+              <Input label="Collection *" value={form.collection} onChange={e => setForm(f => ({ ...f, collection: e.target.value }))} placeholder="events (or * for all collections)" />
+              <Select
+                label="Full Document Mode"
+                value={form.full_document}
+                onChange={e => setForm(f => ({ ...f, full_document: e.target.value }))}
+                options={[
+                  { value: 'updateLookup', label: 'updateLookup (recommended)' },
+                  { value: 'default', label: 'default' },
+                  { value: 'whenAvailable', label: 'whenAvailable' },
+                ]}
+              />
+              <div className="flex items-start gap-2 p-3 rounded-lg bg-emerald-400/[0.04] border border-emerald-400/10">
+                <Database className="w-4 h-4 text-emerald-400/60 flex-shrink-0 mt-0.5" />
+                <p className="text-2xs text-emerald-400/60 leading-relaxed">
+                  MongoDB CDC uses change streams to capture inserts, updates, and deletes in real-time. The "updateLookup" mode includes the full document for update events.
+                </p>
+              </div>
+            </>
+          ) : (
+            <>
+              <Input label="Broker / URI *" value={form.broker} onChange={e => setForm(f => ({ ...f, broker: e.target.value }))} placeholder={form.source_type === 'kafka' ? 'localhost:9092' : 'localhost:5432'} />
+              <Input label="Topic / Collection *" value={form.topic} onChange={e => setForm(f => ({ ...f, topic: e.target.value }))} placeholder={form.source_type === 'kafka' ? 'events' : 'public.users'} />
+            </>
+          )}
           <Input label="Sink Table (Iceberg) *" value={form.sink_table} onChange={e => setForm(f => ({ ...f, sink_table: e.target.value }))} placeholder="iceberg://warehouse.events" />
           <Textarea label="Transform SQL (optional)" value={form.transform_sql} onChange={e => setForm(f => ({ ...f, transform_sql: e.target.value }))} placeholder="SELECT event_type, data, timestamp FROM source WHERE event_type != 'heartbeat'" />
           <div className="flex justify-end gap-2 pt-2">

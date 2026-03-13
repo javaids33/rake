@@ -199,6 +199,9 @@ export function DataSources() {
   const [connName, setConnName] = useState('')
   const [regPath, setRegPath] = useState('')
 
+  // MongoDB auth method
+  const [mongoAuthMethod, setMongoAuthMethod] = useState<'scram' | 'aws_iam' | 'connection_string'>('scram')
+
   // Connection test wizard
   const [testResult, setTestResult] = useState<ConnectionTestResponse | null>(null)
   const [testing, setTesting] = useState(false)
@@ -219,6 +222,7 @@ export function DataSources() {
     setSelectedConnector(connector)
     setConfigValues({})
     setConnName('')
+    setMongoAuthMethod('scram')
     setWizardStep('configure')
     setTestResult(null)
     setConnModal(true)
@@ -229,14 +233,36 @@ export function DataSources() {
     setTestResult(null)
     setWizardStep('test')
     try {
-      const result = await testConnection({
+      const isMongo = selectedConnector?.id === 'mongodb' || selectedConnector?.id === 'cdc_mongodb'
+      const baseParams = {
         conn_type: selectedConnector?.id || 'postgres',
         host: configValues.host || configValues.endpoint || configValues.contact_points || configValues.hosts || 'localhost',
         port: parseInt(configValues.port || '5432'),
         database: configValues.database || configValues.catalog || configValues.keyspace || configValues.bucket || configValues.dbname,
         username: configValues.username || configValues.user,
         password: configValues.password || configValues.secret_key,
-      })
+      }
+      // Add MongoDB-specific auth fields
+      if (isMongo) {
+        if (mongoAuthMethod === 'connection_string') {
+          Object.assign(baseParams, {
+            auth_method: 'connection_string',
+            connection_string: configValues.connection_string || '',
+            host: configValues.connection_string || 'localhost',
+          })
+        } else if (mongoAuthMethod === 'aws_iam') {
+          Object.assign(baseParams, {
+            auth_method: 'aws_iam',
+            aws_access_key: configValues.aws_access_key || '',
+            aws_secret_key: configValues.aws_secret_key || '',
+            aws_session_token: configValues.aws_session_token || '',
+            aws_region: configValues.aws_region || 'us-east-1',
+          })
+        } else {
+          Object.assign(baseParams, { auth_method: 'scram' })
+        }
+      }
+      const result = await testConnection(baseParams)
       setTestResult(result)
       if (result.success) setWizardStep('done')
     } catch (e: any) {
@@ -318,23 +344,37 @@ export function DataSources() {
         })
         toast.success('Storage configured')
         getS3Configs().then(r => setS3Configs(r.configs || []))
-      } else if (DB_LIKE_CATEGORIES.includes(selectedConnector.category) && configValues.host) {
-        const result = await addConnection({
+      } else if (DB_LIKE_CATEGORIES.includes(selectedConnector.category) && (configValues.host || (selectedConnector.id === 'mongodb' && mongoAuthMethod === 'connection_string'))) {
+        const isMongo = selectedConnector.id === 'mongodb' || selectedConnector.id === 'cdc_mongodb'
+        const connPayload: Parameters<typeof addConnection>[0] = {
           name: connName,
           conn_type: selectedConnector.id,
           host: configValues.host || 'localhost',
-          port: parseInt(configValues.port || '5432'),
+          port: parseInt(configValues.port || (isMongo ? '27017' : '5432')),
           database: configValues.database || configValues.catalog || configValues.keyspace || '',
           username: configValues.username || '',
           password: configValues.password || '',
-        })
+        }
+        if (isMongo) {
+          connPayload.auth_method = mongoAuthMethod
+          if (mongoAuthMethod === 'connection_string') {
+            connPayload.connection_string = configValues.connection_string || ''
+            connPayload.host = configValues.connection_string || 'localhost'
+          } else if (mongoAuthMethod === 'aws_iam') {
+            connPayload.aws_access_key = configValues.aws_access_key || ''
+            connPayload.aws_secret_key = configValues.aws_secret_key || ''
+            connPayload.aws_session_token = configValues.aws_session_token || ''
+            connPayload.aws_region = configValues.aws_region || 'us-east-1'
+          }
+        }
+        const result = await addConnection(connPayload)
         // Add connection immediately with syncing status
         const newConn: ConnectionEntry = {
           id: result.id,
           name: connName,
           conn_type: selectedConnector.id,
-          host: configValues.host || 'localhost',
-          port: parseInt(configValues.port || '5432'),
+          host: configValues.host || (isMongo && mongoAuthMethod === 'connection_string' ? configValues.connection_string || '' : 'localhost'),
+          port: parseInt(configValues.port || (isMongo ? '27017' : '5432')),
           database: configValues.database || configValues.catalog || configValues.keyspace || '',
           username: configValues.username || '',
           status: 'connected',
@@ -342,6 +382,7 @@ export function DataSources() {
           created_at: new Date().toISOString(),
           mode: ['postgres', 'mysql', 'sqlite', 'clickhouse'].includes(selectedConnector.id) ? 'federated' : 'snapshot',
           sync_status: result.sync_status === 'syncing' ? 'syncing' : 'ready',
+          ...(isMongo ? { auth_method: mongoAuthMethod } : {}),
         }
         setConnections(prev => [...prev, newConn])
         setTab('active')
@@ -652,16 +693,60 @@ export function DataSources() {
 
             <Input label="Connection Name" value={connName} onChange={e => setConnName(e.target.value)} placeholder={`my-${selectedConnector.id}`} />
 
-            {selectedConnector.config.map(field => (
-              <Input
-                key={field}
-                label={field.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase())}
-                type={field.includes('password') || field.includes('secret') || field.includes('key') || field.includes('token') ? 'password' : 'text'}
-                value={configValues[field] || ''}
-                onChange={e => setConfigValues(v => ({ ...v, [field]: e.target.value }))}
-                placeholder={field === 'host' ? 'localhost' : field === 'port' ? (selectedConnector.id === 'trino' || selectedConnector.id === 'presto' ? '8080' : '5432') : field === 'catalog' ? 'postgresql' : field === 'schema' ? 'public' : field === 'region' ? 'us-east-1' : field === 'ssl_mode' ? 'prefer' : ''}
-              />
-            ))}
+            {/* MongoDB auth method selector */}
+            {(selectedConnector.id === 'mongodb' || selectedConnector.id === 'cdc_mongodb') ? (
+              <>
+                <Select
+                  label="Authentication Method"
+                  value={mongoAuthMethod}
+                  onChange={e => { setMongoAuthMethod(e.target.value as typeof mongoAuthMethod); setConfigValues({}) }}
+                  options={[
+                    { value: 'scram', label: 'SCRAM (Username/Password)' },
+                    { value: 'aws_iam', label: 'AWS IAM' },
+                    { value: 'connection_string', label: 'Connection String' },
+                  ]}
+                />
+
+                {mongoAuthMethod === 'scram' && (
+                  <>
+                    <Input label="Host" value={configValues.host || ''} onChange={e => setConfigValues(v => ({ ...v, host: e.target.value }))} placeholder="localhost" />
+                    <Input label="Port" value={configValues.port || ''} onChange={e => setConfigValues(v => ({ ...v, port: e.target.value }))} placeholder="27017" />
+                    <Input label="Database" value={configValues.database || ''} onChange={e => setConfigValues(v => ({ ...v, database: e.target.value }))} placeholder="mydb" />
+                    <Input label="Username" value={configValues.username || ''} onChange={e => setConfigValues(v => ({ ...v, username: e.target.value }))} placeholder="admin" />
+                    <Input label="Password" type="password" value={configValues.password || ''} onChange={e => setConfigValues(v => ({ ...v, password: e.target.value }))} />
+                  </>
+                )}
+
+                {mongoAuthMethod === 'aws_iam' && (
+                  <>
+                    <Input label="Host (Atlas Cluster URL)" value={configValues.host || ''} onChange={e => setConfigValues(v => ({ ...v, host: e.target.value }))} placeholder="cluster0.abc123.mongodb.net" />
+                    <Input label="Database" value={configValues.database || ''} onChange={e => setConfigValues(v => ({ ...v, database: e.target.value }))} placeholder="mydb" />
+                    <Input label="AWS Access Key" type="password" value={configValues.aws_access_key || ''} onChange={e => setConfigValues(v => ({ ...v, aws_access_key: e.target.value }))} placeholder="AKIA..." />
+                    <Input label="AWS Secret Key" type="password" value={configValues.aws_secret_key || ''} onChange={e => setConfigValues(v => ({ ...v, aws_secret_key: e.target.value }))} />
+                    <Input label="AWS Session Token (optional)" type="password" value={configValues.aws_session_token || ''} onChange={e => setConfigValues(v => ({ ...v, aws_session_token: e.target.value }))} placeholder="Optional — for temporary credentials" />
+                    <Input label="AWS Region" value={configValues.aws_region || ''} onChange={e => setConfigValues(v => ({ ...v, aws_region: e.target.value }))} placeholder="us-east-1" />
+                  </>
+                )}
+
+                {mongoAuthMethod === 'connection_string' && (
+                  <>
+                    <Input label="Connection String" value={configValues.connection_string || ''} onChange={e => setConfigValues(v => ({ ...v, connection_string: e.target.value }))} placeholder="mongodb+srv://user:pass@cluster0.abc123.mongodb.net" />
+                    <Input label="Database" value={configValues.database || ''} onChange={e => setConfigValues(v => ({ ...v, database: e.target.value }))} placeholder="mydb" />
+                  </>
+                )}
+              </>
+            ) : (
+              selectedConnector.config.map(field => (
+                <Input
+                  key={field}
+                  label={field.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase())}
+                  type={field.includes('password') || field.includes('secret') || field.includes('key') || field.includes('token') ? 'password' : 'text'}
+                  value={configValues[field] || ''}
+                  onChange={e => setConfigValues(v => ({ ...v, [field]: e.target.value }))}
+                  placeholder={field === 'host' ? 'localhost' : field === 'port' ? (selectedConnector.id === 'trino' || selectedConnector.id === 'presto' ? '8080' : '5432') : field === 'catalog' ? 'postgresql' : field === 'schema' ? 'public' : field === 'region' ? 'us-east-1' : field === 'ssl_mode' ? 'prefer' : ''}
+                />
+              ))
+            )}
 
             {selectedConnector.status === 'preview' && (
               <div className="flex items-start gap-2 p-3 rounded-lg bg-amber-400/[0.04] border border-amber-400/10">

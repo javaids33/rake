@@ -88,6 +88,10 @@ export const createPipeline = (p: Partial<StreamingPipeline>) =>
   request<{ status: string }>('/api/v1/streaming/pipelines', { method: 'POST', body: JSON.stringify(p) })
 export const deletePipeline = (id: string) =>
   request<{ status: string }>(`/api/v1/streaming/pipelines/${id}`, { method: 'DELETE' })
+export const startPipeline = (id: string) =>
+  request<{ status: string; id: string; source_type: string }>(`/api/v1/streaming/pipelines/${id}/start`, { method: 'POST' })
+export const stopPipeline = (id: string) =>
+  request<{ status: string; id: string }>(`/api/v1/streaming/pipelines/${id}/stop`, { method: 'POST' })
 
 // Scheduler
 export const getSchedules = () => request<{ schedules: ScheduledJob[] }>('/api/v1/schedules')
@@ -104,7 +108,10 @@ export const getClusters = () => request<ClusterInfo>('/api/v1/clusters')
 
 // Connections
 export const getConnections = () => request<{ connections: ConnectionEntry[] }>('/api/v1/connections')
-export const addConnection = (c: { name: string; conn_type?: string; host: string; port: number; database: string; username: string; password?: string }) =>
+export const addConnection = (c: {
+  name: string; conn_type?: string; host: string; port: number; database: string; username: string; password?: string;
+  auth_method?: string; connection_string?: string; aws_access_key?: string; aws_secret_key?: string; aws_session_token?: string; aws_region?: string;
+}) =>
   request<{ status: string; sync_status: string; id: string; name: string; tables: string[] }>('/api/v1/connections', { method: 'POST', body: JSON.stringify(c) })
 export const deleteConnection = (id: string) =>
   request<{ status: string }>(`/api/v1/connections/${id}`, { method: 'DELETE' })

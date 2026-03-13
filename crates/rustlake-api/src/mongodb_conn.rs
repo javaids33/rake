@@ -1,5 +1,11 @@
 //! MongoDB connector — connects to external MongoDB databases, discovers collections,
 //! and converts documents to Arrow RecordBatches for registration in DataFusion.
+//!
+//! Supports multiple authentication methods:
+//! - SCRAM (default): username/password with authSource
+//! - AWS IAM: MONGODB-AWS mechanism for Atlas with IAM credentials
+//! - X.509: certificate-based authentication
+//! - Connection String: raw mongodb+srv:// or mongodb:// URI (e.g., Atlas)
 
 use std::sync::Arc;
 
@@ -9,37 +15,152 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
-use mongodb::bson::{Bson, Document};
-use mongodb::options::ClientOptions;
+use mongodb::bson::{doc, Bson, Document};
+use mongodb::options::{AuthMechanism, ClientOptions, Credential};
 use mongodb::Client;
+
+/// Supported MongoDB authentication methods.
+#[derive(Debug, Clone)]
+pub enum MongoAuthMethod {
+    /// Standard SCRAM-SHA-256/SHA-1 username/password authentication.
+    Scram,
+    /// AWS IAM authentication via MONGODB-AWS mechanism (for Atlas).
+    AwsIam,
+    /// X.509 certificate-based authentication.
+    X509,
+    /// Use a raw connection string (e.g., Atlas `mongodb+srv://` URI).
+    ConnectionString(String),
+}
+
+impl Default for MongoAuthMethod {
+    fn default() -> Self {
+        MongoAuthMethod::Scram
+    }
+}
 
 /// Connection parameters for a MongoDB database.
 #[derive(Clone)]
 pub struct MongoConnParams {
+    /// MongoDB host (hostname or Atlas cluster address).
     pub host: String,
+    /// MongoDB port (default 27017, ignored for Atlas SRV connections).
     pub port: u16,
+    /// Database name to connect to.
     pub database: String,
+    /// Username for SCRAM authentication.
     pub username: String,
+    /// Password for SCRAM authentication.
     pub password: String,
+    /// Authentication method. Defaults to SCRAM.
+    pub auth_method: MongoAuthMethod,
+    /// Auth source database. Defaults to "admin" for SCRAM, "$external" for AWS/X509.
+    pub auth_source: Option<String>,
+    /// AWS access key ID (for AWS IAM auth).
+    pub aws_access_key: Option<String>,
+    /// AWS secret access key (for AWS IAM auth).
+    pub aws_secret_key: Option<String>,
+    /// AWS session token (for temporary credentials with AWS IAM auth).
+    pub aws_session_token: Option<String>,
+    /// Whether to enable TLS. Defaults to true for Atlas connections.
+    pub tls: bool,
+    /// Replica set name (optional).
+    pub replica_set: Option<String>,
+}
+
+impl Default for MongoConnParams {
+    fn default() -> Self {
+        Self {
+            host: "localhost".to_string(),
+            port: 27017,
+            database: String::new(),
+            username: String::new(),
+            password: String::new(),
+            auth_method: MongoAuthMethod::default(),
+            auth_source: None,
+            aws_access_key: None,
+            aws_secret_key: None,
+            aws_session_token: None,
+            tls: false,
+            replica_set: None,
+        }
+    }
 }
 
 impl MongoConnParams {
-    fn connection_string(&self) -> String {
-        format!(
-            "mongodb://{}:{}@{}:{}/{}?authSource=admin",
-            self.username, self.password, self.host, self.port, self.database
-        )
+    /// Build a MongoDB `Client` from these parameters, respecting the auth method.
+    pub async fn build_client(&self) -> Result<Client, String> {
+        let mut options = match &self.auth_method {
+            MongoAuthMethod::Scram => {
+                let auth_source = self.auth_source.as_deref().unwrap_or("admin");
+                let uri = format!(
+                    "mongodb://{}:{}@{}:{}/{}?authSource={}&directConnection=true",
+                    self.username, self.password, self.host, self.port,
+                    self.database, auth_source
+                );
+                ClientOptions::parse(&uri)
+                    .await
+                    .map_err(|e| format!("Failed to parse SCRAM connection string: {}", e))?
+            }
+            MongoAuthMethod::AwsIam => {
+                // AWS IAM uses mongodb+srv:// for Atlas or mongodb:// with explicit params
+                let uri = if self.host.contains(".mongodb.net") {
+                    // Atlas cluster — use SRV
+                    format!("mongodb+srv://{}/{}?authSource=$external&authMechanism=MONGODB-AWS",
+                        self.host, self.database)
+                } else {
+                    let tls_flag = if self.tls { "&tls=true" } else { "" };
+                    format!("mongodb://{}:{}/{}?authSource=$external&authMechanism=MONGODB-AWS{}",
+                        self.host, self.port, self.database, tls_flag)
+                };
+                ClientOptions::parse(&uri)
+                    .await
+                    .map_err(|e| format!("Failed to parse AWS IAM connection string: {}", e))?
+            }
+            MongoAuthMethod::X509 => {
+                let uri = format!(
+                    "mongodb://{}:{}/{}?authMechanism=MONGODB-X509&tls=true",
+                    self.host, self.port, self.database
+                );
+                ClientOptions::parse(&uri)
+                    .await
+                    .map_err(|e| format!("Failed to parse X509 connection string: {}", e))?
+            }
+            MongoAuthMethod::ConnectionString(uri) => {
+                ClientOptions::parse(uri)
+                    .await
+                    .map_err(|e| format!("Failed to parse connection string: {}", e))?
+            }
+        };
+
+        // For AWS IAM, set credential with AWS properties
+        if matches!(self.auth_method, MongoAuthMethod::AwsIam) {
+            let mechanism_props = self.aws_session_token.as_ref().map(|token| {
+                doc! { "AWS_SESSION_TOKEN": token }
+            });
+            let credential = Credential::builder()
+                .username(self.aws_access_key.clone())
+                .password(self.aws_secret_key.clone())
+                .mechanism(AuthMechanism::MongoDbAws)
+                .source(Some("$external".to_string()))
+                .mechanism_properties(mechanism_props)
+                .build();
+            options.credential = Some(credential);
+        }
+
+        // Apply replica set if specified
+        if let Some(ref rs) = self.replica_set {
+            options.repl_set_name = Some(rs.clone());
+        }
+
+        Client::with_options(options)
+            .map_err(|e| format!("Failed to create MongoDB client: {}", e))
     }
+
 }
 
 /// Connect to MongoDB and discover all user collections (excluding system collections).
 pub async fn connect_and_discover(params: &MongoConnParams) -> Result<Vec<String>, String> {
-    let client_options = ClientOptions::parse(&params.connection_string())
-        .await
-        .map_err(|e| format!("Failed to parse MongoDB connection string: {}", e))?;
-
-    let client = Client::with_options(client_options)
-        .map_err(|e| format!("Failed to create MongoDB client: {}", e))?;
+    let client = params.build_client().await?;
 
     let db = client.database(&params.database);
 
@@ -66,12 +187,7 @@ pub async fn fetch_collection_as_arrow(
     params: &MongoConnParams,
     collection_name: &str,
 ) -> Result<RecordBatch, String> {
-    let client_options = ClientOptions::parse(&params.connection_string())
-        .await
-        .map_err(|e| format!("Failed to parse MongoDB connection string: {}", e))?;
-
-    let client = Client::with_options(client_options)
-        .map_err(|e| format!("Failed to create MongoDB client: {}", e))?;
+    let client = params.build_client().await?;
 
     let db = client.database(&params.database);
     let collection = db.collection::<Document>(collection_name);

@@ -19,6 +19,7 @@ use rustlake_vector::embedding::SimpleEmbeddingGenerator;
 use rustlake_vector::search::VectorIndex;
 
 mod iceberg_s3;
+mod mongodb_cdc;
 mod mongodb_conn;
 mod providers;
 mod routes;
@@ -142,6 +143,8 @@ async fn bootstrap_demo_connections(state: Arc<AppState>) {
                     sync_status: "ready".to_string(),
                     sync_error: None,
                     sync_progress: None,
+                    auth_method: "scram".to_string(),
+                    connection_string: None,
                 };
                 state.seed_connection(entry, pg_pass).await;
                 tracing::info!(count = tables.len(), "Bootstrap: Postgres tables registered (federated)");
@@ -197,6 +200,8 @@ async fn bootstrap_demo_connections(state: Arc<AppState>) {
                     sync_status: "ready".to_string(),
                     sync_error: None,
                     sync_progress: None,
+                    auth_method: "scram".to_string(),
+                    connection_string: None,
                 };
                 state.seed_connection(entry, mysql_pass).await;
                 tracing::info!(count = tables.len(), "Bootstrap: MySQL tables registered (federated)");
@@ -224,6 +229,7 @@ async fn bootstrap_demo_connections(state: Arc<AppState>) {
         database: mongo_db.clone(),
         username: mongo_user.clone(),
         password: mongo_pass.clone(),
+        ..Default::default()
     };
 
     match mongodb_conn::connect_and_discover(&mongo_params).await {
@@ -243,6 +249,8 @@ async fn bootstrap_demo_connections(state: Arc<AppState>) {
                 sync_status: "ready".to_string(),
                 sync_error: None,
                 sync_progress: None,
+                auth_method: "scram".to_string(),
+                connection_string: None,
             };
 
             if state.seed_connection(entry, mongo_pass.clone()).await {
@@ -792,11 +800,63 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
+    // ── Hardware & resource banner ──────────────────────────────────
+    let cpu_cores = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(1);
+    let total_memory_bytes: u64 = {
+        #[cfg(target_os = "macos")]
+        {
+            std::process::Command::new("sysctl")
+                .args(["-n", "hw.memsize"])
+                .output()
+                .ok()
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .unwrap_or(0)
+        }
+        #[cfg(target_os = "linux")]
+        {
+            std::fs::read_to_string("/proc/meminfo")
+                .ok()
+                .and_then(|s| {
+                    s.lines()
+                        .find(|l| l.starts_with("MemTotal:"))
+                        .and_then(|l| l.split_whitespace().nth(1).and_then(|v| v.parse::<u64>().ok()).map(|kb| kb * 1024))
+                })
+                .unwrap_or(0)
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        { 0u64 }
+    };
+    let os_name = std::env::consts::OS;
+    let arch = std::env::consts::ARCH;
+    let hostname = hostname::get().map(|h| h.to_string_lossy().to_string()).unwrap_or_else(|_| "unknown".into());
+    let pid = std::process::id();
+    let mem_gb = total_memory_bytes as f64 / 1_073_741_824.0;
+    let saved_conns = state.connections.try_read().map(|c| c.len()).unwrap_or(0);
+    let saved_passwords = state.connection_passwords.try_read().map(|p| p.len()).unwrap_or(0);
+    let saved_s3 = state.migration_s3_creds.try_read().map(|s| s.len()).unwrap_or(0);
+    let cred_secured = std::env::var("RUSTLAKE_SECRET_KEY").map(|k| !k.is_empty()).unwrap_or(false);
+
     tracing::info!("╔══════════════════════════════════════════════════════════╗");
     tracing::info!("║              RustLake Data Platform v0.1.0               ║");
     tracing::info!("╚══════════════════════════════════════════════════════════╝");
+    tracing::info!(
+        host = %hostname, os = os_name, arch = arch, pid = pid,
+        cores = cpu_cores, memory_gb = format!("{:.1}", mem_gb),
+        "System"
+    );
+    tracing::info!(
+        datafusion = "51", arrow = "57",
+        duckdb = state.duckdb_available(), polars = state.polars_available(),
+        flight = flight_enabled,
+        "Engines"
+    );
+    tracing::info!(
+        connections = saved_conns, passwords = saved_passwords,
+        s3_creds = saved_s3, encrypted = cred_secured,
+        "Restored state"
+    );
     tracing::info!(role = ?node_role, bind = %bind_addr, "HTTP API server starting");
-    tracing::info!(flight = flight_enabled, duckdb = state.duckdb_available(), polars = state.polars_available(), "Engine status");
     tracing::debug!("RUST_LOG={}", std::env::var("RUST_LOG").unwrap_or_else(|_| "info,rustlake_*=debug,tower_http=debug".to_string()));
 
     // Build the Axum router

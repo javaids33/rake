@@ -64,10 +64,11 @@ services:
       retries: 5
     restart: unless-stopped
 
-  # MongoDB — document store, seeded with demo data subset
+  # MongoDB — document store with replica set (required for Change Streams CDC)
   mongo:
     image: mongo:7
     container_name: rustlake-mongo
+    command: ["--replSet", "rs0", "--bind_ip_all", "--keyFile", "/etc/mongo/rs-keyfile"]
     ports:
       - "27018:27017"
     environment:
@@ -77,12 +78,13 @@ services:
     volumes:
       - mongo-data:/data/db
       - ./docker/mongo/init.js:/docker-entrypoint-initdb.d/01-init.js:ro
+      - ./docker/mongo/rs-keyfile:/etc/mongo/rs-keyfile:ro
     healthcheck:
       test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')", "-u", "rustlake", "-p", "rustlake", "--authenticationDatabase", "admin"]
       interval: 10s
       timeout: 5s
-      start_period: 15s
-      retries: 5
+      start_period: 30s
+      retries: 10
     restart: unless-stopped
 
   # --------------------------------------------------------------------------

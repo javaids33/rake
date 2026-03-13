@@ -661,6 +661,8 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             get(list_pipelines).post(create_pipeline),
         )
         .route("/api/v1/streaming/pipelines/{id}", delete(delete_pipeline))
+        .route("/api/v1/streaming/pipelines/{id}/start", post(start_pipeline))
+        .route("/api/v1/streaming/pipelines/{id}/stop", post(stop_pipeline))
         // S3/Object storage config
         .route(
             "/api/v1/storage/s3",
@@ -2485,6 +2487,85 @@ pub struct AddConnectionRequest {
     /// Database password.
     #[serde(default)]
     pub password: String,
+    /// Authentication method: "scram" (default), "aws_iam", "x509", "connection_string".
+    #[serde(default = "default_auth_method")]
+    pub auth_method: String,
+    /// Raw connection string (for auth_method = "connection_string", e.g., Atlas mongodb+srv:// URI).
+    #[serde(default)]
+    pub connection_string: String,
+    /// AWS access key ID (for auth_method = "aws_iam").
+    #[serde(default)]
+    pub aws_access_key: String,
+    /// AWS secret access key (for auth_method = "aws_iam").
+    #[serde(default)]
+    pub aws_secret_key: String,
+    /// AWS session token (for temporary credentials with auth_method = "aws_iam").
+    #[serde(default)]
+    pub aws_session_token: String,
+    /// AWS region (for auth_method = "aws_iam"). Reserved for future use.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub aws_region: String,
+}
+
+fn default_auth_method() -> String {
+    "scram".to_string()
+}
+
+/// Build `MongoConnParams` from an `AddConnectionRequest`.
+fn build_mongo_params(req: &AddConnectionRequest) -> crate::mongodb_conn::MongoConnParams {
+    let auth_method = match req.auth_method.as_str() {
+        "aws_iam" => crate::mongodb_conn::MongoAuthMethod::AwsIam,
+        "x509" => crate::mongodb_conn::MongoAuthMethod::X509,
+        "connection_string" if !req.connection_string.is_empty() => {
+            crate::mongodb_conn::MongoAuthMethod::ConnectionString(req.connection_string.clone())
+        }
+        _ => crate::mongodb_conn::MongoAuthMethod::Scram,
+    };
+    crate::mongodb_conn::MongoConnParams {
+        host: req.host.clone(),
+        port: req.port,
+        database: req.database.clone(),
+        username: req.username.clone(),
+        password: req.password.clone(),
+        auth_method,
+        auth_source: None,
+        aws_access_key: if req.aws_access_key.is_empty() { None } else { Some(req.aws_access_key.clone()) },
+        aws_secret_key: if req.aws_secret_key.is_empty() { None } else { Some(req.aws_secret_key.clone()) },
+        aws_session_token: if req.aws_session_token.is_empty() { None } else { Some(req.aws_session_token.clone()) },
+        tls: req.auth_method == "aws_iam" || req.auth_method == "x509",
+        replica_set: None,
+    }
+}
+
+/// Build `MongoConnParams` from a saved `ConnectionEntry` and password.
+fn build_mongo_params_from_entry(
+    conn: &ConnectionEntry,
+    password: &str,
+) -> crate::mongodb_conn::MongoConnParams {
+    let auth_method = match conn.auth_method.as_str() {
+        "aws_iam" => crate::mongodb_conn::MongoAuthMethod::AwsIam,
+        "x509" => crate::mongodb_conn::MongoAuthMethod::X509,
+        "connection_string" => {
+            let uri = conn.connection_string.clone().unwrap_or_default();
+            crate::mongodb_conn::MongoAuthMethod::ConnectionString(uri)
+        }
+        _ => crate::mongodb_conn::MongoAuthMethod::Scram,
+    };
+    crate::mongodb_conn::MongoConnParams {
+        host: conn.host.clone(),
+        port: conn.port,
+        database: conn.database.clone(),
+        username: conn.username.clone(),
+        password: password.to_string(),
+        auth_method,
+        auth_source: None,
+        aws_access_key: None, // AWS keys are not persisted in ConnectionEntry for security
+        aws_secret_key: None,
+        aws_session_token: None,
+        tls: conn.auth_method == "aws_iam" || conn.auth_method == "x509",
+        replica_set: None,
+    }
 }
 
 fn default_conn_type() -> String {
@@ -2920,9 +3001,16 @@ async fn add_connection(
                 .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: format!("Cannot reach MySQL: {}", e) })))?;
         }
         "mongodb" => {
-            let addr = format!("{}:{}", req.host, req.port);
-            tokio::net::TcpStream::connect(&addr).await
-                .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: format!("Cannot reach MongoDB: {}", e) })))?;
+            // For connection_string or Atlas (aws_iam), try parsing the URI instead of TCP check
+            if req.auth_method == "connection_string" || req.auth_method == "aws_iam" {
+                let params = build_mongo_params(&req);
+                params.build_client().await
+                    .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: format!("Cannot connect to MongoDB: {}", e) })))?;
+            } else {
+                let addr = format!("{}:{}", req.host, req.port);
+                tokio::net::TcpStream::connect(&addr).await
+                    .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: format!("Cannot reach MongoDB: {}", e) })))?;
+            }
         }
         #[cfg(feature = "sqlite")]
         "sqlite" => {
@@ -2952,6 +3040,8 @@ async fn add_connection(
         sync_status: "syncing".to_string(),
         sync_error: None,
         sync_progress: None,
+        auth_method: req.auth_method.clone(),
+        connection_string: if req.connection_string.is_empty() { None } else { Some(req.connection_string.clone()) },
     };
 
     state.add_connection_entry(entry).await;
@@ -3055,13 +3145,7 @@ async fn discover_and_register_tables(
         }
         "mongodb" => {
             use futures::stream::{self, StreamExt};
-            let mongo_params = crate::mongodb_conn::MongoConnParams {
-                host: req.host.clone(),
-                port: req.port,
-                database: req.database.clone(),
-                username: req.username.clone(),
-                password: req.password.clone(),
-            };
+            let mongo_params = build_mongo_params(req);
             let collections = crate::mongodb_conn::connect_and_discover(&mongo_params)
                 .await?;
             let ctx = state.ctx.read().await;
@@ -3334,13 +3418,7 @@ pub(crate) async fn reconnect_saved_connections(state: Arc<AppState>) {
                 }
             }
             "mongodb" => {
-                let mongo_params = crate::mongodb_conn::MongoConnParams {
-                    host: conn.host.clone(),
-                    port: conn.port,
-                    database: conn.database.clone(),
-                    username: conn.username.clone(),
-                    password: password.clone(),
-                };
+                let mongo_params = build_mongo_params_from_entry(&conn, &password);
                 match crate::mongodb_conn::connect_and_discover(&mongo_params).await {
                     Ok(collections) => {
                         // Register each collection as a MemTable in the "mongo" schema
@@ -3684,6 +3762,7 @@ async fn register_external_table(
             let mongo_params = crate::mongodb_conn::MongoConnParams {
                 host: conn_host, port: conn_port, database: conn_database,
                 username: conn_username, password,
+                ..Default::default()
             };
             let batch = crate::mongodb_conn::fetch_collection_as_arrow(&mongo_params, &table_name).await
                 .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e })))?;
@@ -4112,6 +4191,8 @@ async fn run_bootstrap(
                     sync_status: "ready".to_string(),
                     sync_error: None,
                     sync_progress: None,
+                    auth_method: "scram".to_string(),
+                    connection_string: None,
                 };
                 state.seed_connection(entry, pg_pass).await;
                 results.insert("postgres".to_string(), serde_json::json!({
@@ -4183,6 +4264,8 @@ async fn run_bootstrap(
                     sync_status: "ready".to_string(),
                     sync_error: None,
                     sync_progress: None,
+                    auth_method: "scram".to_string(),
+                    connection_string: None,
                 };
                 state.seed_connection(entry, mysql_pass).await;
                 results.insert("mysql".to_string(), serde_json::json!({
@@ -4214,6 +4297,7 @@ async fn run_bootstrap(
         database: mongo_db.clone(),
         username: mongo_user.clone(),
         password: mongo_pass,
+        ..Default::default()
     };
 
     match crate::mongodb_conn::connect_and_discover(&mongo_params).await {
@@ -4233,6 +4317,8 @@ async fn run_bootstrap(
                 sync_status: "ready".to_string(),
                 sync_error: None,
                 sync_progress: None,
+                auth_method: "scram".to_string(),
+                connection_string: None,
             };
             state.seed_connection(entry, "rustlake".to_string()).await;
 
@@ -5183,6 +5269,215 @@ async fn delete_pipeline(
         "status": "deleted",
         "id": id,
     })))
+}
+
+/// POST /api/v1/streaming/pipelines/{id}/start — start a CDC pipeline.
+///
+/// For `mongodb-cdc` source type, creates a `MongoDbCdcSource` and spawns a
+/// background task that reads change events and logs them. The task handle is
+/// stored so it can be stopped later.
+async fn start_pipeline(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    // Check if already running
+    {
+        let cdc_sources = state.cdc_sources.read().await;
+        if let Some(src) = cdc_sources.get(&id) {
+            if src.is_running() {
+                return Err((
+                    StatusCode::CONFLICT,
+                    Json(ErrorResponse {
+                        error: format!("Pipeline '{}' is already running", id),
+                    }),
+                ));
+            }
+        }
+    }
+
+    // Look up the pipeline
+    let pipeline = {
+        let pipelines = state.streaming_pipelines.read().await;
+        pipelines.iter().find(|p| p.id == id).cloned()
+    };
+    let pipeline = pipeline.ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("Pipeline '{}' not found", id),
+            }),
+        )
+    })?;
+
+    if pipeline.source_type == "mongodb-cdc" {
+        // Parse CDC config from source_config
+        let cdc_config: crate::mongodb_cdc::CdcSourceConfig =
+            serde_json::from_value(pipeline.source_config.clone()).map_err(|e| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: format!("Invalid mongodb-cdc source_config: {}", e),
+                    }),
+                )
+            })?;
+
+        // Find the MongoDB connection to get params
+        let mongo_params = if !cdc_config.connection_id.is_empty() {
+            let connections = state.connections.read().await;
+            let conn = connections
+                .iter()
+                .find(|c| c.id == cdc_config.connection_id)
+                .cloned();
+            drop(connections);
+            match conn {
+                Some(c) => {
+                    let passwords = state.connection_passwords.read().await;
+                    let password = passwords.get(&c.id).cloned().unwrap_or_default();
+                    drop(passwords);
+                    build_mongo_params_from_entry(&c, &password)
+                }
+                None => {
+                    return Err((
+                        StatusCode::NOT_FOUND,
+                        Json(ErrorResponse {
+                            error: format!(
+                                "MongoDB connection '{}' not found",
+                                cdc_config.connection_id
+                            ),
+                        }),
+                    ));
+                }
+            }
+        } else {
+            // Use database field directly with default local connection
+            crate::mongodb_conn::MongoConnParams {
+                database: cdc_config.database.clone(),
+                ..Default::default()
+            }
+        };
+
+        // Start the CDC source
+        match crate::mongodb_cdc::MongoDbCdcSource::start(&mongo_params, &cdc_config, None).await {
+            Ok((source, mut rx)) => {
+                let source = std::sync::Arc::new(source);
+
+                // Store the source handle
+                state
+                    .cdc_sources
+                    .write()
+                    .await
+                    .insert(id.clone(), source.clone());
+
+                // Update pipeline status
+                {
+                    let mut pipelines = state.streaming_pipelines.write().await;
+                    if let Some(p) = pipelines.iter_mut().find(|p| p.id == id) {
+                        p.status = "running".to_string();
+                    }
+                }
+
+                // Spawn background task to consume CDC events
+                let state_clone = state.clone();
+                let pipeline_id = id.clone();
+                tokio::spawn(async move {
+                    let mut total_events: u64 = 0;
+                    while let Some(result) = rx.recv().await {
+                        match result {
+                            Ok(batch) => {
+                                let rows = batch.num_rows() as u64;
+                                total_events += rows;
+                                tracing::info!(
+                                    pipeline_id = %pipeline_id,
+                                    batch_rows = rows,
+                                    total_events = total_events,
+                                    "CDC batch received"
+                                );
+                                // Update events_processed counter
+                                let mut pipelines =
+                                    state_clone.streaming_pipelines.write().await;
+                                if let Some(p) =
+                                    pipelines.iter_mut().find(|p| p.id == pipeline_id)
+                                {
+                                    p.events_processed = total_events;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    pipeline_id = %pipeline_id,
+                                    error = %e,
+                                    "CDC source error"
+                                );
+                                break;
+                            }
+                        }
+                    }
+                    // Pipeline ended — update status
+                    let mut pipelines = state_clone.streaming_pipelines.write().await;
+                    if let Some(p) = pipelines.iter_mut().find(|p| p.id == pipeline_id) {
+                        p.status = "stopped".to_string();
+                    }
+                    state_clone.cdc_sources.write().await.remove(&pipeline_id);
+                    tracing::info!(pipeline_id = %pipeline_id, total_events = total_events, "CDC pipeline ended");
+                });
+
+                Ok(Json(serde_json::json!({
+                    "status": "started",
+                    "id": id,
+                    "source_type": "mongodb-cdc",
+                })))
+            }
+            Err(e) => Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Failed to start CDC source: {}", e),
+                }),
+            )),
+        }
+    } else {
+        // For non-CDC pipelines, just update status
+        let mut pipelines = state.streaming_pipelines.write().await;
+        if let Some(p) = pipelines.iter_mut().find(|p| p.id == id) {
+            p.status = "running".to_string();
+        }
+        Ok(Json(serde_json::json!({
+            "status": "started",
+            "id": id,
+            "source_type": pipeline.source_type,
+        })))
+    }
+}
+
+/// POST /api/v1/streaming/pipelines/{id}/stop — stop a running pipeline.
+async fn stop_pipeline(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    // Stop CDC source if running
+    {
+        let cdc_sources = state.cdc_sources.read().await;
+        if let Some(source) = cdc_sources.get(&id) {
+            source.stop();
+        }
+    }
+    // Remove from active sources
+    state.cdc_sources.write().await.remove(&id);
+
+    // Update pipeline status
+    let mut pipelines = state.streaming_pipelines.write().await;
+    if let Some(p) = pipelines.iter_mut().find(|p| p.id == id) {
+        p.status = "stopped".to_string();
+        Ok(Json(serde_json::json!({
+            "status": "stopped",
+            "id": id,
+        })))
+    } else {
+        Err((
+            StatusCode::NOT_FOUND,
+            Json(ErrorResponse {
+                error: format!("Pipeline '{}' not found", id),
+            }),
+        ))
+    }
 }
 
 // ── S3 / Object Storage Config Handlers ─────────────────────────────

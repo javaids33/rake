@@ -238,6 +238,12 @@ export interface ConnectionEntry {
   mode: 'federated' | 'snapshot'
   sync_status?: 'syncing' | 'ready' | 'error'
   sync_error?: string
+  auth_method?: 'scram' | 'aws_iam' | 'connection_string'
+  connection_string?: string
+  aws_access_key?: string
+  aws_secret_key?: string
+  aws_session_token?: string
+  aws_region?: string
 }
 
 export interface ProviderInfo {
@@ -438,6 +444,12 @@ export interface ConnectionTestRequest {
   database?: string
   username?: string
   password?: string
+  auth_method?: string
+  connection_string?: string
+  aws_access_key?: string
+  aws_secret_key?: string
+  aws_session_token?: string
+  aws_region?: string
 }
 
 export interface ConnectionTestResponse {

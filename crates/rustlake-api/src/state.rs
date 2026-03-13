@@ -146,10 +146,20 @@ pub struct ConnectionEntry {
     /// Progress detail for syncing connections.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sync_progress: Option<String>,
+    /// Authentication method: "scram" (default), "aws_iam", "x509", "connection_string".
+    #[serde(default = "default_auth_method")]
+    pub auth_method: String,
+    /// Raw connection string (for auth_method = "connection_string").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_string: Option<String>,
 }
 
 fn default_sync_ready() -> String {
     "ready".to_string()
+}
+
+fn default_auth_method() -> String {
+    "scram".to_string()
 }
 
 /// A user-created transform model.
@@ -595,6 +605,8 @@ pub struct AppState {
     pub read_only_tables: RwLock<std::collections::HashSet<String>>,
     /// Encrypted credential store for persisting passwords and S3 credentials.
     pub credential_store: crate::credential_store::CredentialStore,
+    /// Active MongoDB CDC sources keyed by pipeline ID.
+    pub cdc_sources: RwLock<std::collections::HashMap<String, std::sync::Arc<crate::mongodb_cdc::MongoDbCdcSource>>>,
 }
 
 impl AppState {
@@ -670,6 +682,7 @@ impl AppState {
             engine_tracker: RwLock::new(EnginePerformanceTracker::new()),
             read_only_tables: RwLock::new(std::collections::HashSet::new()),
             credential_store: crate::credential_store::CredentialStore::new(),
+            cdc_sources: RwLock::new(std::collections::HashMap::new()),
         }
     }
 
@@ -721,6 +734,7 @@ impl AppState {
             engine_tracker: RwLock::new(EnginePerformanceTracker::new()),
             read_only_tables: RwLock::new(std::collections::HashSet::new()),
             credential_store: crate::credential_store::CredentialStore::new(),
+            cdc_sources: RwLock::new(std::collections::HashMap::new()),
         }
     }
 
