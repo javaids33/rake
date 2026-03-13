@@ -9,7 +9,7 @@ import { Tabs } from '../components/ui/Tabs'
 import { EmptyState } from '../components/ui/EmptyState'
 import { StatusDot } from '../components/ui/StatusDot'
 import { cn } from '../lib/utils'
-import { getConnections, addConnection, updateConnection, deleteConnection, getS3Configs, addS3Config, deleteS3Config, uploadFile, registerTable, testConnection, importConnections, exportConnections } from '../api/client'
+import { getConnections, addConnection, updateConnection, deleteConnection, getS3Configs, addS3Config, updateS3Config, deleteS3Config, uploadFile, registerTable, testConnection, importConnections, exportConnections } from '../api/client'
 import { useServerEvents } from '../components/layout/Shell'
 import type { TrinoScanEvent } from '../hooks/useEventStream'
 import { useAppStore } from '../stores/app'
@@ -204,6 +204,8 @@ export function DataSources() {
 
   // Edit connection
   const [editingConnection, setEditingConnection] = useState<ConnectionEntry | null>(null)
+  // Edit S3 connection
+  const [editingS3, setEditingS3] = useState<S3Config | null>(null)
 
   // Connection test wizard
   const [testResult, setTestResult] = useState<ConnectionTestResponse | null>(null)
@@ -256,6 +258,25 @@ export function DataSources() {
     setConnModal(true)
   }
 
+  const handleEditS3 = (c: S3Config) => {
+    const connector = CONNECTOR_CATALOG.find(cn => S3_COMPAT_IDS.includes(cn.id))
+    if (!connector) return
+    setEditingS3(c)
+    setEditingConnection(null)
+    setSelectedConnector(connector)
+    setConnName(c.name)
+    setConfigValues({
+      endpoint: c.endpoint || '',
+      access_key: c.access_key || '',
+      secret_key: '', // Don't pre-fill secret — user must re-enter
+      bucket: c.bucket || '',
+      region: c.region || 'us-east-1',
+    })
+    setWizardStep('configure')
+    setTestResult(null)
+    setConnModal(true)
+  }
+
   const handleTestConnection = async () => {
     setTesting(true)
     setTestResult(null)
@@ -300,11 +321,17 @@ export function DataSources() {
   }
 
   // Subscribe to SSE connection sync events instead of polling
-  const { onConnectionSync, onTrinoScan } = useServerEvents()
+  const { onConnectionSync, onTrinoScan, onS3Scan } = useServerEvents()
   const { darkMode } = useAppStore()
 
   // Track Trino scan progress per connection
   const [trinoScanState, setTrinoScanState] = useState<Record<string, { phase: string; status: string }>>({})
+
+  // Track S3 scan progress per config
+  const [s3ScanState, setS3ScanState] = useState<Record<string, {
+    phase: string; detail: string; scanned: number; total: number; found: number;
+    elapsed_ms: number; formats: Record<string, number>
+  }>>({})
 
   useEffect(() => {
     const unsub = onConnectionSync((event) => {
@@ -358,19 +385,59 @@ export function DataSources() {
     return unsub
   }, [onTrinoScan])
 
+  // Subscribe to S3 scan progress events
+  useEffect(() => {
+    const unsub = onS3Scan((event) => {
+      if (event.sync_status !== 'syncing') {
+        // Scan complete — refresh configs and clear progress
+        getS3Configs().then(r => setS3Configs(r.configs || [])).catch(() => {})
+        setS3ScanState(prev => {
+          const next = { ...prev }
+          delete next[event.name]
+          return next
+        })
+        if (event.found > 0) {
+          const fmts = Object.entries(event.formats || {}).map(([k, v]) => `${v} ${k}`).join(', ')
+          toast.success(`S3 scan complete: ${event.found} tables (${fmts})`, { id: `s3-scan-${event.name}` })
+        }
+      } else {
+        setS3ScanState(prev => ({
+          ...prev,
+          [event.name]: {
+            phase: event.phase || 'scanning',
+            detail: event.detail || '',
+            scanned: event.scanned,
+            total: event.total,
+            found: event.found,
+            elapsed_ms: event.elapsed_ms,
+            formats: event.formats || {},
+          },
+        }))
+      }
+    })
+    return unsub
+  }, [onS3Scan])
+
   const handleConnect = async () => {
     if (!selectedConnector || !connName.trim()) return
     try {
       if (selectedConnector.category === 'storage' && S3_COMPAT_IDS.includes(selectedConnector.id)) {
-        await addS3Config({
+        const s3Payload = {
           name: connName,
           endpoint: configValues.endpoint || '',
           access_key: configValues.access_key || '',
           secret_key: configValues.secret_key || '',
           bucket: configValues.bucket || '',
           region: configValues.region || 'us-east-1',
-        })
-        toast.success('Storage configured')
+        }
+        if (editingS3) {
+          await updateS3Config(editingS3.name, s3Payload)
+          toast.success('S3 connection updated — re-scanning tables')
+          setEditingS3(null)
+        } else {
+          await addS3Config(s3Payload)
+          toast.success('Storage configured')
+        }
         getS3Configs().then(r => setS3Configs(r.configs || []))
       } else if (DB_LIKE_CATEGORIES.includes(selectedConnector.category) && (configValues.host || (selectedConnector.id === 'mongodb' && mongoAuthMethod === 'connection_string'))) {
         const isMongo = selectedConnector.id === 'mongodb' || selectedConnector.id === 'cdc_mongodb'
@@ -680,9 +747,19 @@ export function DataSources() {
                 const s3IsError = s3SyncStatus === 'error'
                 const s3IsReady = s3SyncStatus === 'ready'
                 const dotColor = s3IsError ? '#ef4444' : s3IsSyncing ? '#f59e0b' : '#22c55e'
+                const scanProg = s3ScanState[c.name]
+                const pct = scanProg && scanProg.total > 0 ? Math.round((scanProg.scanned / scanProg.total) * 100) : 0
+                // Format badges for ready state
+                const fmtCounts = c.format_counts || (scanProg?.formats) || {}
+                const FORMAT_COLORS: Record<string, string> = {
+                  iceberg: 'bg-sky-400/10 text-sky-400 border-sky-400/20',
+                  delta: 'bg-yellow-400/10 text-yellow-400 border-yellow-400/20',
+                  hudi: 'bg-orange-400/10 text-orange-400 border-orange-400/20',
+                  parquet: 'bg-zinc-400/10 text-zinc-400 border-zinc-400/20',
+                }
                 return (
-                <Card key={c.name} className="flex items-center gap-4">
-                  <div className="w-10 h-10 rounded-lg bg-amber-400/[0.06] border border-amber-400/10 flex items-center justify-center relative">
+                <Card key={c.name} className="flex items-start gap-4">
+                  <div className="w-10 h-10 rounded-lg bg-amber-400/[0.06] border border-amber-400/10 flex items-center justify-center relative flex-shrink-0 mt-0.5">
                     <HardDrive className="w-5 h-5 text-amber-400" />
                     <span style={{
                       position: 'absolute', top: -2, right: -2, width: 10, height: 10, borderRadius: '50%',
@@ -691,12 +768,14 @@ export function DataSources() {
                       animation: s3IsSyncing ? 'pulse 2s infinite' : undefined,
                     }} />
                   </div>
-                  <div className="flex-1">
+                  <div className="flex-1 min-w-0">
                     <div className="flex items-center gap-2">
                       <h3 className="text-sm font-semibold text-zinc-200">{c.name}</h3>
                       <Badge className="bg-amber-400/8 text-amber-400/80 border-amber-400/10">S3</Badge>
                       {s3IsSyncing ? (
-                        <Badge className="bg-amber-400/10 text-amber-400 border-amber-400/20 text-2xs animate-pulse">Scanning...</Badge>
+                        <Badge className="bg-amber-400/10 text-amber-400 border-amber-400/20 text-2xs animate-pulse">
+                          {scanProg ? `Scanning ${pct}%` : 'Scanning...'}
+                        </Badge>
                       ) : s3IsError ? (
                         <Badge className="bg-red-400/10 text-red-400 border-red-400/20 text-2xs">Scan Failed</Badge>
                       ) : s3IsReady ? (
@@ -706,25 +785,79 @@ export function DataSources() {
                       ) : (
                         <Badge className="bg-emerald-400/8 text-emerald-400/80 border-emerald-400/10 text-2xs">Connected</Badge>
                       )}
+                      {/* Format badges when ready */}
+                      {s3IsReady && Object.entries(fmtCounts).map(([fmt, count]) => (
+                        <Badge key={fmt} className={cn("text-2xs", FORMAT_COLORS[fmt] || '')}>
+                          {count} {fmt}
+                        </Badge>
+                      ))}
                     </div>
                     <p className="text-2xs font-mono text-zinc-500 mt-0.5">{c.endpoint}</p>
                     {s3IsError && c.sync_error && (
                       <p className="text-2xs text-red-400/80 mt-1">{c.sync_error}</p>
                     )}
-                    <div className="flex items-center gap-1.5 mt-2 flex-wrap">
-                      <Badge>{c.bucket}</Badge>
-                      <Badge>{c.region}</Badge>
-                    </div>
+
+                    {/* Live scan progress */}
+                    {s3IsSyncing && scanProg && (
+                      <div className="mt-2 space-y-1.5">
+                        {/* Progress bar */}
+                        <div className="w-full h-1.5 rounded-full bg-white/[0.04] overflow-hidden">
+                          <div
+                            className="h-full rounded-full bg-amber-400/60 transition-all duration-300"
+                            style={{ width: `${Math.max(pct, 2)}%` }}
+                          />
+                        </div>
+                        <div className="flex items-center justify-between">
+                          <p className="text-2xs text-amber-400/70 truncate max-w-[280px]">{scanProg.detail}</p>
+                          <div className="flex items-center gap-3 text-2xs text-zinc-500 flex-shrink-0">
+                            <span>{scanProg.scanned}/{scanProg.total} dirs</span>
+                            <span>{scanProg.found} found</span>
+                            <span>{(scanProg.elapsed_ms / 1000).toFixed(1)}s</span>
+                          </div>
+                        </div>
+                        {/* Format breakdown during scan */}
+                        {Object.keys(scanProg.formats).length > 0 && (
+                          <div className="flex items-center gap-1.5 flex-wrap">
+                            {Object.entries(scanProg.formats).map(([fmt, count]) => (
+                              <Badge key={fmt} className={cn("text-2xs", FORMAT_COLORS[fmt] || '')}>
+                                {count} {fmt}
+                              </Badge>
+                            ))}
+                          </div>
+                        )}
+                      </div>
+                    )}
+
+                    {!s3IsSyncing && (
+                      <div className="flex items-center gap-1.5 mt-2 flex-wrap">
+                        <Badge>{c.bucket}</Badge>
+                        <Badge>{c.region}</Badge>
+                      </div>
+                    )}
                     {c.tables && c.tables.length > 0 && (
                       <div className="flex items-center gap-1.5 mt-2 flex-wrap">
-                        {c.tables.slice(0, 5).map(t => <Badge key={t} className="text-2xs">{t}</Badge>)}
+                        {c.tables.slice(0, 5).map((t: string) => {
+                          const tblType = c.table_types?.[t] || ''
+                          const isMV = tblType.toUpperCase().includes('MATERIALIZED')
+                          const isView = !isMV && tblType.toUpperCase().includes('VIEW')
+                          return (
+                            <Badge key={t} className={cn("text-2xs", isMV && "bg-violet-400/10 text-violet-400 border-violet-400/20", isView && "bg-sky-400/10 text-sky-400 border-sky-400/20")}>
+                              {isMV && 'MV: '}{isView && 'VIEW: '}{t.includes('.') ? t.split('.').pop() : t}
+                            </Badge>
+                          )
+                        })}
                         {c.tables.length > 5 && <Badge className="text-2xs">+{c.tables.length - 5} more</Badge>}
                       </div>
                     )}
                   </div>
-                  <Button variant="ghost" size="sm" onClick={() => { deleteS3Config(c.name); setS3Configs(cs => cs.filter(x => x.name !== c.name)) }}>
-                    <Trash2 className="w-3.5 h-3.5 text-zinc-600" />
-                  </Button>
+                  <div className="flex items-center gap-1">
+                    <Button variant="ghost" size="sm" onClick={() => handleEditS3(c)}>
+                      <Pencil className="w-3.5 h-3.5 text-zinc-500" />
+                    </Button>
+                    <Button variant="ghost" size="sm" onClick={() => { deleteS3Config(c.name); setS3Configs(cs => cs.filter(x => x.name !== c.name)) }}>
+                      <Trash2 className="w-3.5 h-3.5 text-zinc-600" />
+                    </Button>
+                  </div>
                 </Card>
                 )
               })}
@@ -859,7 +992,7 @@ export function DataSources() {
       )}
 
       {/* Dynamic connector config modal */}
-      <Modal open={connModal} onClose={() => { setConnModal(false); setEditingConnection(null) }} title={selectedConnector ? (editingConnection ? `Edit ${selectedConnector.name} Connection` : `Connect ${selectedConnector.name}`) : 'Connect'} width="max-w-lg">
+      <Modal open={connModal} onClose={() => { setConnModal(false); setEditingConnection(null); setEditingS3(null) }} title={selectedConnector ? (editingConnection || editingS3 ? `Edit ${selectedConnector.name} Connection` : `Connect ${selectedConnector.name}`) : 'Connect'} width="max-w-lg">
         {selectedConnector && (
           <div className="space-y-4">
             {/* Wizard step indicator */}
@@ -1023,7 +1156,7 @@ export function DataSources() {
             <div className="flex justify-end gap-2 pt-2">
               <Button variant="secondary" size="sm" onClick={() => setConnModal(false)}>Cancel</Button>
               <Button variant="primary" size="sm" onClick={handleConnect} icon={<Link2 className="w-3.5 h-3.5" />}>
-                {editingConnection ? 'Update' : selectedConnector.category === 'format' ? 'Register' : 'Connect'}
+                {editingConnection || editingS3 ? 'Update' : selectedConnector.category === 'format' ? 'Register' : 'Connect'}
               </Button>
             </div>
           </div>

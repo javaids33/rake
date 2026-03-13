@@ -264,6 +264,19 @@ export interface S3Config {
   sync_status?: 'syncing' | 'ready' | 'error' | 'configured'
   sync_error?: string
   tables?: string[]
+  /** Table type info: table_name → type (e.g. "MATERIALIZED_VIEW", "VIEW") */
+  table_types?: Record<string, string>
+  /** Table format info: table_name → format (e.g. "iceberg", "delta", "parquet") */
+  table_formats?: Record<string, string>
+  /** Format breakdown: format → count */
+  format_counts?: Record<string, number>
+  /** Scan progress fields */
+  scan_progress?: string
+  scan_detail?: string
+  scan_scanned?: number
+  scan_total?: number
+  scan_found?: number
+  scan_elapsed_ms?: number
 }
 
 export interface ClusterInfo {

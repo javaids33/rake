@@ -30,8 +30,22 @@ export interface TrinoScanEvent {
   sync_status: string
 }
 
+/** S3 bucket scan progress pushed via SSE. */
+export interface S3ScanEvent {
+  name: string
+  phase: string | null
+  detail: string | null
+  scanned: number
+  total: number
+  found: number
+  elapsed_ms: number
+  formats: Record<string, number>
+  sync_status: string
+}
+
 type SyncListener = (event: ConnectionSyncEvent) => void
 type TrinoScanListener = (event: TrinoScanEvent) => void
+type S3ScanListener = (event: S3ScanEvent) => void
 
 /**
  * Hook that maintains a single SSE connection to `/api/v1/events`.
@@ -47,6 +61,7 @@ export function useEventStream() {
   const [connected, setConnected] = useState(false)
   const syncListenersRef = useRef<Set<SyncListener>>(new Set())
   const trinoScanListenersRef = useRef<Set<TrinoScanListener>>(new Set())
+  const s3ScanListenersRef = useRef<Set<S3ScanListener>>(new Set())
   const sourceRef = useRef<EventSource | null>(null)
 
   // Allow components to subscribe to connection sync events
@@ -59,6 +74,12 @@ export function useEventStream() {
   const onTrinoScan = useCallback((listener: TrinoScanListener) => {
     trinoScanListenersRef.current.add(listener)
     return () => { trinoScanListenersRef.current.delete(listener) }
+  }, [])
+
+  // Allow components to subscribe to S3 scan progress events
+  const onS3Scan = useCallback((listener: S3ScanListener) => {
+    s3ScanListenersRef.current.add(listener)
+    return () => { s3ScanListenersRef.current.delete(listener) }
   }, [])
 
   useEffect(() => {
@@ -91,6 +112,13 @@ export function useEventStream() {
         } catch { /* ignore parse errors */ }
       })
 
+      es.addEventListener('s3_scan', (e) => {
+        try {
+          const data: S3ScanEvent = JSON.parse(e.data)
+          s3ScanListenersRef.current.forEach(fn => fn(data))
+        } catch { /* ignore parse errors */ }
+      })
+
       es.onerror = () => {
         setConnected(false)
         es.close()
@@ -108,5 +136,5 @@ export function useEventStream() {
     }
   }, [])
 
-  return { status, connected, onConnectionSync, onTrinoScan }
+  return { status, connected, onConnectionSync, onTrinoScan, onS3Scan }
 }

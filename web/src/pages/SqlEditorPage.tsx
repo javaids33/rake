@@ -1241,7 +1241,11 @@ export function SqlEditorPage() {
                       <HardDrive className="w-3 h-3 text-emerald-400 flex-shrink-0" />
                       <span className="text-xs font-semibold text-zinc-300 truncate">{s3.name}</span>
                       <Badge className="ml-auto text-2xs bg-emerald-500/15 text-emerald-400 border-emerald-500/20">
-                        {tableCount > 0 ? `${tableCount} tables` : s3.status}
+                        {tableCount > 0 ? (() => {
+                          const fmts = s3.format_counts || {}
+                          const fmtStr = Object.entries(fmts).map(([k, v]) => `${v} ${k}`).join(', ')
+                          return fmtStr || `${tableCount} tables`
+                        })() : s3.sync_status === 'syncing' ? 'Scanning...' : s3.status}
                       </Badge>
                     </button>
                     {isExpanded && (
@@ -1291,8 +1295,30 @@ export function SqlEditorPage() {
                                               ? <ChevronDown className="w-2.5 h-2.5 text-zinc-600 flex-shrink-0" />
                                               : <ChevronRight className="w-2.5 h-2.5 text-zinc-600 flex-shrink-0" />
                                             }
-                                            <Table2 className="w-3 h-3 text-zinc-500 flex-shrink-0" />
+                                            {(() => {
+                                              const tt = (s3.table_types || {})[fullName] || ''
+                                              const fmt = (s3.table_formats || {})[fullName] || ''
+                                              const isMV = tt.toUpperCase().includes('MATERIALIZED')
+                                              const isView = !isMV && tt.toUpperCase().includes('VIEW')
+                                              const isDelta = fmt === 'delta'
+                                              const isHudi = fmt === 'hudi'
+                                              const isPq = fmt === 'parquet'
+                                              const iconColor = isMV ? 'text-violet-400' : isView ? 'text-sky-400' : isDelta ? 'text-yellow-400' : isHudi ? 'text-orange-400' : isPq ? 'text-zinc-400' : 'text-sky-400/60'
+                                              return isMV || isView
+                                                ? <Layers className={`w-3 h-3 ${iconColor} flex-shrink-0`} />
+                                                : <Table2 className={`w-3 h-3 ${iconColor} flex-shrink-0`} />
+                                            })()}
                                             <span className="text-2xs font-mono text-zinc-400 truncate">{tblName}</span>
+                                            {(() => {
+                                              const tt = (s3.table_types || {})[fullName] || ''
+                                              const fmt = (s3.table_formats || {})[fullName] || ''
+                                              const isMV = tt.toUpperCase().includes('MATERIALIZED')
+                                              const isView = !isMV && tt.toUpperCase().includes('VIEW')
+                                              if (isMV) return <span className="text-2xs text-violet-400/70 ml-1 flex-shrink-0">MV</span>
+                                              if (isView) return <span className="text-2xs text-sky-400/70 ml-1 flex-shrink-0">VIEW</span>
+                                              if (fmt && fmt !== 'iceberg') return <span className={`text-2xs ml-1 flex-shrink-0 ${fmt === 'delta' ? 'text-yellow-400/60' : fmt === 'hudi' ? 'text-orange-400/60' : 'text-zinc-500'}`}>{fmt}</span>
+                                              return null
+                                            })()}
                                           </button>
                                           <Tooltip content="Insert SELECT query" position="left">
                                             <button

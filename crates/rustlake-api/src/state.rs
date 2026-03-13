@@ -285,12 +285,39 @@ pub struct S3Config {
     /// Iceberg tables discovered via S3 warehouse scan.
     #[serde(default)]
     pub tables: Vec<String>,
+    /// Table type info from Iceberg metadata properties (table_name → table_type, e.g. "MATERIALIZED_VIEW").
+    #[serde(default)]
+    pub table_types: std::collections::HashMap<String, String>,
+    /// Table format info: table_name → format (e.g. "iceberg", "delta", "parquet", "hudi").
+    #[serde(default)]
+    pub table_formats: std::collections::HashMap<String, String>,
     /// Sync status for async discovery: "ready", "syncing", "error".
     #[serde(default = "default_sync_ready")]
     pub sync_status: String,
     /// Error message if sync/discovery failed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sync_error: Option<String>,
+    /// Current scan progress phase and detail for real-time UI updates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan_progress: Option<String>,
+    /// Scan progress detail (e.g., "Found iceberg (sales.orders)").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan_detail: Option<String>,
+    /// Tables scanned so far (numerator for progress bar).
+    #[serde(default)]
+    pub scan_scanned: usize,
+    /// Total directories to scan (denominator for progress bar).
+    #[serde(default)]
+    pub scan_total: usize,
+    /// Tables found so far during scan.
+    #[serde(default)]
+    pub scan_found: usize,
+    /// Elapsed scan time in ms.
+    #[serde(default)]
+    pub scan_elapsed_ms: u128,
+    /// Format breakdown during/after scan.
+    #[serde(default)]
+    pub format_counts: std::collections::HashMap<String, usize>,
 }
 
 /// S3 credentials for a set of buckets, fetched from the credentials API.

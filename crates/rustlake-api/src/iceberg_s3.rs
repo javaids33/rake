@@ -1,23 +1,15 @@
-//! S3-based Iceberg table discovery.
+//! S3-based table format discovery — agnostic scanner for any bucket.
 //!
-//! Scans an S3 warehouse path directly to discover Iceberg tables
-//! without routing through Trino's SQL engine. This is dramatically faster:
-//! - S3 ListObjectsV2: ~50ms per 1000 objects
-//! - Trino SHOW CREATE TABLE: ~200-500ms per table (parse → plan → execute → poll)
+//! Scans S3 warehouse paths to discover tables in any format:
+//! - **Iceberg**: `metadata/v*.metadata.json` (Trino, Spark, Flink, Databricks)
+//! - **Delta Lake**: `_delta_log/*.json` (Databricks, Spark)
+//! - **Hudi**: `.hoodie/hoodie.properties` (Apache Hudi)
+//! - **Raw Parquet**: directories containing `*.parquet` files (no metadata)
 //!
-//! For a warehouse with 100 tables, S3 discovery takes ~2s vs Trino ~30-60s.
+//! Handles both hierarchical warehouses (db.db/table/) and flat layouts (table/).
 //!
-//! Layout expected:
-//! ```text
-//! s3://bucket/warehouse/
-//!   database_name/
-//!     table_name/
-//!       metadata/
-//!         v1.metadata.json     ← Iceberg table metadata (schema, partitions)
-//!         00000-....avro       ← manifest lists
-//!       data/
-//!         *.parquet            ← data files
-//! ```
+//! Performance: S3 ListObjectsV2 ~50ms per 1000 objects.
+//! For 500 tables → ~5-10s with 16 concurrent S3 operations.
 
 use futures::stream::{self, StreamExt};
 use object_store::aws::AmazonS3Builder;
@@ -25,31 +17,82 @@ use object_store::path::Path as ObjectPath;
 use object_store::ObjectStore;
 use serde::Serialize;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 
-/// Maximum concurrent S3 operations during discovery.
-const S3_DISCOVERY_PARALLELISM: usize = 8;
+/// Concurrent S3 operations for directory listing (phase 1-2).
+const DISCOVERY_DIR_PARALLELISM: usize = 16;
+/// Concurrent S3 operations for metadata reads (phase 3).
+const DISCOVERY_META_PARALLELISM: usize = 24;
 
-/// A discovered Iceberg table from S3 scanning.
+/// Table format detected from S3 directory layout.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum TableFormat {
+    Iceberg,
+    Delta,
+    Hudi,
+    Parquet,
+}
+
+impl std::fmt::Display for TableFormat {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TableFormat::Iceberg => write!(f, "iceberg"),
+            TableFormat::Delta => write!(f, "delta"),
+            TableFormat::Hudi => write!(f, "hudi"),
+            TableFormat::Parquet => write!(f, "parquet"),
+        }
+    }
+}
+
+/// A discovered table from S3 scanning (any format).
 #[derive(Debug, Clone, Serialize)]
-pub struct IcebergTableInfo {
+pub struct DiscoveredTable {
     pub database: String,
     pub table_name: String,
     pub s3_location: String,
+    pub format: TableFormat,
     pub metadata_location: Option<String>,
     pub column_count: usize,
-    pub columns: Vec<IcebergColumnInfo>,
+    pub columns: Vec<ColumnInfo>,
     pub format_version: Option<i64>,
     pub partition_fields: Vec<String>,
     pub snapshot_count: usize,
     pub last_updated_ms: Option<i64>,
+    /// Table type from metadata properties (e.g., "MATERIALIZED_VIEW", "VIEW").
+    #[serde(default)]
+    pub table_type: String,
+    /// Arbitrary properties from table metadata.
+    #[serde(default)]
+    pub properties: std::collections::HashMap<String, String>,
 }
 
+// Keep the old name as an alias for backward compatibility in routes.rs
+pub type IcebergTableInfo = DiscoveredTable;
+
 #[derive(Debug, Clone, Serialize)]
-pub struct IcebergColumnInfo {
+pub struct ColumnInfo {
     pub name: String,
     pub data_type: String,
     pub nullable: bool,
     pub ordinal: i32,
+}
+
+// Keep old name for backward compat
+pub type IcebergColumnInfo = ColumnInfo;
+
+/// Scan progress event emitted during discovery.
+#[derive(Debug, Clone, Serialize)]
+pub struct ScanProgress {
+    pub phase: String,
+    pub detail: String,
+    pub databases_found: usize,
+    pub tables_found: usize,
+    pub tables_scanned: usize,
+    pub total_to_scan: usize,
+    pub elapsed_ms: u128,
+    /// Formats found so far.
+    pub formats: std::collections::HashMap<String, usize>,
 }
 
 /// Result of scanning a warehouse.
@@ -57,9 +100,11 @@ pub struct IcebergColumnInfo {
 pub struct WarehouseScanResult {
     pub warehouse_path: String,
     pub databases: Vec<String>,
-    pub tables: Vec<IcebergTableInfo>,
+    pub tables: Vec<DiscoveredTable>,
     pub total_tables: usize,
     pub scan_duration_ms: u128,
+    /// Breakdown by format.
+    pub format_counts: std::collections::HashMap<String, usize>,
 }
 
 /// Build an S3 ObjectStore from credentials.
@@ -86,74 +131,259 @@ pub fn build_s3_store(
     Ok(Arc::new(store))
 }
 
-/// Scan an S3 warehouse path to discover Iceberg databases and tables.
+/// Scan an S3 warehouse path to discover tables in all supported formats.
 ///
-/// This is the fast path — no Trino queries, pure S3 ListObjects.
+/// Sends progress updates via the optional `progress_tx` channel.
+/// The caller can use this to emit SSE events to the frontend.
 pub async fn scan_warehouse(
     store: &Arc<dyn ObjectStore>,
     warehouse_prefix: &str,
 ) -> Result<WarehouseScanResult, String> {
+    scan_warehouse_with_progress(store, warehouse_prefix, None).await
+}
+
+/// Scan with progress reporting. Pass a channel sender to receive live updates.
+pub async fn scan_warehouse_with_progress(
+    store: &Arc<dyn ObjectStore>,
+    warehouse_prefix: &str,
+    progress_tx: Option<mpsc::UnboundedSender<ScanProgress>>,
+) -> Result<WarehouseScanResult, String> {
     let start = std::time::Instant::now();
     let prefix = normalize_prefix(warehouse_prefix);
 
-    // Step 1: List top-level directories = databases
-    let databases = list_directories(store, &prefix).await?;
-    tracing::info!(count = databases.len(), prefix = %prefix, "S3 scan: discovered databases");
+    let emit = |phase: &str, detail: &str, dbs: usize, found: usize, scanned: usize, total: usize, formats: &std::collections::HashMap<String, usize>| {
+        if let Some(ref tx) = progress_tx {
+            let _ = tx.send(ScanProgress {
+                phase: phase.to_string(),
+                detail: detail.to_string(),
+                databases_found: dbs,
+                tables_found: found,
+                tables_scanned: scanned,
+                total_to_scan: total,
+                elapsed_ms: start.elapsed().as_millis(),
+                formats: formats.clone(),
+            });
+        }
+    };
 
-    if databases.is_empty() {
+    let empty_formats: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+
+    // ── Phase 1: Discover top-level directories ──────────────────────
+    emit("listing", "Listing bucket directories...", 0, 0, 0, 0, &empty_formats);
+
+    let top_level_dirs = list_directories(store, &prefix).await?;
+    let top_level_files = list_files_with_dirs(store, &prefix).await?;
+
+    tracing::info!(count = top_level_dirs.len(), files = top_level_files.files.len(), prefix = %prefix, "S3 scan: discovered top-level entries");
+
+    // Determine structure: is this a hierarchical warehouse (db/table/) or flat (table/)?
+    // Check if top-level dirs contain metadata/ or _delta_log/ — if so, it's flat layout.
+    // We probe the first few dirs in parallel to decide.
+    let mut databases: Vec<String> = Vec::new();
+    let mut flat_tables: Vec<(String, String)> = Vec::new(); // (dir_name, path)
+
+    if top_level_dirs.is_empty() {
+        // Bucket root has no subdirs — check for parquet files at root
+        emit("complete", "Empty bucket — no tables found", 0, 0, 0, 0, &empty_formats);
         return Ok(WarehouseScanResult {
             warehouse_path: prefix,
             databases: vec![],
             tables: vec![],
             total_tables: 0,
             scan_duration_ms: start.elapsed().as_millis(),
+            format_counts: empty_formats,
         });
     }
 
-    // Step 2: List tables within each database (parallel, 8 concurrent)
-    let db_tables: Vec<(String, Vec<String>)> = stream::iter(databases.iter().cloned())
-        .map(|db| {
+    emit("probing", &format!("Probing {} directories for table formats...", top_level_dirs.len()), 0, 0, 0, top_level_dirs.len(), &empty_formats);
+
+    // Probe top-level dirs to detect layout
+    let probe_results: Vec<(String, DirProbe)> = stream::iter(top_level_dirs.iter().cloned())
+        .map(|dir| {
             let store = store.clone();
             let prefix = prefix.clone();
             async move {
-                let db_prefix = format!("{}{}/", prefix, db);
-                let tables = list_directories(&store, &db_prefix).await.unwrap_or_default();
-                (db, tables)
+                let dir_path = format!("{}{}/", prefix, dir);
+                let probe = probe_directory(&store, &dir_path).await;
+                (dir, probe)
             }
         })
-        .buffer_unordered(S3_DISCOVERY_PARALLELISM)
+        .buffer_unordered(DISCOVERY_DIR_PARALLELISM)
         .collect()
         .await;
 
-    // Step 3: For each table, check for metadata/ dir and read metadata.json (parallel, 8 concurrent)
+    for (dir, probe) in &probe_results {
+        if probe.is_table {
+            // This top-level dir IS a table (flat layout)
+            flat_tables.push((dir.clone(), format!("{}{}/", prefix, dir)));
+        } else if probe.has_subdirs {
+            // This dir has subdirs — treat as a database
+            databases.push(dir.clone());
+        }
+        // Dirs with neither metadata nor subdirs are ignored (e.g., _spark_metadata, logs)
+    }
+
+    emit(
+        "discovering",
+        &format!("{} databases, {} top-level tables found", databases.len(), flat_tables.len()),
+        databases.len(),
+        flat_tables.len(),
+        0,
+        0,
+        &empty_formats,
+    );
+
+    // ── Phase 2: List tables within each database (parallel) ─────────
+    let db_tables: Vec<(String, Vec<(String, String)>)> = if !databases.is_empty() {
+        let results: Vec<(String, Vec<(String, String)>)> = stream::iter(databases.iter().cloned())
+            .map(|db| {
+                let store = store.clone();
+                let prefix = prefix.clone();
+                async move {
+                    let db_prefix = format!("{}{}/", prefix, db);
+                    let subdirs = list_directories(&store, &db_prefix).await.unwrap_or_default();
+                    let table_paths: Vec<(String, String)> = subdirs.into_iter()
+                        .map(|tbl| {
+                            let path = format!("{}{}/", db_prefix, tbl);
+                            (tbl, path)
+                        })
+                        .collect();
+                    (db, table_paths)
+                }
+            })
+            .buffer_unordered(DISCOVERY_DIR_PARALLELISM)
+            .collect()
+            .await;
+        results
+    } else {
+        vec![]
+    };
+
+    // Combine: flat tables go into a "default" database, hierarchical tables keep their DB
     let mut all_table_paths: Vec<(String, String, String)> = Vec::new(); // (db, table, path)
+    for (table_name, path) in &flat_tables {
+        all_table_paths.push(("default".to_string(), table_name.clone(), path.clone()));
+    }
     for (db, tables) in &db_tables {
-        for table in tables {
-            let path = format!("{}{}/{}/", prefix, db, table);
-            all_table_paths.push((db.clone(), table.clone(), path));
+        for (table_name, path) in tables {
+            all_table_paths.push((db.clone(), table_name.clone(), path.clone()));
         }
     }
 
-    let table_infos: Vec<Option<IcebergTableInfo>> = stream::iter(all_table_paths)
+    let total_to_scan = all_table_paths.len();
+    emit(
+        "scanning",
+        &format!("Scanning {} directories for table metadata...", total_to_scan),
+        databases.len(),
+        0,
+        0,
+        total_to_scan,
+        &empty_formats,
+    );
+
+    tracing::info!(
+        databases = databases.len(),
+        flat_tables = flat_tables.len(),
+        total_dirs = total_to_scan,
+        "S3 scan: starting multi-format table discovery"
+    );
+
+    // ── Phase 3: Discover tables in all formats (high parallelism) ───
+    // We use a counter + progress sender to report real-time progress.
+    let scanned_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let found_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let format_counts = Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::<String, usize>::new()));
+
+    let table_infos: Vec<Option<DiscoveredTable>> = stream::iter(all_table_paths)
         .map(|(db, table, path)| {
             let store = store.clone();
+            let scanned = scanned_counter.clone();
+            let found = found_counter.clone();
+            let fmt_counts = format_counts.clone();
+            let ptx = progress_tx.clone();
+            let total = total_to_scan;
+            let db_count = databases.len();
+            let start_time = start;
             async move {
-                discover_iceberg_table(&store, &db, &table, &path).await
+                let result = discover_table(&store, &db, &table, &path).await;
+
+                let s = scanned.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if let Some(ref tbl) = result {
+                    found.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let mut fc = fmt_counts.lock().await;
+                    *fc.entry(tbl.format.to_string()).or_insert(0) += 1;
+
+                    // Emit progress every table found, or every 10 scanned
+                    if let Some(ref tx) = ptx {
+                        let f = found.load(std::sync::atomic::Ordering::Relaxed);
+                        let _ = tx.send(ScanProgress {
+                            phase: "scanning".to_string(),
+                            detail: format!("Found {} ({}.{})", tbl.format, db, table),
+                            databases_found: db_count,
+                            tables_found: f,
+                            tables_scanned: s,
+                            total_to_scan: total,
+                            elapsed_ms: start_time.elapsed().as_millis(),
+                            formats: fc.clone(),
+                        });
+                    }
+                } else if s % 10 == 0 || s == total {
+                    // Progress update even for non-tables (every 10)
+                    if let Some(ref tx) = ptx {
+                        let f = found.load(std::sync::atomic::Ordering::Relaxed);
+                        let fc = fmt_counts.lock().await;
+                        let _ = tx.send(ScanProgress {
+                            phase: "scanning".to_string(),
+                            detail: format!("Scanned {}/{} directories...", s, total),
+                            databases_found: db_count,
+                            tables_found: f,
+                            tables_scanned: s,
+                            total_to_scan: total,
+                            elapsed_ms: start_time.elapsed().as_millis(),
+                            formats: fc.clone(),
+                        });
+                    }
+                }
+
+                result
             }
         })
-        .buffer_unordered(S3_DISCOVERY_PARALLELISM)
+        .buffer_unordered(DISCOVERY_META_PARALLELISM)
         .collect()
         .await;
 
-    let tables: Vec<IcebergTableInfo> = table_infos.into_iter().flatten().collect();
+    let tables: Vec<DiscoveredTable> = table_infos.into_iter().flatten().collect();
     let total_tables = tables.len();
-    let db_names: Vec<String> = db_tables.iter().map(|(db, _)| db.clone()).collect();
 
+    let final_format_counts = {
+        let guard = format_counts.lock().await;
+        guard.clone()
+    };
+
+    // Collect all unique database names
+    let mut db_names: Vec<String> = databases;
+    if !flat_tables.is_empty() && !db_names.contains(&"default".to_string()) {
+        db_names.push("default".to_string());
+    }
+    db_names.sort();
+    db_names.dedup();
+
+    let duration = start.elapsed().as_millis();
     tracing::info!(
         tables = total_tables,
         databases = db_names.len(),
-        elapsed_ms = start.elapsed().as_millis(),
-        "S3 Iceberg warehouse scan complete"
+        elapsed_ms = duration,
+        "S3 multi-format scan complete"
+    );
+
+    emit(
+        "complete",
+        &format!("Done! {} tables in {}ms", total_tables, duration),
+        db_names.len(),
+        total_tables,
+        total_to_scan,
+        total_to_scan,
+        &final_format_counts,
     );
 
     Ok(WarehouseScanResult {
@@ -161,37 +391,100 @@ pub async fn scan_warehouse(
         databases: db_names,
         tables,
         total_tables,
-        scan_duration_ms: start.elapsed().as_millis(),
+        scan_duration_ms: duration,
+        format_counts: final_format_counts,
     })
 }
 
-/// Discover a single Iceberg table from its S3 path.
-/// Checks for metadata/ directory and reads the latest metadata.json.
+/// Result of probing a directory to determine if it's a table or database.
+#[derive(Debug)]
+struct DirProbe {
+    is_table: bool,
+    has_subdirs: bool,
+}
+
+/// Quick probe: check if a directory contains table metadata markers or subdirectories.
+async fn probe_directory(store: &Arc<dyn ObjectStore>, dir_path: &str) -> DirProbe {
+    // ListWithDelimiter gives us immediate children (files + subdirs)
+    let obj_prefix = ObjectPath::from(dir_path);
+    let result = match store.list_with_delimiter(Some(&obj_prefix)).await {
+        Ok(r) => r,
+        Err(_) => return DirProbe { is_table: false, has_subdirs: false },
+    };
+
+    let subdir_names: Vec<String> = result.common_prefixes.iter()
+        .filter_map(|p| {
+            let s = p.to_string();
+            let trimmed = s.trim_end_matches('/');
+            trimmed.rsplit('/').next().map(|n| n.to_string())
+        })
+        .collect();
+
+    // Check for format markers in subdirectory names
+    let has_metadata = subdir_names.iter().any(|d| d == "metadata");
+    let has_delta_log = subdir_names.iter().any(|d| d == "_delta_log");
+    let has_hoodie = subdir_names.iter().any(|d| d == ".hoodie");
+    let has_data_dir = subdir_names.iter().any(|d| d == "data");
+
+    // Check file names for parquet/orc at this level
+    let file_names: Vec<String> = result.objects.iter()
+        .filter_map(|o| {
+            let s = o.location.to_string();
+            s.rsplit('/').next().map(|n| n.to_string())
+        })
+        .collect();
+    let has_parquet_files = file_names.iter().any(|f| f.ends_with(".parquet") || f.ends_with(".snappy.parquet"));
+
+    let is_table = has_metadata || has_delta_log || has_hoodie || has_parquet_files || (has_data_dir && !has_metadata);
+    let has_subdirs = !subdir_names.is_empty();
+
+    DirProbe { is_table, has_subdirs }
+}
+
+/// Discover a single table from its S3 path — tries all formats.
+async fn discover_table(
+    store: &Arc<dyn ObjectStore>,
+    database: &str,
+    table_name: &str,
+    table_path: &str,
+) -> Option<DiscoveredTable> {
+    // Try formats in priority order: Iceberg → Delta → Hudi → raw Parquet
+    if let Some(t) = discover_iceberg_table(store, database, table_name, table_path).await {
+        return Some(t);
+    }
+    if let Some(t) = discover_delta_table(store, database, table_name, table_path).await {
+        return Some(t);
+    }
+    if let Some(t) = discover_hudi_table(store, database, table_name, table_path).await {
+        return Some(t);
+    }
+    if let Some(t) = discover_parquet_dir(store, database, table_name, table_path).await {
+        return Some(t);
+    }
+    None
+}
+
+// ── Iceberg Discovery ──────────────────────────────────────────────
+
+/// Discover an Iceberg table from metadata/v*.metadata.json.
 async fn discover_iceberg_table(
     store: &Arc<dyn ObjectStore>,
     database: &str,
     table_name: &str,
     table_path: &str,
-) -> Option<IcebergTableInfo> {
+) -> Option<DiscoveredTable> {
     let metadata_prefix = format!("{}metadata/", table_path);
-
-    // List metadata files to find the latest version-hint or v*.metadata.json
     let meta_files = list_files(store, &metadata_prefix).await.ok()?;
 
     if meta_files.is_empty() {
-        // No metadata/ directory — might not be an Iceberg table
         return None;
     }
 
-    // Find the latest metadata JSON file
-    // Iceberg convention: v{N}.metadata.json where higher N = newer
     let metadata_file = find_latest_metadata(&meta_files)?;
     let metadata_path = format!("{}{}", metadata_prefix, metadata_file);
 
-    // Read and parse the metadata JSON
-    let metadata = read_iceberg_metadata(store, &metadata_path).await.ok()?;
+    let metadata = read_json_file(store, &metadata_path).await.ok()?;
 
-    // Extract schema from metadata
     let (columns, format_version) = parse_iceberg_schema(&metadata);
     let partition_fields = parse_partition_spec(&metadata);
     let snapshot_count = metadata.get("snapshots")
@@ -201,24 +494,352 @@ async fn discover_iceberg_table(
     let last_updated = metadata.get("last-updated-ms")
         .and_then(|v| v.as_i64());
 
-    let s3_location = table_path.trim_end_matches('/').to_string();
+    let properties = parse_iceberg_properties(&metadata);
+    let table_type = properties.get("table_type")
+        .or_else(|| properties.get("table-type"))
+        .cloned()
+        .unwrap_or_default();
 
-    Some(IcebergTableInfo {
+    Some(DiscoveredTable {
         database: database.to_string(),
         table_name: table_name.to_string(),
-        s3_location,
+        s3_location: table_path.trim_end_matches('/').to_string(),
+        format: TableFormat::Iceberg,
         metadata_location: Some(metadata_path),
         column_count: columns.len(),
-        columns: columns.clone(),
+        columns,
         format_version: Some(format_version),
         partition_fields,
         snapshot_count,
         last_updated_ms: last_updated,
+        table_type,
+        properties,
     })
 }
 
-/// Read and parse an Iceberg metadata JSON file from S3.
-async fn read_iceberg_metadata(
+// ── Delta Lake Discovery ───────────────────────────────────────────
+
+/// Discover a Delta Lake table from `_delta_log/` directory.
+///
+/// Delta tables store their metadata in `_delta_log/*.json` files.
+/// The latest JSON commit file contains the schema and partition info.
+async fn discover_delta_table(
+    store: &Arc<dyn ObjectStore>,
+    database: &str,
+    table_name: &str,
+    table_path: &str,
+) -> Option<DiscoveredTable> {
+    let delta_prefix = format!("{}_delta_log/", table_path);
+    let files = list_files(store, &delta_prefix).await.ok()?;
+
+    if files.is_empty() {
+        return None;
+    }
+
+    // Find the latest commit JSON (highest numbered: 00000000000000000000.json)
+    let mut json_files: Vec<&str> = files.iter()
+        .filter(|f| f.ends_with(".json"))
+        .map(|s| s.as_str())
+        .collect();
+    json_files.sort();
+
+    let latest_commit = json_files.last()?;
+    let commit_path = format!("{}{}", delta_prefix, latest_commit);
+
+    let commit_data = read_json_lines(store, &commit_path).await.ok()?;
+
+    // Parse Delta commit log — it's newline-delimited JSON
+    // Look for "metaData" action which contains schema
+    let mut columns = Vec::new();
+    let mut partition_cols: Vec<String> = Vec::new();
+    let mut properties = std::collections::HashMap::new();
+    let mut format_version: i64 = 1;
+
+    for entry in &commit_data {
+        if let Some(protocol) = entry.get("protocol") {
+            format_version = protocol.get("minReaderVersion")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(1);
+        }
+        if let Some(meta) = entry.get("metaData") {
+            // Schema is a JSON string inside the metaData
+            if let Some(schema_str) = meta.get("schemaString").and_then(|s| s.as_str()) {
+                if let Ok(schema_json) = serde_json::from_str::<serde_json::Value>(schema_str) {
+                    if let Some(fields) = schema_json.get("fields").and_then(|f| f.as_array()) {
+                        for (i, field) in fields.iter().enumerate() {
+                            let name = field.get("name").and_then(|n| n.as_str()).unwrap_or("unknown").to_string();
+                            let dtype = delta_type_to_string(field.get("type"));
+                            let nullable = field.get("nullable").and_then(|n| n.as_bool()).unwrap_or(true);
+                            columns.push(ColumnInfo { name, data_type: dtype, nullable, ordinal: i as i32 });
+                        }
+                    }
+                }
+            }
+            // Partition columns
+            if let Some(parts) = meta.get("partitionColumns").and_then(|p| p.as_array()) {
+                partition_cols = parts.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect();
+            }
+            // Properties (description, delta.enableChangeDataFeed, etc.)
+            if let Some(props) = meta.get("configuration").and_then(|c| c.as_object()) {
+                for (k, v) in props {
+                    if let Some(vs) = v.as_str() {
+                        properties.insert(k.clone(), vs.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    // Count commits as "snapshots"
+    let snapshot_count = json_files.len();
+
+    Some(DiscoveredTable {
+        database: database.to_string(),
+        table_name: table_name.to_string(),
+        s3_location: table_path.trim_end_matches('/').to_string(),
+        format: TableFormat::Delta,
+        metadata_location: Some(commit_path),
+        column_count: columns.len(),
+        columns,
+        format_version: Some(format_version),
+        partition_fields: partition_cols,
+        snapshot_count,
+        last_updated_ms: None,
+        table_type: String::new(),
+        properties,
+    })
+}
+
+/// Convert Delta type to string.
+fn delta_type_to_string(type_val: Option<&serde_json::Value>) -> String {
+    match type_val {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Object(obj)) => {
+            if let Some(t) = obj.get("type").and_then(|v| v.as_str()) {
+                match t {
+                    "struct" => "struct".to_string(),
+                    "array" => {
+                        let elem = obj.get("elementType")
+                            .map(|e| delta_type_to_string(Some(e)))
+                            .unwrap_or_else(|| "unknown".to_string());
+                        format!("array<{}>", elem)
+                    }
+                    "map" => {
+                        let key = obj.get("keyType")
+                            .map(|k| delta_type_to_string(Some(k)))
+                            .unwrap_or_else(|| "string".to_string());
+                        let val = obj.get("valueType")
+                            .map(|v| delta_type_to_string(Some(v)))
+                            .unwrap_or_else(|| "string".to_string());
+                        format!("map<{}, {}>", key, val)
+                    }
+                    _ => t.to_string(),
+                }
+            } else {
+                "unknown".to_string()
+            }
+        }
+        _ => "unknown".to_string(),
+    }
+}
+
+// ── Hudi Discovery ─────────────────────────────────────────────────
+
+/// Discover an Apache Hudi table from `.hoodie/` directory.
+async fn discover_hudi_table(
+    store: &Arc<dyn ObjectStore>,
+    database: &str,
+    table_name: &str,
+    table_path: &str,
+) -> Option<DiscoveredTable> {
+    let hoodie_prefix = format!("{}.hoodie/", table_path);
+    let files = list_files(store, &hoodie_prefix).await.ok()?;
+
+    if files.is_empty() {
+        return None;
+    }
+
+    // Read hoodie.properties if available
+    let mut properties = std::collections::HashMap::new();
+    if files.iter().any(|f| f == "hoodie.properties") {
+        let props_path = format!("{}hoodie.properties", hoodie_prefix);
+        if let Ok(bytes) = read_file_bytes(store, &props_path).await {
+            if let Ok(text) = String::from_utf8(bytes) {
+                for line in text.lines() {
+                    let line = line.trim();
+                    if line.starts_with('#') || line.is_empty() { continue; }
+                    if let Some(eq) = line.find('=') {
+                        let key = line[..eq].trim().to_string();
+                        let val = line[eq+1..].trim().to_string();
+                        properties.insert(key, val);
+                    }
+                }
+            }
+        }
+    }
+
+    let table_type = properties.get("hoodie.table.type")
+        .cloned()
+        .unwrap_or_else(|| "COPY_ON_WRITE".to_string());
+
+    // Try to read schema from .hoodie/latest commit metadata
+    // For now, return empty columns — schema inference for Hudi is complex
+    let commit_files: Vec<&String> = files.iter()
+        .filter(|f| f.ends_with(".commit") || f.ends_with(".deltacommit"))
+        .collect();
+
+    Some(DiscoveredTable {
+        database: database.to_string(),
+        table_name: table_name.to_string(),
+        s3_location: table_path.trim_end_matches('/').to_string(),
+        format: TableFormat::Hudi,
+        metadata_location: Some(hoodie_prefix),
+        column_count: 0,
+        columns: vec![],
+        format_version: None,
+        partition_fields: vec![],
+        snapshot_count: commit_files.len(),
+        last_updated_ms: None,
+        table_type,
+        properties,
+    })
+}
+
+// ── Raw Parquet Discovery ──────────────────────────────────────────
+
+/// Discover a directory of Parquet files (no formal table format).
+/// Common in Spark/EMR output, Athena CTAS, Glue ETL, etc.
+async fn discover_parquet_dir(
+    store: &Arc<dyn ObjectStore>,
+    database: &str,
+    table_name: &str,
+    table_path: &str,
+) -> Option<DiscoveredTable> {
+    // Check for .parquet files at this level or in data/ subdir
+    let listing = list_files_with_dirs(store, table_path).await.ok()?;
+
+    let parquet_files: Vec<&String> = listing.files.iter()
+        .filter(|f| f.ends_with(".parquet") || f.ends_with(".snappy.parquet"))
+        .collect();
+
+    // Also check data/ subdir
+    let data_parquet = if listing.dirs.contains(&"data".to_string()) {
+        let data_prefix = format!("{}data/", table_path);
+        list_files(store, &data_prefix).await.ok()
+            .map(|files| files.into_iter().filter(|f| f.ends_with(".parquet") || f.ends_with(".snappy.parquet")).count())
+            .unwrap_or(0)
+    } else {
+        0
+    };
+
+    let total_parquet = parquet_files.len() + data_parquet;
+    if total_parquet == 0 {
+        return None;
+    }
+
+    // Check for Hive-style partitioning (subdirs like year=2024/)
+    let partition_dirs: Vec<String> = listing.dirs.iter()
+        .filter(|d| d.contains('='))
+        .cloned()
+        .collect();
+    let partition_fields: Vec<String> = partition_dirs.iter()
+        .filter_map(|d| d.split('=').next().map(|s| s.to_string()))
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+
+    let mut properties = std::collections::HashMap::new();
+    properties.insert("file_count".to_string(), total_parquet.to_string());
+    if !partition_dirs.is_empty() {
+        properties.insert("partitioning".to_string(), "hive".to_string());
+    }
+
+    Some(DiscoveredTable {
+        database: database.to_string(),
+        table_name: table_name.to_string(),
+        s3_location: table_path.trim_end_matches('/').to_string(),
+        format: TableFormat::Parquet,
+        metadata_location: None,
+        column_count: 0, // Would need to read a parquet file to get schema
+        columns: vec![],
+        format_version: None,
+        partition_fields,
+        snapshot_count: total_parquet,
+        last_updated_ms: None,
+        table_type: String::new(),
+        properties,
+    })
+}
+
+// ── File / Directory helpers ───────────────────────────────────────
+
+struct DirListing {
+    files: Vec<String>,
+    dirs: Vec<String>,
+}
+
+/// List both files and directories at a prefix.
+async fn list_files_with_dirs(store: &Arc<dyn ObjectStore>, prefix: &str) -> Result<DirListing, String> {
+    let obj_prefix = ObjectPath::from(prefix);
+    let result = store.list_with_delimiter(Some(&obj_prefix)).await
+        .map_err(|e| format!("S3 list '{}': {}", prefix, e))?;
+
+    let dirs: Vec<String> = result.common_prefixes.into_iter()
+        .filter_map(|p| {
+            let s = p.to_string();
+            let trimmed = s.trim_end_matches('/');
+            trimmed.rsplit('/').next().map(|n| n.to_string())
+        })
+        .collect();
+
+    let files: Vec<String> = result.objects.into_iter()
+        .filter_map(|meta| {
+            let s = meta.location.to_string();
+            s.rsplit('/').next().map(|n| n.to_string())
+        })
+        .collect();
+
+    Ok(DirListing { files, dirs })
+}
+
+/// List immediate subdirectories under a prefix.
+async fn list_directories(store: &Arc<dyn ObjectStore>, prefix: &str) -> Result<Vec<String>, String> {
+    let obj_prefix = ObjectPath::from(prefix);
+    let result = store.list_with_delimiter(Some(&obj_prefix)).await
+        .map_err(|e| format!("S3 list '{}': {}", prefix, e))?;
+
+    let dirs: Vec<String> = result.common_prefixes.into_iter()
+        .filter_map(|p| {
+            let path_str = p.to_string();
+            let trimmed = path_str.trim_end_matches('/');
+            trimmed.rsplit('/').next().map(|s| s.to_string())
+        })
+        .filter(|d| !d.is_empty() && !d.starts_with('.') && !d.starts_with('_'))
+        .collect();
+
+    Ok(dirs)
+}
+
+/// List files (not directories) under a prefix.
+async fn list_files(store: &Arc<dyn ObjectStore>, prefix: &str) -> Result<Vec<String>, String> {
+    let obj_prefix = ObjectPath::from(prefix);
+    let result = store.list_with_delimiter(Some(&obj_prefix)).await
+        .map_err(|e| format!("S3 list files '{}': {}", prefix, e))?;
+
+    let files: Vec<String> = result.objects.into_iter()
+        .filter_map(|meta| {
+            let path_str = meta.location.to_string();
+            path_str.rsplit('/').next().map(|s| s.to_string())
+        })
+        .collect();
+
+    Ok(files)
+}
+
+/// Read a JSON file from S3.
+async fn read_json_file(
     store: &Arc<dyn ObjectStore>,
     path: &str,
 ) -> Result<serde_json::Value, String> {
@@ -231,28 +852,64 @@ async fn read_iceberg_metadata(
         .map_err(|e| format!("Failed to parse {}: {}", path, e))
 }
 
+/// Read a newline-delimited JSON file (Delta commit log format).
+async fn read_json_lines(
+    store: &Arc<dyn ObjectStore>,
+    path: &str,
+) -> Result<Vec<serde_json::Value>, String> {
+    let obj_path = ObjectPath::from(path);
+    let result = store.get(&obj_path).await
+        .map_err(|e| format!("Failed to read {}: {}", path, e))?;
+    let bytes = result.bytes().await
+        .map_err(|e| format!("Failed to read bytes from {}: {}", path, e))?;
+    let text = String::from_utf8_lossy(&bytes);
+    let entries: Vec<serde_json::Value> = text.lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    Ok(entries)
+}
+
+/// Read raw file bytes from S3.
+async fn read_file_bytes(
+    store: &Arc<dyn ObjectStore>,
+    path: &str,
+) -> Result<Vec<u8>, String> {
+    let obj_path = ObjectPath::from(path);
+    let result = store.get(&obj_path).await
+        .map_err(|e| format!("Failed to read {}: {}", path, e))?;
+    let bytes = result.bytes().await
+        .map_err(|e| format!("Failed to read bytes from {}: {}", path, e))?;
+    Ok(bytes.to_vec())
+}
+
+// Keep old name for backward compat
+pub async fn read_iceberg_metadata(
+    store: &Arc<dyn ObjectStore>,
+    path: &str,
+) -> Result<serde_json::Value, String> {
+    read_json_file(store, path).await
+}
+
+// ── Iceberg-specific parsing ───────────────────────────────────────
+
 /// Find the latest v*.metadata.json file from a list of metadata files.
 fn find_latest_metadata(files: &[String]) -> Option<String> {
-    // First check for version-hint.text
     if files.contains(&"version-hint.text".to_string()) {
         // Would need to read version-hint.text to get the version number
-        // For now, fall through to version number scanning
+        // Fall through to version number scanning
     }
 
-    // Find highest version v{N}.metadata.json
     let mut best_version: i64 = -1;
     let mut best_file: Option<String> = None;
 
     for file in files {
         if file.ends_with(".metadata.json") {
-            // Extract version number from v{N}.metadata.json or {N}-{uuid}.metadata.json
             let version = file.split('.').next()
                 .and_then(|prefix| {
-                    // Try v{N} format
                     if let Some(num_str) = prefix.strip_prefix('v') {
                         num_str.parse::<i64>().ok()
                     } else {
-                        // Try {N}-{uuid} format (e.g., "00001-abc123")
                         prefix.split('-').next().and_then(|n| n.parse::<i64>().ok())
                     }
                 });
@@ -265,7 +922,6 @@ fn find_latest_metadata(files: &[String]) -> Option<String> {
         }
     }
 
-    // Fallback: just pick the last metadata.json alphabetically
     if best_file.is_none() {
         best_file = files.iter()
             .filter(|f| f.ends_with(".metadata.json"))
@@ -277,14 +933,11 @@ fn find_latest_metadata(files: &[String]) -> Option<String> {
 }
 
 /// Parse Iceberg schema from metadata JSON.
-/// Returns (columns, format_version).
-fn parse_iceberg_schema(metadata: &serde_json::Value) -> (Vec<IcebergColumnInfo>, i64) {
+fn parse_iceberg_schema(metadata: &serde_json::Value) -> (Vec<ColumnInfo>, i64) {
     let format_version = metadata.get("format-version")
         .and_then(|v| v.as_i64())
         .unwrap_or(1);
 
-    // Iceberg v2: schema is in "schemas" array, current-schema-id points to the active one
-    // Iceberg v1: schema is in "schema" object directly
     let schema = if format_version >= 2 {
         let schema_id = metadata.get("current-schema-id").and_then(|v| v.as_i64()).unwrap_or(0);
         metadata.get("schemas")
@@ -312,7 +965,7 @@ fn parse_iceberg_schema(metadata: &serde_json::Value) -> (Vec<IcebergColumnInfo>
                 let required = field.get("required")
                     .and_then(|r| r.as_bool())
                     .unwrap_or(false);
-                IcebergColumnInfo {
+                ColumnInfo {
                     name,
                     data_type,
                     nullable: !required,
@@ -330,7 +983,6 @@ fn iceberg_type_to_string(type_val: Option<&serde_json::Value>) -> String {
     match type_val {
         Some(serde_json::Value::String(s)) => s.clone(),
         Some(serde_json::Value::Object(obj)) => {
-            // Complex type: struct, list, map
             if let Some(t) = obj.get("type").and_then(|v| v.as_str()) {
                 match t {
                     "struct" => "struct".to_string(),
@@ -361,8 +1013,6 @@ fn iceberg_type_to_string(type_val: Option<&serde_json::Value>) -> String {
 
 /// Parse partition spec from Iceberg metadata.
 fn parse_partition_spec(metadata: &serde_json::Value) -> Vec<String> {
-    // v2: "partition-specs" array + "default-spec-id"
-    // v1: "partition-spec" array
     let spec = metadata.get("partition-specs")
         .and_then(|specs| specs.as_array())
         .and_then(|specs| {
@@ -386,45 +1036,23 @@ fn parse_partition_spec(metadata: &serde_json::Value) -> Vec<String> {
     }).unwrap_or_default()
 }
 
-/// List immediate subdirectories under a prefix.
-async fn list_directories(store: &Arc<dyn ObjectStore>, prefix: &str) -> Result<Vec<String>, String> {
-    let obj_prefix = ObjectPath::from(prefix);
-    let result = store.list_with_delimiter(Some(&obj_prefix)).await
-        .map_err(|e| format!("S3 list '{}': {}", prefix, e))?;
-
-    let dirs: Vec<String> = result.common_prefixes.into_iter()
-        .filter_map(|p| {
-            let path_str = p.to_string();
-            // Extract the last directory component
-            let trimmed = path_str.trim_end_matches('/');
-            trimmed.rsplit('/').next().map(|s| s.to_string())
+/// Extract properties map from Iceberg metadata JSON.
+fn parse_iceberg_properties(metadata: &serde_json::Value) -> std::collections::HashMap<String, String> {
+    metadata.get("properties")
+        .and_then(|p| p.as_object())
+        .map(|obj| {
+            obj.iter()
+                .filter_map(|(k, v)| {
+                    v.as_str().map(|s| (k.clone(), s.to_string()))
+                })
+                .collect()
         })
-        .filter(|d| !d.is_empty() && !d.starts_with('.') && !d.starts_with('_'))
-        .collect();
-
-    Ok(dirs)
-}
-
-/// List files (not directories) under a prefix.
-async fn list_files(store: &Arc<dyn ObjectStore>, prefix: &str) -> Result<Vec<String>, String> {
-    let obj_prefix = ObjectPath::from(prefix);
-    let result = store.list_with_delimiter(Some(&obj_prefix)).await
-        .map_err(|e| format!("S3 list files '{}': {}", prefix, e))?;
-
-    let files: Vec<String> = result.objects.into_iter()
-        .filter_map(|meta| {
-            let path_str = meta.location.to_string();
-            path_str.rsplit('/').next().map(|s| s.to_string())
-        })
-        .collect();
-
-    Ok(files)
+        .unwrap_or_default()
 }
 
 /// Normalize a warehouse prefix to ensure it ends with '/'.
 fn normalize_prefix(prefix: &str) -> String {
     let trimmed = prefix.trim_start_matches("s3://");
-    // Remove bucket name if present
     let path_only = if let Some(idx) = trimmed.find('/') {
         &trimmed[idx + 1..]
     } else {
@@ -439,13 +1067,13 @@ fn normalize_prefix(prefix: &str) -> String {
     }
 }
 
+// ── Trino warehouse location helpers ───────────────────────────────
+
 /// Try to get warehouse location from Trino catalog properties.
-/// This is a single fast query vs scanning for each table.
 pub async fn get_warehouse_location_from_trino(
     rest: &crate::trino_client::TrinoRestClient,
     catalog_name: &str,
 ) -> Option<String> {
-    // Try catalog_properties system table
     let sql = format!(
         "SELECT property_value FROM system.metadata.catalog_properties WHERE catalog_name = '{}' AND property_name = 'warehouse'",
         catalog_name
@@ -462,41 +1090,29 @@ pub async fn get_warehouse_location_from_trino(
         }
     }
 
-    // Fallback 1: SHOW CREATE SCHEMA — Iceberg schemas often have a location property
     let schema_sql = format!("SHOW SCHEMAS FROM \"{}\"", catalog_name);
     if let Ok(rows) = rest.query(&schema_sql, catalog_name).await {
         for row in &rows {
             if let Some(schema) = row.first().and_then(|v| v.as_str()) {
                 let schema = schema.trim();
                 if schema == "information_schema" || schema == "pg_catalog" { continue; }
-
                 let show_schema_sql = format!("SHOW CREATE SCHEMA \"{}\".\"{}\"", catalog_name, schema);
-                tracing::info!(catalog = %catalog_name, schema = %schema, "Trying SHOW CREATE SCHEMA for warehouse location");
                 if let Ok(create_result) = rest.query(&show_schema_sql, catalog_name).await {
                     let ddl: String = create_result.iter()
                         .filter_map(|r| r.first().and_then(|v| v.as_str()))
                         .collect::<Vec<_>>().join("\n").to_lowercase();
-                    tracing::debug!(catalog = %catalog_name, schema = %schema, ddl = %ddl, "SHOW CREATE SCHEMA result");
-
-                    // Extract s3 location from schema DDL
                     if let Some(loc) = extract_s3_location(&ddl) {
-                        // Schema location is usually s3://bucket/warehouse/db — parent is warehouse
                         if let Some(warehouse) = derive_warehouse_from_schema_location(&loc) {
-                            tracing::info!(catalog = %catalog_name, warehouse = %warehouse, "Derived warehouse from SHOW CREATE SCHEMA");
                             return Some(warehouse);
                         }
-                        // If we can't derive parent, the schema location itself might be the warehouse
-                        tracing::info!(catalog = %catalog_name, warehouse = %loc, "Using schema location as warehouse");
                         return Some(loc);
                     }
                 }
-                break; // Only try the first real schema
+                break;
             }
         }
     }
 
-    // Fallback 2: SHOW CREATE TABLE on one table — extract location, strip table/db segments
-    tracing::info!(catalog = %catalog_name, "SHOW CREATE SCHEMA didn't yield location, trying SHOW CREATE TABLE on one table");
     if let Ok(rows) = rest.query(&format!("SHOW SCHEMAS FROM \"{}\"", catalog_name), catalog_name).await {
         for row in &rows {
             if let Some(schema) = row.first().and_then(|v| v.as_str()) {
@@ -513,7 +1129,6 @@ pub async fn get_warehouse_location_from_trino(
                                     .collect::<Vec<_>>().join("\n").to_lowercase();
                                 if let Some(loc) = extract_s3_location(&ddl) {
                                     if let Some(warehouse) = derive_warehouse_from_location(&loc) {
-                                        tracing::info!(catalog = %catalog_name, warehouse = %warehouse, "Derived warehouse from SHOW CREATE TABLE");
                                         return Some(warehouse);
                                     }
                                 }
@@ -521,24 +1136,19 @@ pub async fn get_warehouse_location_from_trino(
                         }
                     }
                 }
-                break; // Only try the first schema
+                break;
             }
         }
     }
 
-    tracing::warn!(catalog = %catalog_name, "Could not determine warehouse location from any method");
+    tracing::warn!(catalog = %catalog_name, "Could not determine warehouse location");
     None
 }
 
-/// Extract S3 location from DDL text. Handles both s3:// and s3a:// prefixes.
 fn extract_s3_location(ddl: &str) -> Option<String> {
     for pattern in &["external_location = '", "location = '", "'s3://", "'s3a://"] {
         if let Some(idx) = ddl.find(pattern) {
-            let start = if pattern.starts_with('\'') {
-                idx + 1
-            } else {
-                idx + pattern.len()
-            };
+            let start = if pattern.starts_with('\'') { idx + 1 } else { idx + pattern.len() };
             let rest = &ddl[start..];
             if let Some(end) = rest.find('\'') {
                 let loc = rest[..end].trim().to_string();
@@ -551,25 +1161,19 @@ fn extract_s3_location(ddl: &str) -> Option<String> {
     None
 }
 
-/// Derive warehouse root from a table location.
-/// e.g., s3://bucket/warehouse/db/table → s3://bucket/warehouse/
 fn derive_warehouse_from_location(location: &str) -> Option<String> {
     let parts: Vec<&str> = location.trim_end_matches('/').rsplitn(3, '/').collect();
     if parts.len() >= 3 {
-        // parts[2] = s3://bucket/warehouse, parts[1] = db, parts[0] = table
         Some(format!("{}/", parts[2]))
     } else {
         None
     }
 }
 
-/// Derive warehouse root from a schema location.
-/// Schema locations are one level above table: s3://bucket/warehouse/db → s3://bucket/warehouse/
 fn derive_warehouse_from_schema_location(location: &str) -> Option<String> {
     let trimmed = location.trim_end_matches('/');
     if let Some(idx) = trimmed.rfind('/') {
         let parent = &trimmed[..idx];
-        // Make sure we still have the s3:// prefix and at least a bucket
         if parent.starts_with("s3://") || parent.starts_with("s3a://") {
             return Some(format!("{}/", parent));
         }

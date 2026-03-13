@@ -131,6 +131,8 @@ export const uploadFile = (file: File) => {
 export const getS3Configs = () => request<{ configs: S3Config[] }>('/api/v1/storage/s3')
 export const addS3Config = (c: Partial<S3Config> & { secret_key: string }) =>
   request<{ status: string }>('/api/v1/storage/s3', { method: 'POST', body: JSON.stringify(c) })
+export const updateS3Config = (name: string, c: Partial<S3Config> & { secret_key: string }) =>
+  request<{ status: string; sync_status: string }>(`/api/v1/storage/s3/${name}`, { method: 'PUT', body: JSON.stringify(c) })
 export const deleteS3Config = (name: string) =>
   request<{ status: string }>(`/api/v1/storage/s3/${name}`, { method: 'DELETE' })
 

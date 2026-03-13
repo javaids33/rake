@@ -668,7 +668,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             "/api/v1/storage/s3",
             get(list_s3_configs).post(add_s3_config),
         )
-        .route("/api/v1/storage/s3/{id}", delete(delete_s3_config))
+        .route("/api/v1/storage/s3/{id}", put(update_s3_config).delete(delete_s3_config))
         // Quality checks
         .route("/api/v1/quality/checks", get(quality_checks))
         .route(
@@ -837,7 +837,40 @@ async fn event_stream(
                 }
             }
 
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            // ── Check S3 scan progress changes ────────────────────
+            {
+                let s3_configs = state.s3_configs.read().await;
+                for cfg in s3_configs.iter() {
+                    if cfg.sync_status == "syncing" {
+                        let scan_key = format!("s3:{}", cfg.name);
+                        let current_progress = format!(
+                            "{}:{}:{}:{}",
+                            cfg.scan_progress.as_deref().unwrap_or(""),
+                            cfg.scan_scanned,
+                            cfg.scan_found,
+                            cfg.scan_elapsed_ms,
+                        );
+                        let prev = last_progress.get(&scan_key).map(|s| s.as_str()).unwrap_or("");
+                        if current_progress != prev {
+                            last_progress.insert(scan_key, current_progress);
+                            let scan_event = serde_json::json!({
+                                "name": cfg.name,
+                                "phase": cfg.scan_progress,
+                                "detail": cfg.scan_detail,
+                                "scanned": cfg.scan_scanned,
+                                "total": cfg.scan_total,
+                                "found": cfg.scan_found,
+                                "elapsed_ms": cfg.scan_elapsed_ms,
+                                "formats": cfg.format_counts,
+                                "sync_status": cfg.sync_status,
+                            });
+                            yield Ok(Event::default().event("s3_scan").data(scan_event.to_string()));
+                        }
+                    }
+                }
+            }
+
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
         }
     };
 
@@ -4376,8 +4409,17 @@ async fn run_bootstrap(
                 status: "configured".to_string(),
                 created_at: Utc::now(),
                 tables: vec![],
+                table_types: std::collections::HashMap::new(),
+                table_formats: std::collections::HashMap::new(),
                 sync_status: "ready".to_string(),
                 sync_error: None,
+                scan_progress: None,
+                scan_detail: None,
+                scan_scanned: 0,
+                scan_total: 0,
+                scan_found: 0,
+                scan_elapsed_ms: 0,
+                format_counts: std::collections::HashMap::new(),
             });
             results.insert("minio".to_string(), serde_json::json!({ "status": "configured" }));
         } else {
@@ -5660,8 +5702,17 @@ async fn add_s3_config(
         status: "configured".to_string(),
         created_at: Utc::now(),
         tables: vec![],
+        table_types: std::collections::HashMap::new(),
+        table_formats: std::collections::HashMap::new(),
         sync_status: "syncing".to_string(),
         sync_error: None,
+        scan_progress: None,
+        scan_detail: None,
+        scan_scanned: 0,
+        scan_total: 0,
+        scan_found: 0,
+        scan_elapsed_ms: 0,
+        format_counts: std::collections::HashMap::new(),
     };
 
     let mut configs = state.s3_configs.write().await;
@@ -5683,18 +5734,23 @@ async fn add_s3_config(
     let bg_bucket = req.bucket.clone();
     let bg_region = req.region.clone();
     tokio::spawn(async move {
-        let result = discover_s3_iceberg_tables(
+        let result = discover_s3_tables(
             &bg_state, &bg_name, &bg_endpoint, &bg_access_key, &bg_secret_key, &bg_bucket, &bg_region,
         ).await;
         match result {
-            Ok(tables) => {
-                let count = tables.len();
+            Ok(result) => {
+                let count = result.tables.len();
                 let mut configs = bg_state.s3_configs.write().await;
                 if let Some(cfg) = configs.iter_mut().find(|c| c.name == bg_name) {
-                    cfg.tables = tables;
+                    cfg.tables = result.tables;
+                    cfg.table_types = result.table_types;
+                    cfg.table_formats = result.table_formats;
+                    cfg.format_counts = result.format_counts;
                     cfg.status = "ready".to_string();
                     cfg.sync_status = "ready".to_string();
                     cfg.sync_error = None;
+                    cfg.scan_progress = Some("complete".to_string());
+                    cfg.scan_detail = None;
                 }
                 tracing::info!(
                     name = %bg_name,
@@ -5847,8 +5903,17 @@ async fn import_connections(
             status: "configured".to_string(),
             created_at: Utc::now(),
             tables: vec![],
+            table_types: std::collections::HashMap::new(),
+            table_formats: std::collections::HashMap::new(),
             sync_status: "syncing".to_string(),
             sync_error: None,
+            scan_progress: None,
+            scan_detail: None,
+            scan_scanned: 0,
+            scan_total: 0,
+            scan_found: 0,
+            scan_elapsed_ms: 0,
+            format_counts: std::collections::HashMap::new(),
         };
 
         let mut configs = state.s3_configs.write().await;
@@ -5870,7 +5935,7 @@ async fn import_connections(
         let bg_bucket = s3_req.bucket.clone();
         let bg_region = s3_req.region.clone();
         tokio::spawn(async move {
-            let result = discover_s3_iceberg_tables(
+            let result = discover_s3_tables(
                 &bg_state,
                 &bg_name,
                 &bg_endpoint,
@@ -5881,14 +5946,19 @@ async fn import_connections(
             )
             .await;
             match result {
-                Ok(tables) => {
-                    let count = tables.len();
+                Ok(result) => {
+                    let count = result.tables.len();
                     let mut configs = bg_state.s3_configs.write().await;
                     if let Some(cfg) = configs.iter_mut().find(|c| c.name == bg_name) {
-                        cfg.tables = tables;
+                        cfg.tables = result.tables;
+                        cfg.table_types = result.table_types;
+                        cfg.table_formats = result.table_formats;
+                        cfg.format_counts = result.format_counts;
                         cfg.status = "ready".to_string();
                         cfg.sync_status = "ready".to_string();
                         cfg.sync_error = None;
+                        cfg.scan_progress = Some("complete".to_string());
+                        cfg.scan_detail = None;
                     }
                     tracing::info!(
                         name = %bg_name,
@@ -6027,8 +6097,54 @@ fn iceberg_type_to_arrow(iceberg_type: &str) -> arrow::datatypes::DataType {
     }
 }
 
-/// Background task: scan S3 warehouse for Iceberg tables and register them in DataFusion.
-async fn discover_s3_iceberg_tables(
+/// Try to register an S3-backed ListingTable so queries return real data.
+///
+/// Creates a DataFusion ListingTable that reads .parquet files from the S3 path.
+/// Schema is inferred from the Parquet file headers (fast — only reads footer metadata).
+async fn try_register_listing_table(
+    df_ctx: &datafusion::prelude::SessionContext,
+    table_name: &str,
+    s3_data_path: &str,
+    schema_provider: &Arc<dyn datafusion::catalog::SchemaProvider>,
+) -> Result<(), String> {
+    use datafusion::datasource::listing::{ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl};
+    use datafusion::datasource::file_format::parquet::ParquetFormat;
+
+    let table_url = ListingTableUrl::parse(s3_data_path)
+        .map_err(|e| format!("ListingTableUrl '{}': {}", s3_data_path, e))?;
+
+    let parquet_format = ParquetFormat::default();
+    let listing_options = ListingOptions::new(Arc::new(parquet_format))
+        .with_file_extension(".parquet");
+
+    let config = ListingTableConfig::new(table_url)
+        .with_listing_options(listing_options)
+        .infer_schema(&df_ctx.state())
+        .await
+        .map_err(|e| format!("Schema infer at '{}': {}", s3_data_path, e))?;
+
+    let listing_table = ListingTable::try_new(config)
+        .map_err(|e| format!("ListingTable '{}': {}", table_name, e))?;
+
+    let provider: Arc<dyn datafusion::datasource::TableProvider> = Arc::new(listing_table);
+    schema_provider.register_table(table_name.to_string(), provider)
+        .map_err(|e| format!("Register '{}': {}", table_name, e))?;
+
+    Ok(())
+}
+
+/// Result of S3 discovery: registered table names, table types, table formats, and format counts.
+struct S3DiscoveryResult {
+    tables: Vec<String>,
+    table_types: std::collections::HashMap<String, String>,
+    table_formats: std::collections::HashMap<String, String>,
+    format_counts: std::collections::HashMap<String, usize>,
+}
+
+/// Background task: scan S3 warehouse for tables (all formats) and register in DataFusion.
+///
+/// Sends real-time progress updates via the S3Config's scan_* fields, picked up by SSE.
+async fn discover_s3_tables(
     state: &Arc<AppState>,
     name: &str,
     endpoint: &str,
@@ -6036,11 +6152,35 @@ async fn discover_s3_iceberg_tables(
     secret_key: &str,
     bucket: &str,
     region: &str,
-) -> std::result::Result<Vec<String>, String> {
+) -> std::result::Result<S3DiscoveryResult, String> {
     let ep = if endpoint.is_empty() { None } else { Some(endpoint) };
     let store = crate::iceberg_s3::build_s3_store(bucket, access_key, secret_key, region, ep)?;
 
-    let scan_result = crate::iceberg_s3::scan_warehouse(&store, "").await?;
+    // Set up progress channel — updates S3Config scan fields for SSE pickup
+    let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<crate::iceberg_s3::ScanProgress>();
+
+    // Spawn progress consumer — writes updates to state
+    let progress_state = state.clone();
+    let progress_name = name.to_string();
+    let progress_handle = tokio::spawn(async move {
+        while let Some(progress) = progress_rx.recv().await {
+            let mut configs = progress_state.s3_configs.write().await;
+            if let Some(cfg) = configs.iter_mut().find(|c| c.name == progress_name) {
+                cfg.scan_progress = Some(progress.phase);
+                cfg.scan_detail = Some(progress.detail);
+                cfg.scan_scanned = progress.tables_scanned;
+                cfg.scan_total = progress.total_to_scan;
+                cfg.scan_found = progress.tables_found;
+                cfg.scan_elapsed_ms = progress.elapsed_ms;
+                cfg.format_counts = progress.formats;
+            }
+        }
+    });
+
+    let scan_result = crate::iceberg_s3::scan_warehouse_with_progress(&store, "", Some(progress_tx)).await?;
+
+    // Wait for progress consumer to finish
+    let _ = progress_handle.await;
 
     tracing::info!(
         name = %name,
@@ -6048,16 +6188,42 @@ async fn discover_s3_iceberg_tables(
         databases = scan_result.databases.len(),
         tables = scan_result.total_tables,
         elapsed_ms = scan_result.scan_duration_ms,
-        "S3 warehouse scan complete"
+        formats = ?scan_result.format_counts,
+        "S3 multi-format scan complete"
     );
 
     let mut registered_tables = Vec::new();
+    let mut table_types: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut table_formats: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let ctx = state.ctx.read().await;
     let df_ctx = ctx.datafusion_ctx();
 
+    // ── Register S3 object store with DataFusion's runtime so ListingTable can read files ──
+    {
+        let s3_store = object_store::aws::AmazonS3Builder::new()
+            .with_bucket_name(bucket)
+            .with_region(region)
+            .with_access_key_id(access_key)
+            .with_secret_access_key(secret_key)
+            .with_allow_http(true);
+        let s3_store = if let Some(ep) = ep {
+            s3_store.with_endpoint(ep)
+        } else {
+            s3_store
+        };
+        let s3_store = s3_store.build()
+            .map_err(|e| format!("S3 ObjectStore for DataFusion: {}", e))?;
+
+        let url = url::Url::parse(&format!("s3://{}", bucket))
+            .map_err(|e| format!("URL parse for bucket '{}': {}", bucket, e))?;
+        df_ctx.runtime_env()
+            .register_object_store(&url, Arc::new(s3_store));
+
+        tracing::info!(bucket = %bucket, "Registered S3 object store with DataFusion runtime");
+    }
+
     // Group tables by database → register as schema-qualified names (s3_{db}.{table})
-    // DataFusion needs MemorySchemaProvider per database, like we do for pg/mysql/mongo
-    let mut db_tables: std::collections::HashMap<String, Vec<&crate::iceberg_s3::IcebergTableInfo>> =
+    let mut db_tables: std::collections::HashMap<String, Vec<&crate::iceberg_s3::DiscoveredTable>> =
         std::collections::HashMap::new();
     for table_info in &scan_result.tables {
         db_tables.entry(table_info.database.clone()).or_default().push(table_info);
@@ -6065,7 +6231,6 @@ async fn discover_s3_iceberg_tables(
 
     let mut errors = 0u32;
     for (db_name, tables) in &db_tables {
-        // Strip common suffixes like ".db" from Iceberg warehouse directory names
         let clean_db = db_name.trim_end_matches(".db");
         let schema_name = format!("s3_{}", clean_db);
         let schema_provider = match crate::providers::ensure_schema(df_ctx, &schema_name) {
@@ -6078,49 +6243,67 @@ async fn discover_s3_iceberg_tables(
         };
 
         for table_info in tables {
-            // Build an Arrow schema from the discovered columns
-            let arrow_fields: Vec<arrow::datatypes::Field> = table_info.columns.iter().map(|col| {
-                let dt = iceberg_type_to_arrow(&col.data_type);
-                arrow::datatypes::Field::new(&col.name, dt, col.nullable)
-            }).collect();
+            let full_name = format!("{}.{}", schema_name, table_info.table_name);
 
-            if arrow_fields.is_empty() {
-                tracing::debug!(
-                    db = %db_name, table = %table_info.table_name,
-                    "Skipping Iceberg table with no columns"
-                );
-                errors += 1;
-                continue;
-            }
-
-            let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(arrow_fields));
-            match datafusion::datasource::MemTable::try_new(schema, vec![vec![]]) {
-                Ok(mem_table) => {
-                    let provider: std::sync::Arc<dyn datafusion::datasource::TableProvider> =
-                        std::sync::Arc::new(mem_table);
-                    match schema_provider.register_table(
-                        table_info.table_name.clone(), provider,
-                    ) {
-                        Ok(_) => {
-                            let full_name = format!("{}.{}", schema_name, table_info.table_name);
-                            registered_tables.push(full_name);
-                        }
-                        Err(e) => {
-                            tracing::debug!(
-                                db = %db_name, table = %table_info.table_name,
-                                error = %e, "Failed to register Iceberg table"
-                            );
-                            errors += 1;
-                        }
+            // Try to register as a ListingTable backed by real S3 data files.
+            // For Iceberg/Delta: data lives under {table_path}/data/*.parquet
+            // For raw Parquet: data is at {table_path}/*.parquet
+            let data_path = {
+                let base = &table_info.s3_location;
+                match table_info.format {
+                    crate::iceberg_s3::TableFormat::Iceberg | crate::iceberg_s3::TableFormat::Delta => {
+                        format!("s3://{}/{}/data/", bucket, base)
+                    }
+                    _ => {
+                        format!("s3://{}/{}/", bucket, base)
                     }
                 }
-                Err(e) => {
+            };
+
+            // Attempt ListingTable registration (reads actual parquet files from S3)
+            let registered = match try_register_listing_table(df_ctx, &table_info.table_name, &data_path, &schema_provider).await {
+                Ok(()) => {
                     tracing::debug!(
-                        db = %db_name, table = %table_info.table_name,
-                        error = %e, "Failed to create MemTable for Iceberg table"
+                        table = %full_name, format = %table_info.format, path = %data_path,
+                        "Registered S3 ListingTable (queryable)"
                     );
-                    errors += 1;
+                    true
                 }
+                Err(e) => {
+                    // Fallback: register MemTable with schema only (browseable but not queryable for data)
+                    tracing::debug!(
+                        table = %full_name, format = %table_info.format, path = %data_path,
+                        error = %e, "ListingTable failed, falling back to schema-only MemTable"
+                    );
+                    let arrow_fields: Vec<arrow::datatypes::Field> = table_info.columns.iter().map(|col| {
+                        let dt = iceberg_type_to_arrow(&col.data_type);
+                        arrow::datatypes::Field::new(&col.name, dt, col.nullable)
+                    }).collect();
+                    let arrow_fields = if arrow_fields.is_empty() {
+                        vec![arrow::datatypes::Field::new("_placeholder", arrow::datatypes::DataType::Utf8, true)]
+                    } else {
+                        arrow_fields
+                    };
+                    let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(arrow_fields));
+                    match datafusion::datasource::MemTable::try_new(schema, vec![vec![]]) {
+                        Ok(mem_table) => {
+                            let provider: std::sync::Arc<dyn datafusion::datasource::TableProvider> =
+                                std::sync::Arc::new(mem_table);
+                            schema_provider.register_table(table_info.table_name.clone(), provider).is_ok()
+                        }
+                        Err(_) => false,
+                    }
+                }
+            };
+
+            if registered {
+                if !table_info.table_type.is_empty() {
+                    table_types.insert(full_name.clone(), table_info.table_type.clone());
+                }
+                table_formats.insert(full_name.clone(), table_info.format.to_string());
+                registered_tables.push(full_name);
+            } else {
+                errors += 1;
             }
         }
     }
@@ -6128,11 +6311,16 @@ async fn discover_s3_iceberg_tables(
     if errors > 0 {
         tracing::info!(
             registered = registered_tables.len(), errors = errors,
-            "S3 Iceberg registration: some tables had issues"
+            "S3 table registration: some tables had issues"
         );
     }
 
-    Ok(registered_tables)
+    Ok(S3DiscoveryResult {
+        tables: registered_tables,
+        table_types,
+        table_formats,
+        format_counts: scan_result.format_counts,
+    })
 }
 
 async fn list_s3_configs(
@@ -6151,8 +6339,17 @@ async fn list_s3_configs(
                 "status": c.status,
                 "created_at": c.created_at,
                 "tables": c.tables,
+                "table_types": c.table_types,
+                "table_formats": c.table_formats,
                 "sync_status": c.sync_status,
                 "sync_error": c.sync_error,
+                "scan_progress": c.scan_progress,
+                "scan_detail": c.scan_detail,
+                "scan_scanned": c.scan_scanned,
+                "scan_total": c.scan_total,
+                "scan_found": c.scan_found,
+                "scan_elapsed_ms": c.scan_elapsed_ms,
+                "format_counts": c.format_counts,
             })
         })
         .collect();
@@ -6177,6 +6374,123 @@ async fn delete_s3_config(
     Ok(Json(serde_json::json!({
         "status": "deleted",
         "name": name,
+    })))
+}
+
+/// PUT /api/v1/storage/s3/{name} — update S3 config (e.g. rotated credentials) and re-discover.
+async fn update_s3_config(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(req): Json<AddS3ConfigRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let mut configs = state.s3_configs.write().await;
+    let found = configs.iter_mut().find(|c| c.name == name);
+    let cfg = match found {
+        Some(c) => c,
+        None => {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("S3 config '{}' not found", name),
+                }),
+            ));
+        }
+    };
+
+    // Update fields
+    cfg.name = req.name.clone();
+    cfg.endpoint = req.endpoint.clone();
+    cfg.access_key = req.access_key.clone();
+    cfg.secret_key = req.secret_key.clone();
+    cfg.bucket = req.bucket.clone();
+    cfg.region = req.region.clone();
+    cfg.sync_status = "syncing".to_string();
+    cfg.sync_error = None;
+    cfg.status = "configured".to_string();
+    drop(configs);
+
+    tracing::info!(
+        name = %req.name,
+        bucket = %req.bucket,
+        "S3 config updated — re-running Iceberg table discovery"
+    );
+
+    // Deregister old tables from DataFusion
+    {
+        let ctx = state.ctx.read().await;
+        let df_ctx = ctx.datafusion_ctx();
+        let old_configs = state.s3_configs.read().await;
+        if let Some(cfg) = old_configs.iter().find(|c| c.name == name) {
+            for table_name in &cfg.tables {
+                if let Some(dot) = table_name.find('.') {
+                    let schema = &table_name[..dot];
+                    let tbl = &table_name[dot + 1..];
+                    if let Ok(sp) = df_ctx.catalog("datafusion")
+                        .ok_or("no catalog")
+                        .and_then(|cat| cat.schema(schema).ok_or("no schema"))
+                    {
+                        let _ = sp.deregister_table(tbl);
+                    }
+                }
+            }
+        }
+    }
+
+    // Re-discover in background
+    let bg_state = state.clone();
+    let bg_name = req.name.clone();
+    let bg_endpoint = req.endpoint.clone();
+    let bg_access_key = req.access_key.clone();
+    let bg_secret_key = req.secret_key;
+    let bg_bucket = req.bucket.clone();
+    let bg_region = req.region.clone();
+    tokio::spawn(async move {
+        let result = discover_s3_tables(
+            &bg_state, &bg_name, &bg_endpoint, &bg_access_key, &bg_secret_key, &bg_bucket, &bg_region,
+        ).await;
+        match result {
+            Ok(result) => {
+                let count = result.tables.len();
+                let mut configs = bg_state.s3_configs.write().await;
+                if let Some(cfg) = configs.iter_mut().find(|c| c.name == bg_name) {
+                    cfg.tables = result.tables;
+                    cfg.table_types = result.table_types;
+                    cfg.table_formats = result.table_formats;
+                    cfg.format_counts = result.format_counts;
+                    cfg.status = "ready".to_string();
+                    cfg.sync_status = "ready".to_string();
+                    cfg.sync_error = None;
+                    cfg.scan_progress = Some("complete".to_string());
+                    cfg.scan_detail = None;
+                }
+                tracing::info!(
+                    name = %bg_name,
+                    tables = count,
+                    "S3 config update: re-discovery complete — {} tables found",
+                    count
+                );
+            }
+            Err(e) => {
+                let mut configs = bg_state.s3_configs.write().await;
+                if let Some(cfg) = configs.iter_mut().find(|c| c.name == bg_name) {
+                    cfg.status = "error".to_string();
+                    cfg.sync_status = "error".to_string();
+                    cfg.sync_error = Some(e.clone());
+                }
+                tracing::error!(
+                    name = %bg_name,
+                    error = %e,
+                    "S3 config update: re-discovery failed"
+                );
+            }
+        }
+    });
+
+    Ok(Json(serde_json::json!({
+        "status": "updated",
+        "sync_status": "syncing",
+        "name": req.name,
+        "message": "S3 configuration updated. Re-discovering Iceberg tables."
     })))
 }
 

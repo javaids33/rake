@@ -328,8 +328,17 @@ async fn bootstrap_demo_connections(state: Arc<AppState>) {
                 status: "configured".to_string(),
                 created_at: chrono::Utc::now(),
                 tables: vec![],
+                table_types: std::collections::HashMap::new(),
+                table_formats: std::collections::HashMap::new(),
                 sync_status: "ready".to_string(),
                 sync_error: None,
+                scan_progress: None,
+                scan_detail: None,
+                scan_scanned: 0,
+                scan_total: 0,
+                scan_found: 0,
+                scan_elapsed_ms: 0,
+                format_counts: std::collections::HashMap::new(),
             });
             tracing::info!("Bootstrap: added Local MinIO S3 config");
         }
