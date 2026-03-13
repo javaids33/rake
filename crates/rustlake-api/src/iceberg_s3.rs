@@ -71,9 +71,6 @@ pub struct DiscoveredTable {
     pub properties: std::collections::HashMap<String, String>,
 }
 
-// Keep the old name as an alias for backward compatibility in routes.rs
-pub type IcebergTableInfo = DiscoveredTable;
-
 #[derive(Debug, Clone, Serialize)]
 pub struct ColumnInfo {
     pub name: String,
@@ -81,9 +78,6 @@ pub struct ColumnInfo {
     pub nullable: bool,
     pub ordinal: i32,
 }
-
-// Keep old name for backward compat
-pub type IcebergColumnInfo = ColumnInfo;
 
 /// Scan progress event emitted during discovery.
 #[derive(Debug, Clone, Serialize)]
@@ -1035,13 +1029,6 @@ async fn read_file_bytes(
     Ok(bytes.to_vec())
 }
 
-// Keep old name for backward compat
-pub async fn read_iceberg_metadata(
-    store: &Arc<dyn ObjectStore>,
-    path: &str,
-) -> Result<serde_json::Value, String> {
-    read_json_file(store, path).await
-}
 
 // ── Iceberg-specific parsing ───────────────────────────────────────
 

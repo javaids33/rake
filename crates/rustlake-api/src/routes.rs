@@ -886,6 +886,16 @@ async fn execute_sql(
 
     tracing::info!(sql = %req.sql, %query_id, engine_choice = %req.engine, "Received SQL request");
 
+    // Log available schemas for debugging table resolution
+    {
+        let ctx = state.ctx.read().await;
+        let df_ctx = ctx.datafusion_ctx();
+        if let Some(catalog) = df_ctx.catalog("datafusion") {
+            let schemas = catalog.schema_names();
+            tracing::info!(%query_id, available_schemas = ?schemas, "DataFusion catalog schemas");
+        }
+    }
+
     // Classify the query (parse + classify timing)
     let parse_start = Instant::now();
     let classification = QueryClassifier::classify_with_engine(&req.sql)
@@ -6110,6 +6120,7 @@ async fn try_register_listing_table(
     use datafusion::datasource::listing::{ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl};
     use datafusion::datasource::file_format::parquet::ParquetFormat;
 
+    tracing::debug!(table_name = %table_name, path = %s3_data_path, "Parsing ListingTableUrl");
     let table_url = ListingTableUrl::parse(s3_data_path)
         .map_err(|e| format!("ListingTableUrl '{}': {}", s3_data_path, e))?;
 
@@ -6117,12 +6128,14 @@ async fn try_register_listing_table(
     let listing_options = ListingOptions::new(Arc::new(parquet_format))
         .with_file_extension(".parquet");
 
+    tracing::debug!(table_name = %table_name, "Inferring schema from parquet files");
     let config = ListingTableConfig::new(table_url)
         .with_listing_options(listing_options)
         .infer_schema(&df_ctx.state())
         .await
         .map_err(|e| format!("Schema infer at '{}': {}", s3_data_path, e))?;
 
+    tracing::debug!(table_name = %table_name, schema_fields = config.file_schema.as_ref().map(|s| s.fields().len()).unwrap_or(0), "Schema inferred");
     let listing_table = ListingTable::try_new(config)
         .map_err(|e| format!("ListingTable '{}': {}", table_name, e))?;
 
@@ -6130,6 +6143,7 @@ async fn try_register_listing_table(
     schema_provider.register_table(table_name.to_string(), provider)
         .map_err(|e| format!("Register '{}': {}", table_name, e))?;
 
+    tracing::debug!(table_name = %table_name, "Table registered in schema provider");
     Ok(())
 }
 
@@ -6261,19 +6275,25 @@ async fn discover_s3_tables(
             };
 
             // Attempt ListingTable registration (reads actual parquet files from S3)
+            tracing::info!(
+                schema = %schema_name, table = %table_info.table_name,
+                full_name = %full_name, format = %table_info.format,
+                data_path = %data_path, s3_location = %table_info.s3_location,
+                "Attempting S3 table registration"
+            );
             let registered = match try_register_listing_table(df_ctx, &table_info.table_name, &data_path, &schema_provider).await {
                 Ok(()) => {
-                    tracing::debug!(
+                    tracing::info!(
                         table = %full_name, format = %table_info.format, path = %data_path,
-                        "Registered S3 ListingTable (queryable)"
+                        "✓ Registered S3 ListingTable (queryable)"
                     );
                     true
                 }
                 Err(e) => {
                     // Fallback: register MemTable with schema only (browseable but not queryable for data)
-                    tracing::debug!(
+                    tracing::warn!(
                         table = %full_name, format = %table_info.format, path = %data_path,
-                        error = %e, "ListingTable failed, falling back to schema-only MemTable"
+                        error = %e, "✗ ListingTable failed, falling back to schema-only MemTable"
                     );
                     let arrow_fields: Vec<arrow::datatypes::Field> = table_info.columns.iter().map(|col| {
                         let dt = iceberg_type_to_arrow(&col.data_type);
@@ -6308,8 +6328,33 @@ async fn discover_s3_tables(
         }
     }
 
-    if errors > 0 {
+    // ── Post-registration summary ──
+    {
+        // Log every schema and its tables for diagnostics
+        let catalog = df_ctx.catalog("datafusion").unwrap();
+        let schema_names = catalog.schema_names();
+        let s3_schemas: Vec<_> = schema_names.iter().filter(|s| s.starts_with("s3_")).collect();
         tracing::info!(
+            total_registered = registered_tables.len(),
+            total_errors = errors,
+            s3_schemas = ?s3_schemas,
+            "S3 registration summary"
+        );
+        for sn in &s3_schemas {
+            if let Some(sp) = catalog.schema(sn) {
+                let tables = sp.table_names();
+                tracing::info!(
+                    schema = %sn,
+                    table_count = tables.len(),
+                    tables = ?tables,
+                    "Schema contents after registration"
+                );
+            }
+        }
+    }
+
+    if errors > 0 {
+        tracing::warn!(
             registered = registered_tables.len(), errors = errors,
             "S3 table registration: some tables had issues"
         );

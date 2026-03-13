@@ -4,6 +4,8 @@ import { useEditorStore } from '../stores/editor'
 import { SqlEditorComponent } from '../components/editor/SqlEditor'
 import { DataTable } from '../components/ui/DataTable'
 import { QueryChart } from '../components/charts/QueryChart'
+import { DataProfile } from '../components/editor/DataProfile'
+import { CommandPalette } from '../components/ui/CommandPalette'
 import { Button } from '../components/ui/Button'
 import { Badge } from '../components/ui/Badge'
 import { Card } from '../components/ui/Card'
@@ -21,6 +23,7 @@ import {
   Play, Plus, X, Table2, BarChart3, LineChart, ScatterChart, PieChart,
   AreaChart, Save, BookOpen, Zap, Clock, Rows3, Terminal, FileSearch, Gauge, ArrowLeftRight, Trophy,
   ChevronDown, ChevronRight, GitBranch, Radio, Workflow, Database, Plug, Search, Columns3, MousePointerClick, HardDrive, Trash2, RefreshCw, Layers, Square, Wifi, PanelRightClose, PanelRightOpen,
+  Clipboard, Download, Braces, Eye, Activity, Command,
 } from 'lucide-react'
 
 const chartOptions: Array<{ type: ChartType; icon: React.ReactNode; label: string }> = [
@@ -39,7 +42,7 @@ export function SqlEditorPage() {
   const error = store.errors[store.activeTabId]
   const loading = store.loading[store.activeTabId]
 
-  const [view, setView] = useState<'table' | 'chart' | 'explain'>('table')
+  const [view, setView] = useState<'table' | 'chart' | 'explain' | 'profile'>('table')
   const [saveOpen, setSaveOpen] = useState(false)
   const [explainResult, setExplainResult] = useState<ExplainResponse | null>(null)
   const [explaining, setExplaining] = useState(false)
@@ -76,10 +79,23 @@ export function SqlEditorPage() {
   const [expandedTrinoTable, setExpandedTrinoTable] = useState<string | null>(null) // "connId:catalog:schema:table"
   const [trinoColumnCache, setTrinoColumnCache] = useState<Record<string, Array<{ name: string; data_type: string; nullable: boolean; ordinal: number }>>>({})
   const [trinoRefreshing, setTrinoRefreshing] = useState<Set<string>>(new Set())
+  const [cmdPaletteOpen, setCmdPaletteOpen] = useState(false)
   const resizing = useRef(false)
   const containerRef = useRef<HTMLDivElement>(null)
   const workflowRef = useRef<HTMLDivElement>(null)
   const demoRef = useRef<HTMLDivElement>(null)
+
+  // Global Cmd+K handler for command palette
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key === 'k') {
+        e.preventDefault()
+        setCmdPaletteOpen(prev => !prev)
+      }
+    }
+    document.addEventListener('keydown', handler)
+    return () => document.removeEventListener('keydown', handler)
+  }, [])
 
   // WebSocket streaming
   const { connected: wsConnected, sendQuery, cancelQuery } = useWebSocket()
@@ -600,6 +616,15 @@ export function SqlEditorPage() {
           <Button variant="ghost" size="sm" icon={<ArrowLeftRight className="w-3.5 h-3.5 text-cyan-400" />} onClick={handleCompare} loading={comparing}>
             <span className="text-cyan-400">Compare All</span>
           </Button>
+          <Tooltip content="Command Palette — search tables, pages, actions" position="bottom">
+            <button
+              onClick={() => setCmdPaletteOpen(true)}
+              className="flex items-center gap-1.5 px-2 py-1 rounded-md text-2xs text-zinc-500 border border-zinc-700/40 bg-zinc-800/20 hover:bg-white/[0.04] hover:text-zinc-300 transition-colors"
+            >
+              <Command className="w-3 h-3" />
+              <span className="font-mono">K</span>
+            </button>
+          </Tooltip>
         </div>
       </div>
 
@@ -735,10 +760,11 @@ export function SqlEditorPage() {
                       tabs={[
                         { id: 'table', label: 'Table', icon: <Table2 className="w-3 h-3" /> },
                         { id: 'chart', label: 'Chart', icon: <BarChart3 className="w-3 h-3" /> },
+                        { id: 'profile', label: 'Profile', icon: <Activity className="w-3 h-3" /> },
                         ...(explainResult ? [{ id: 'explain', label: 'Plan', icon: <FileSearch className="w-3 h-3" /> }] : []),
                       ]}
                       active={view}
-                      onChange={(id) => setView(id as 'table' | 'chart' | 'explain')}
+                      onChange={(id) => setView(id as 'table' | 'chart' | 'explain' | 'profile')}
                     />
                     {view === 'chart' && (
                       <div className="flex items-center gap-1 ml-2">
@@ -759,6 +785,59 @@ export function SqlEditorPage() {
                     )}
                   </div>
                   <div className="flex items-center gap-3">
+                    {/* Result action buttons */}
+                    <div className="flex items-center gap-1 border-r border-white/[0.06] pr-3 mr-1">
+                      <Tooltip content="Copy SQL to clipboard" position="bottom">
+                        <button
+                          onClick={() => { navigator.clipboard.writeText(activeTab.sql); import('react-hot-toast').then(m => m.default.success('SQL copied')) }}
+                          className="p-1.5 rounded-md text-zinc-600 hover:text-zinc-300 hover:bg-white/[0.04] transition-colors"
+                        >
+                          <Clipboard className="w-3.5 h-3.5" />
+                        </button>
+                      </Tooltip>
+                      <Tooltip content="Export results as CSV" position="bottom">
+                        <button
+                          onClick={() => {
+                            if (!result) return
+                            const header = result.columns.join(',')
+                            const rows_csv = result.rows.map((r: Record<string, unknown>) => result.columns.map((c: string) => {
+                              const v = r[c]
+                              const s = v === null || v === undefined ? '' : String(v)
+                              return s.includes(',') || s.includes('"') || s.includes('\n') ? `"${s.replace(/"/g, '""')}"` : s
+                            }).join(',')).join('\n')
+                            const blob = new Blob([header + '\n' + rows_csv], { type: 'text/csv' })
+                            const url = URL.createObjectURL(blob)
+                            const a = document.createElement('a')
+                            a.href = url; a.download = `query_result_${Date.now()}.csv`; a.click()
+                            URL.revokeObjectURL(url)
+                          }}
+                          className="p-1.5 rounded-md text-zinc-600 hover:text-zinc-300 hover:bg-white/[0.04] transition-colors"
+                        >
+                          <Download className="w-3.5 h-3.5" />
+                        </button>
+                      </Tooltip>
+                      <Tooltip content="Copy results as JSON" position="bottom">
+                        <button
+                          onClick={() => { if (result) { navigator.clipboard.writeText(JSON.stringify(result.rows, null, 2)); import('react-hot-toast').then(m => m.default.success('JSON copied')) } }}
+                          className="p-1.5 rounded-md text-zinc-600 hover:text-zinc-300 hover:bg-white/[0.04] transition-colors"
+                        >
+                          <Braces className="w-3.5 h-3.5" />
+                        </button>
+                      </Tooltip>
+                      <Tooltip content="Create VIEW from this query" position="bottom">
+                        <button
+                          onClick={() => {
+                            const sql = activeTab.sql.trim().replace(/;$/, '')
+                            const viewName = `v_${activeTab.name.toLowerCase().replace(/[^a-z0-9]/g, '_')}`
+                            store.updateTabSql(store.activeTabId, `CREATE VIEW ${viewName} AS\n${sql};`)
+                            import('react-hot-toast').then(m => m.default.success('CREATE VIEW SQL generated'))
+                          }}
+                          className="p-1.5 rounded-md text-zinc-600 hover:text-zinc-300 hover:bg-white/[0.04] transition-colors"
+                        >
+                          <Eye className="w-3.5 h-3.5" />
+                        </button>
+                      </Tooltip>
+                    </div>
                     <Tooltip content="Detected query type (auto-classified)" position="bottom">
                       <span className={cn('inline-flex items-center px-2 py-0.5 rounded-md text-2xs font-medium border', QUERY_TYPE_COLORS[result.query_type] || 'bg-surface-4 text-zinc-400 border-zinc-700/50')}>
                         {result.query_type}
@@ -800,6 +879,8 @@ export function SqlEditorPage() {
                 <div className="flex-1 overflow-auto">
                   {view === 'table' ? (
                     <DataTable columns={result.columns} rows={result.rows} maxHeight="100%" />
+                  ) : view === 'profile' ? (
+                    <DataProfile columns={result.columns} rows={result.rows} />
                   ) : view === 'explain' && explainResult ? (
                     <div className="p-4 space-y-5">
                       <div>
@@ -1322,7 +1403,7 @@ export function SqlEditorPage() {
                                           </button>
                                           <Tooltip content="Insert SELECT query" position="left">
                                             <button
-                                              onClick={() => insertAtCursor(`SELECT * FROM "${fullName}" LIMIT 100;`)}
+                                              onClick={() => insertAtCursor(`SELECT * FROM ${fullName} LIMIT 100;`)}
                                               className="p-1 mr-2 rounded opacity-0 group-hover:opacity-100 hover:bg-white/[0.04] transition-all"
                                             >
                                               <MousePointerClick className="w-3 h-3 text-amber-400/70" />
@@ -1334,9 +1415,9 @@ export function SqlEditorPage() {
                                             {cols.map(col => (
                                               <button
                                                 key={col.name}
-                                                onClick={() => insertAtCursor(`"${fullName}".${col.name}`)}
+                                                onClick={() => insertAtCursor(`${fullName}.${col.name}`)}
                                                 className="w-full flex items-center gap-1.5 px-3 py-1 hover:bg-white/[0.02] transition-colors cursor-pointer"
-                                                title={`Insert "${fullName}".${col.name}`}
+                                                title={`Insert ${fullName}.${col.name}`}
                                               >
                                                 <Columns3 className="w-2.5 h-2.5 text-zinc-600 flex-shrink-0" />
                                                 <span className="text-2xs font-mono text-zinc-500 truncate">{col.name}</span>
@@ -1426,6 +1507,29 @@ export function SqlEditorPage() {
           </div>
         </div>
       </Modal>
+
+      {/* Command Palette (Cmd+K) */}
+      <CommandPalette
+        open={cmdPaletteOpen}
+        onClose={() => setCmdPaletteOpen(false)}
+        tables={tables}
+        savedQueries={store.savedQueries}
+        onRunQuery={runQuery}
+        onNewTab={() => store.addTab()}
+        onExportCsv={() => {
+          if (!result) return
+          const header = result.columns.join(',')
+          const csvRows = result.rows.map((r: Record<string, unknown>) => result.columns.map((c: string) => {
+            const v = r[c]; const s = v === null || v === undefined ? '' : String(v)
+            return s.includes(',') || s.includes('"') || s.includes('\n') ? `"${s.replace(/"/g, '""')}"` : s
+          }).join(',')).join('\n')
+          const blob = new Blob([header + '\n' + csvRows], { type: 'text/csv' })
+          const url = URL.createObjectURL(blob)
+          const a = document.createElement('a'); a.href = url; a.download = `query_result_${Date.now()}.csv`; a.click()
+          URL.revokeObjectURL(url)
+        }}
+        onInsertSql={(sql) => store.updateTabSql(store.activeTabId, sql)}
+      />
     </div>
   )
 }
