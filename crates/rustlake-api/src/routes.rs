@@ -626,7 +626,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             "/api/v1/connections",
             post(add_connection).get(list_connections),
         )
-        .route("/api/v1/connections/{id}", delete(delete_connection))
+        .route("/api/v1/connections/{id}", delete(delete_connection).put(update_connection))
         .route("/api/v1/connections/{id}/status", get(connection_sync_status))
         .route(
             "/api/v1/connections/{id}/register/{table}",
@@ -3643,6 +3643,143 @@ async fn delete_connection(
     })))
 }
 
+/// PUT /api/v1/connections/{id} — update an existing connection.
+async fn update_connection(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<AddConnectionRequest>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    // Check the connection exists
+    {
+        let connections = state.connections.read().await;
+        if !connections.iter().any(|c| c.id == id) {
+            return Err((
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("Connection '{}' not found", id),
+                }),
+            ));
+        }
+    }
+
+    // Quick connectivity check (same as add_connection)
+    let conn_type = req.conn_type.clone();
+    match conn_type.as_str() {
+        "trino" | "presto" => {
+            let user = if req.username.is_empty() { "rustlake".to_string() } else { req.username.clone() };
+            let base_url = trino_base_url(&req.host, req.port);
+            let rest = crate::trino_client::TrinoRestClient::new(base_url, user, req.password.clone());
+            rest.server_info().await
+                .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: format!("Cannot reach Trino: {}", e) })))?;
+        }
+        #[cfg(feature = "postgres")]
+        "postgres" | "postgresql" => {
+            let addr = format!("{}:{}", req.host, req.port);
+            tokio::net::TcpStream::connect(&addr).await
+                .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: format!("Cannot reach Postgres: {}", e) })))?;
+        }
+        #[cfg(feature = "mysql")]
+        "mysql" | "mariadb" => {
+            let addr = format!("{}:{}", req.host, req.port);
+            tokio::net::TcpStream::connect(&addr).await
+                .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: format!("Cannot reach MySQL: {}", e) })))?;
+        }
+        "mongodb" => {
+            if req.auth_method == "connection_string" || req.auth_method == "aws_iam" {
+                let params = build_mongo_params(&req);
+                params.build_client().await
+                    .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: format!("Cannot connect to MongoDB: {}", e) })))?;
+            } else {
+                let addr = format!("{}:{}", req.host, req.port);
+                tokio::net::TcpStream::connect(&addr).await
+                    .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: format!("Cannot reach MongoDB: {}", e) })))?;
+            }
+        }
+        #[cfg(feature = "sqlite")]
+        "sqlite" => {
+            if !std::path::Path::new(&req.host).exists() {
+                return Err((StatusCode::BAD_REQUEST, Json(ErrorResponse { error: format!("SQLite file not found: {}", req.host) })));
+            }
+        }
+        other => {
+            return Err((StatusCode::BAD_REQUEST, Json(ErrorResponse { error: format!("Unsupported connection type: {}", other) })));
+        }
+    }
+
+    // Update the connection entry fields and set sync_status back to "syncing"
+    state.update_connection_entry(&id, |entry| {
+        entry.name = req.name.clone();
+        entry.conn_type = req.conn_type.clone();
+        entry.host = req.host.clone();
+        entry.port = req.port;
+        entry.database = req.database.clone();
+        entry.username = req.username.clone();
+        entry.status = "connected".to_string();
+        entry.tables = vec![];
+        entry.sync_status = "syncing".to_string();
+        entry.sync_error = None;
+        entry.sync_progress = None;
+        entry.auth_method = req.auth_method.clone();
+        entry.connection_string = if req.connection_string.is_empty() { None } else { Some(req.connection_string.clone()) };
+    }).await;
+
+    // Update stored password
+    state.store_password(id.clone(), req.password.clone()).await;
+
+    tracing::info!(
+        id = %id,
+        name = %req.name,
+        conn_type = %req.conn_type,
+        "Connection updated — starting background table re-discovery"
+    );
+
+    let response = serde_json::json!({
+        "status": "connected",
+        "sync_status": "syncing",
+        "id": id,
+        "name": req.name,
+        "tables": serde_json::Value::Array(vec![]),
+    });
+
+    // Spawn background task for table re-discovery (same logic as add_connection)
+    let bg_state = state.clone();
+    let bg_id = id.clone();
+    let bg_req = req.clone();
+    tokio::spawn(async move {
+        let result = discover_and_register_tables(&bg_state, &bg_id, &bg_req).await;
+        match result {
+            Ok(tables) => {
+                bg_state.update_connection_entry(&bg_id, |entry| {
+                    entry.tables = tables.clone();
+                    entry.sync_status = "ready".to_string();
+                    entry.sync_error = None;
+                }).await;
+                tracing::info!(
+                    id = %bg_id,
+                    name = %bg_req.name,
+                    tables = tables.len(),
+                    "Background re-sync complete: {} tables registered",
+                    tables.len()
+                );
+            }
+            Err(e) => {
+                bg_state.update_connection_entry(&bg_id, |entry| {
+                    entry.sync_status = "error".to_string();
+                    entry.sync_error = Some(e.clone());
+                }).await;
+                tracing::error!(
+                    id = %bg_id,
+                    name = %bg_req.name,
+                    error = %e,
+                    "Background re-sync failed"
+                );
+            }
+        }
+    });
+
+    Ok(Json(response))
+}
+
 /// GET /api/v1/connections/:id/status — poll sync status for a connection.
 async fn connection_sync_status(
     State(state): State<Arc<AppState>>,
@@ -4229,6 +4366,9 @@ async fn run_bootstrap(
                 region: minio_region,
                 status: "configured".to_string(),
                 created_at: Utc::now(),
+                tables: vec![],
+                sync_status: "ready".to_string(),
+                sync_error: None,
             });
             results.insert("minio".to_string(), serde_json::json!({ "status": "configured" }));
         } else {
@@ -5505,23 +5645,146 @@ async fn add_s3_config(
         name: req.name.clone(),
         endpoint: req.endpoint.clone(),
         access_key: req.access_key.clone(),
-        secret_key: req.secret_key,
+        secret_key: req.secret_key.clone(),
         bucket: req.bucket.clone(),
         region: req.region.clone(),
         status: "configured".to_string(),
         created_at: Utc::now(),
+        tables: vec![],
+        sync_status: "syncing".to_string(),
+        sync_error: None,
     };
 
     let mut configs = state.s3_configs.write().await;
     configs.push(config);
+    drop(configs);
+
+    tracing::info!(
+        name = %req.name,
+        bucket = %req.bucket,
+        "S3 config saved — starting background Iceberg table discovery"
+    );
+
+    // Spawn background task to discover Iceberg tables on S3
+    let bg_state = state.clone();
+    let bg_name = req.name.clone();
+    let bg_endpoint = req.endpoint.clone();
+    let bg_access_key = req.access_key.clone();
+    let bg_secret_key = req.secret_key;
+    let bg_bucket = req.bucket.clone();
+    let bg_region = req.region.clone();
+    tokio::spawn(async move {
+        let result = discover_s3_iceberg_tables(
+            &bg_state, &bg_name, &bg_endpoint, &bg_access_key, &bg_secret_key, &bg_bucket, &bg_region,
+        ).await;
+        match result {
+            Ok(tables) => {
+                let count = tables.len();
+                let mut configs = bg_state.s3_configs.write().await;
+                if let Some(cfg) = configs.iter_mut().find(|c| c.name == bg_name) {
+                    cfg.tables = tables;
+                    cfg.status = "ready".to_string();
+                    cfg.sync_status = "ready".to_string();
+                    cfg.sync_error = None;
+                }
+                tracing::info!(
+                    name = %bg_name,
+                    tables = count,
+                    "S3 Iceberg discovery complete: {} tables found",
+                    count
+                );
+            }
+            Err(e) => {
+                let mut configs = bg_state.s3_configs.write().await;
+                if let Some(cfg) = configs.iter_mut().find(|c| c.name == bg_name) {
+                    cfg.status = "error".to_string();
+                    cfg.sync_status = "error".to_string();
+                    cfg.sync_error = Some(e.clone());
+                }
+                tracing::error!(
+                    name = %bg_name,
+                    error = %e,
+                    "S3 Iceberg discovery failed"
+                );
+            }
+        }
+    });
 
     Ok(Json(serde_json::json!({
         "status": "ok",
+        "sync_status": "syncing",
         "name": req.name,
         "endpoint": req.endpoint,
         "bucket": req.bucket,
-        "message": "S3 configuration saved. Use s3://<bucket>/<path> in Register Table to access objects."
+        "message": "S3 configuration saved. Iceberg table discovery running in background."
     })))
+}
+
+/// Background task: scan S3 warehouse for Iceberg tables and register them in DataFusion.
+async fn discover_s3_iceberg_tables(
+    state: &Arc<AppState>,
+    name: &str,
+    endpoint: &str,
+    access_key: &str,
+    secret_key: &str,
+    bucket: &str,
+    region: &str,
+) -> std::result::Result<Vec<String>, String> {
+    let ep = if endpoint.is_empty() { None } else { Some(endpoint) };
+    let store = crate::iceberg_s3::build_s3_store(bucket, access_key, secret_key, region, ep)?;
+
+    let scan_result = crate::iceberg_s3::scan_warehouse(&store, "").await?;
+
+    tracing::info!(
+        name = %name,
+        bucket = %bucket,
+        databases = scan_result.databases.len(),
+        tables = scan_result.total_tables,
+        elapsed_ms = scan_result.scan_duration_ms,
+        "S3 warehouse scan complete"
+    );
+
+    let mut registered_tables = Vec::new();
+    let ctx = state.ctx.read().await;
+    let df_ctx = ctx.datafusion_ctx();
+
+    // Register each discovered Iceberg table in DataFusion as a MemTable from its schema
+    for table_info in &scan_result.tables {
+        let table_name = format!("s3_{}.{}", table_info.database, table_info.table_name);
+
+        // Build an Arrow schema from the discovered columns
+        let arrow_fields: Vec<arrow::datatypes::Field> = table_info.columns.iter().map(|col| {
+            let dt = match col.data_type.as_str() {
+                "boolean" => arrow::datatypes::DataType::Boolean,
+                "int" | "integer" => arrow::datatypes::DataType::Int32,
+                "long" | "bigint" => arrow::datatypes::DataType::Int64,
+                "float" => arrow::datatypes::DataType::Float32,
+                "double" => arrow::datatypes::DataType::Float64,
+                "string" => arrow::datatypes::DataType::Utf8,
+                "binary" => arrow::datatypes::DataType::Binary,
+                "date" => arrow::datatypes::DataType::Date32,
+                "timestamp" | "timestamptz" => arrow::datatypes::DataType::Timestamp(
+                    arrow::datatypes::TimeUnit::Microsecond, None,
+                ),
+                "decimal" => arrow::datatypes::DataType::Decimal128(38, 10),
+                _ => arrow::datatypes::DataType::Utf8,
+            };
+            arrow::datatypes::Field::new(&col.name, dt, col.nullable)
+        }).collect();
+
+        let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(arrow_fields));
+        // Register an empty MemTable so the table shows up in the catalog with correct schema
+        if let Ok(mem_table) = datafusion::datasource::MemTable::try_new(schema, vec![]) {
+            let provider: std::sync::Arc<dyn datafusion::datasource::TableProvider> =
+                std::sync::Arc::new(mem_table);
+            if df_ctx.register_table(&table_name, provider).is_ok() {
+                registered_tables.push(table_name.clone());
+                tracing::debug!(table = %table_name, "Registered Iceberg table from S3");
+            }
+        }
+    }
+
+    Ok(registered_tables)
 }
 
 async fn list_s3_configs(
@@ -5539,6 +5802,9 @@ async fn list_s3_configs(
                 "region": c.region,
                 "status": c.status,
                 "created_at": c.created_at,
+                "tables": c.tables,
+                "sync_status": c.sync_status,
+                "sync_error": c.sync_error,
             })
         })
         .collect();

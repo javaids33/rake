@@ -282,6 +282,15 @@ pub struct S3Config {
     pub region: String,
     pub status: String,
     pub created_at: DateTime<Utc>,
+    /// Iceberg tables discovered via S3 warehouse scan.
+    #[serde(default)]
+    pub tables: Vec<String>,
+    /// Sync status for async discovery: "ready", "syncing", "error".
+    #[serde(default = "default_sync_ready")]
+    pub sync_status: String,
+    /// Error message if sync/discovery failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync_error: Option<String>,
 }
 
 /// S3 credentials for a set of buckets, fetched from the credentials API.

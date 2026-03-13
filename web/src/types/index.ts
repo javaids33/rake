@@ -261,6 +261,9 @@ export interface S3Config {
   region: string
   status: string
   created_at: string
+  sync_status?: 'syncing' | 'ready' | 'error' | 'configured'
+  sync_error?: string
+  tables?: string[]
 }
 
 export interface ClusterInfo {

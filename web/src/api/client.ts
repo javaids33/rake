@@ -113,6 +113,8 @@ export const addConnection = (c: {
   auth_method?: string; connection_string?: string; aws_access_key?: string; aws_secret_key?: string; aws_session_token?: string; aws_region?: string;
 }) =>
   request<{ status: string; sync_status: string; id: string; name: string; tables: string[] }>('/api/v1/connections', { method: 'POST', body: JSON.stringify(c) })
+export const updateConnection = (id: string, c: Parameters<typeof addConnection>[0]) =>
+  request<{ status: string; sync_status: string; id: string; name: string; tables: string[] }>(`/api/v1/connections/${id}`, { method: 'PUT', body: JSON.stringify(c) })
 export const deleteConnection = (id: string) =>
   request<{ status: string }>(`/api/v1/connections/${id}`, { method: 'DELETE' })
 export const getConnectionStatus = (id: string) =>

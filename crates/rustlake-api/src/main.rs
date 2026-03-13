@@ -327,6 +327,9 @@ async fn bootstrap_demo_connections(state: Arc<AppState>) {
                 region: minio_region,
                 status: "configured".to_string(),
                 created_at: chrono::Utc::now(),
+                tables: vec![],
+                sync_status: "ready".to_string(),
+                sync_error: None,
             });
             tracing::info!("Bootstrap: added Local MinIO S3 config");
         }

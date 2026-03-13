@@ -9,13 +9,13 @@ import { Tabs } from '../components/ui/Tabs'
 import { EmptyState } from '../components/ui/EmptyState'
 import { StatusDot } from '../components/ui/StatusDot'
 import { cn } from '../lib/utils'
-import { getConnections, addConnection, deleteConnection, getS3Configs, addS3Config, deleteS3Config, uploadFile, registerTable, testConnection } from '../api/client'
+import { getConnections, addConnection, updateConnection, deleteConnection, getS3Configs, addS3Config, deleteS3Config, uploadFile, registerTable, testConnection } from '../api/client'
 import { useServerEvents } from '../components/layout/Shell'
 import type { TrinoScanEvent } from '../hooks/useEventStream'
 import { useAppStore } from '../stores/app'
 import type { ConnectionEntry, S3Config, ConnectionTestResponse } from '../types'
 import {
-  FolderInput, Database, HardDrive, Upload, Plus, Trash2,
+  FolderInput, Database, HardDrive, Upload, Plus, Trash2, Pencil,
   Server, Globe, FileText, Plug, Link2, FolderOpen, Search,
   ArrowRight, CheckCircle2, AlertCircle, Zap, ExternalLink,
   BarChart3, Layers, Radio, Cloud,
@@ -202,6 +202,9 @@ export function DataSources() {
   // MongoDB auth method
   const [mongoAuthMethod, setMongoAuthMethod] = useState<'scram' | 'aws_iam' | 'connection_string'>('scram')
 
+  // Edit connection
+  const [editingConnection, setEditingConnection] = useState<ConnectionEntry | null>(null)
+
   // Connection test wizard
   const [testResult, setTestResult] = useState<ConnectionTestResponse | null>(null)
   const [testing, setTesting] = useState(false)
@@ -223,6 +226,25 @@ export function DataSources() {
     setConfigValues({})
     setConnName('')
     setMongoAuthMethod('scram')
+    setWizardStep('configure')
+    setTestResult(null)
+    setEditingConnection(null)
+    setConnModal(true)
+  }
+
+  const handleEditConnection = (c: ConnectionEntry) => {
+    const connector = CONNECTOR_CATALOG.find(cn => cn.id === c.conn_type)
+    if (!connector) return
+    setEditingConnection(c)
+    setSelectedConnector(connector)
+    setConnName(c.name)
+    setConfigValues({
+      host: c.host || '',
+      port: String(c.port || ''),
+      database: c.database || '',
+      username: c.username || '',
+    })
+    if (c.auth_method) setMongoAuthMethod(c.auth_method as typeof mongoAuthMethod)
     setWizardStep('configure')
     setTestResult(null)
     setConnModal(true)
@@ -367,26 +389,45 @@ export function DataSources() {
             connPayload.aws_region = configValues.aws_region || 'us-east-1'
           }
         }
-        const result = await addConnection(connPayload)
-        // Add connection immediately with syncing status
-        const newConn: ConnectionEntry = {
-          id: result.id,
-          name: connName,
-          conn_type: selectedConnector.id,
-          host: configValues.host || (isMongo && mongoAuthMethod === 'connection_string' ? configValues.connection_string || '' : 'localhost'),
-          port: parseInt(configValues.port || (isMongo ? '27017' : '5432')),
-          database: configValues.database || configValues.catalog || configValues.keyspace || '',
-          username: configValues.username || '',
-          status: 'connected',
-          tables: [],
-          created_at: new Date().toISOString(),
-          mode: ['postgres', 'mysql', 'sqlite', 'clickhouse'].includes(selectedConnector.id) ? 'federated' : 'snapshot',
-          sync_status: result.sync_status === 'syncing' ? 'syncing' : 'ready',
-          ...(isMongo ? { auth_method: mongoAuthMethod } : {}),
+        if (editingConnection) {
+          const result = await updateConnection(editingConnection.id, connPayload)
+          // Update in-place
+          setConnections(prev => prev.map(conn => conn.id === editingConnection.id ? {
+            ...conn,
+            name: connName,
+            host: configValues.host || conn.host,
+            port: parseInt(configValues.port || String(conn.port)),
+            database: configValues.database || configValues.catalog || configValues.keyspace || conn.database,
+            username: configValues.username || conn.username,
+            sync_status: result.sync_status === 'syncing' ? 'syncing' : 'ready',
+            tables: result.tables || conn.tables,
+          } : conn))
+          toast.success('Connection updated')
+          // Refresh connections list
+          getConnections().then(r => setConnections(r.connections || [])).catch(() => {})
+          setEditingConnection(null)
+        } else {
+          const result = await addConnection(connPayload)
+          // Add connection immediately with syncing status
+          const newConn: ConnectionEntry = {
+            id: result.id,
+            name: connName,
+            conn_type: selectedConnector.id,
+            host: configValues.host || (isMongo && mongoAuthMethod === 'connection_string' ? configValues.connection_string || '' : 'localhost'),
+            port: parseInt(configValues.port || (isMongo ? '27017' : '5432')),
+            database: configValues.database || configValues.catalog || configValues.keyspace || '',
+            username: configValues.username || '',
+            status: 'connected',
+            tables: [],
+            created_at: new Date().toISOString(),
+            mode: ['postgres', 'mysql', 'sqlite', 'clickhouse'].includes(selectedConnector.id) ? 'federated' : 'snapshot',
+            sync_status: result.sync_status === 'syncing' ? 'syncing' : 'ready',
+            ...(isMongo ? { auth_method: mongoAuthMethod } : {}),
+          }
+          setConnections(prev => [...prev, newConn])
+          setTab('active')
+          toast.loading('Discovering tables in background...', { id: `sync-${result.id}`, duration: 30000 })
         }
-        setConnections(prev => [...prev, newConn])
-        setTab('active')
-        toast.loading('Discovering tables in background...', { id: `sync-${result.id}`, duration: 30000 })
         // SSE will push sync status updates automatically
       } else if (selectedConnector.category === 'format') {
         if (configValues.path || configValues.catalog_uri) {
@@ -615,46 +656,78 @@ export function DataSources() {
                       </div>
                     )}
                   </div>
-                  <Button variant="ghost" size="sm" onClick={() => { deleteConnection(c.id); setConnections(cs => cs.filter(x => x.id !== c.id)) }}>
-                    <Trash2 className="w-3.5 h-3.5 text-zinc-600" />
-                  </Button>
+                  <div className="flex items-center gap-1">
+                    <Button variant="ghost" size="sm" onClick={() => handleEditConnection(c)}>
+                      <Pencil className="w-3.5 h-3.5 text-zinc-500" />
+                    </Button>
+                    <Button variant="ghost" size="sm" onClick={() => { deleteConnection(c.id); setConnections(cs => cs.filter(x => x.id !== c.id)) }}>
+                      <Trash2 className="w-3.5 h-3.5 text-zinc-600" />
+                    </Button>
+                  </div>
                 </Card>
                 )
               })}
-              {s3Configs.map(c => (
+              {s3Configs.map(c => {
+                const s3SyncStatus = c.sync_status || 'configured'
+                const s3IsSyncing = s3SyncStatus === 'syncing'
+                const s3IsError = s3SyncStatus === 'error'
+                const s3IsReady = s3SyncStatus === 'ready'
+                const dotColor = s3IsError ? '#ef4444' : s3IsSyncing ? '#f59e0b' : '#22c55e'
+                return (
                 <Card key={c.name} className="flex items-center gap-4">
                   <div className="w-10 h-10 rounded-lg bg-amber-400/[0.06] border border-amber-400/10 flex items-center justify-center relative">
                     <HardDrive className="w-5 h-5 text-amber-400" />
                     <span style={{
                       position: 'absolute', top: -2, right: -2, width: 10, height: 10, borderRadius: '50%',
-                      background: '#22c55e', border: '2px solid rgba(2,6,23,0.8)',
-                      boxShadow: '0 0 6px rgba(34,197,94,0.4)',
+                      background: dotColor, border: '2px solid rgba(2,6,23,0.8)',
+                      boxShadow: `0 0 6px ${dotColor}66`,
+                      animation: s3IsSyncing ? 'pulse 2s infinite' : undefined,
                     }} />
                   </div>
                   <div className="flex-1">
                     <div className="flex items-center gap-2">
                       <h3 className="text-sm font-semibold text-zinc-200">{c.name}</h3>
                       <Badge className="bg-amber-400/8 text-amber-400/80 border-amber-400/10">S3</Badge>
-                      <Badge className="bg-emerald-400/8 text-emerald-400/80 border-emerald-400/10 text-2xs">Connected</Badge>
+                      {s3IsSyncing ? (
+                        <Badge className="bg-amber-400/10 text-amber-400 border-amber-400/20 text-2xs animate-pulse">Scanning...</Badge>
+                      ) : s3IsError ? (
+                        <Badge className="bg-red-400/10 text-red-400 border-red-400/20 text-2xs">Scan Failed</Badge>
+                      ) : s3IsReady ? (
+                        <Badge className="bg-emerald-400/8 text-emerald-400/80 border-emerald-400/10 text-2xs">
+                          Ready {c.tables && c.tables.length > 0 && `(${c.tables.length} tables)`}
+                        </Badge>
+                      ) : (
+                        <Badge className="bg-emerald-400/8 text-emerald-400/80 border-emerald-400/10 text-2xs">Connected</Badge>
+                      )}
                     </div>
                     <p className="text-2xs font-mono text-zinc-500 mt-0.5">{c.endpoint}</p>
-                    <div className="flex items-center gap-1.5 mt-2">
+                    {s3IsError && c.sync_error && (
+                      <p className="text-2xs text-red-400/80 mt-1">{c.sync_error}</p>
+                    )}
+                    <div className="flex items-center gap-1.5 mt-2 flex-wrap">
                       <Badge>{c.bucket}</Badge>
                       <Badge>{c.region}</Badge>
                     </div>
+                    {c.tables && c.tables.length > 0 && (
+                      <div className="flex items-center gap-1.5 mt-2 flex-wrap">
+                        {c.tables.slice(0, 5).map(t => <Badge key={t} className="text-2xs">{t}</Badge>)}
+                        {c.tables.length > 5 && <Badge className="text-2xs">+{c.tables.length - 5} more</Badge>}
+                      </div>
+                    )}
                   </div>
                   <Button variant="ghost" size="sm" onClick={() => { deleteS3Config(c.name); setS3Configs(cs => cs.filter(x => x.name !== c.name)) }}>
                     <Trash2 className="w-3.5 h-3.5 text-zinc-600" />
                   </Button>
                 </Card>
-              ))}
+                )
+              })}
             </div>
           )}
         </div>
       )}
 
       {/* Dynamic connector config modal */}
-      <Modal open={connModal} onClose={() => setConnModal(false)} title={selectedConnector ? `Connect ${selectedConnector.name}` : 'Connect'} width="max-w-lg">
+      <Modal open={connModal} onClose={() => { setConnModal(false); setEditingConnection(null) }} title={selectedConnector ? (editingConnection ? `Edit ${selectedConnector.name} Connection` : `Connect ${selectedConnector.name}`) : 'Connect'} width="max-w-lg">
         {selectedConnector && (
           <div className="space-y-4">
             {/* Wizard step indicator */}
@@ -818,7 +891,7 @@ export function DataSources() {
             <div className="flex justify-end gap-2 pt-2">
               <Button variant="secondary" size="sm" onClick={() => setConnModal(false)}>Cancel</Button>
               <Button variant="primary" size="sm" onClick={handleConnect} icon={<Link2 className="w-3.5 h-3.5" />}>
-                {selectedConnector.category === 'format' ? 'Register' : 'Connect'}
+                {editingConnection ? 'Update' : selectedConnector.category === 'format' ? 'Register' : 'Connect'}
               </Button>
             </div>
           </div>
