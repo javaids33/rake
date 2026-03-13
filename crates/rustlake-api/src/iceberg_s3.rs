@@ -23,6 +23,10 @@ use tokio::sync::mpsc;
 const DISCOVERY_DIR_PARALLELISM: usize = 16;
 /// Concurrent S3 operations for metadata reads (phase 3).
 const DISCOVERY_META_PARALLELISM: usize = 24;
+/// Maximum directory depth to recurse when scanning for tables.
+/// Trino/Hive warehouses can be: schema/namespace/table-uuid/ (3 levels),
+/// and some have even deeper layouts.
+const MAX_SCAN_DEPTH: usize = 5;
 
 /// Table format detected from S3 directory layout.
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -233,40 +237,100 @@ pub async fn scan_warehouse_with_progress(
         &empty_formats,
     );
 
-    // ── Phase 2: List tables within each database (parallel) ─────────
-    let db_tables: Vec<(String, Vec<(String, String)>)> = if !databases.is_empty() {
-        let results: Vec<(String, Vec<(String, String)>)> = stream::iter(databases.iter().cloned())
-            .map(|db| {
-                let store = store.clone();
-                let prefix = prefix.clone();
-                async move {
-                    let db_prefix = format!("{}{}/", prefix, db);
-                    let subdirs = list_directories(&store, &db_prefix).await.unwrap_or_default();
-                    let table_paths: Vec<(String, String)> = subdirs.into_iter()
-                        .map(|tbl| {
-                            let path = format!("{}{}/", db_prefix, tbl);
-                            (tbl, path)
-                        })
-                        .collect();
-                    (db, table_paths)
-                }
-            })
-            .buffer_unordered(DISCOVERY_DIR_PARALLELISM)
-            .collect()
-            .await;
-        results
-    } else {
-        vec![]
-    };
+    // ── Phase 2: Recursively discover table dirs within each database ─
+    // Trino/Hive warehouses can have deep hierarchies:
+    //   catalog/schema/table-uuid/metadata/
+    // We recurse into non-table directories up to MAX_SCAN_DEPTH.
+    //
+    // The "database" label composes intermediate path segments with underscores:
+    //   consumer/app_104387_rtef/mars-{uuid}/ → database = "app_104387_rtef", table = "mars"
+    //   (consumer is treated as catalog, app_104387_rtef as schema/database)
+    //   If only 2-level: sales.db/orders/ → database = "sales", table = "orders"
 
-    // Combine: flat tables go into a "default" database, hierarchical tables keep their DB
     let mut all_table_paths: Vec<(String, String, String)> = Vec::new(); // (db, table, path)
+
+    // Add flat (top-level) tables
     for (table_name, path) in &flat_tables {
         all_table_paths.push(("default".to_string(), table_name.clone(), path.clone()));
     }
-    for (db, tables) in &db_tables {
-        for (table_name, path) in tables {
-            all_table_paths.push((db.clone(), table_name.clone(), path.clone()));
+
+    // Recursively explore databases to find table directories
+    if !databases.is_empty() {
+        let mut dirs_to_explore: Vec<(Vec<String>, String)> = Vec::new(); // (path_segments, full_path)
+        for db_name in &databases {
+            dirs_to_explore.push((
+                vec![db_name.clone()],
+                format!("{}{}/", prefix, db_name),
+            ));
+        }
+
+        // BFS-style recursive exploration: each level checks subdirs for tables vs deeper hierarchy
+        let mut depth = 1;
+        while !dirs_to_explore.is_empty() && depth < MAX_SCAN_DEPTH {
+            let explore_results: Vec<(Vec<String>, String, Vec<String>, Vec<String>)> =
+                stream::iter(dirs_to_explore.into_iter())
+                    .map(|(segments, dir_path)| {
+                        let store = store.clone();
+                        async move {
+                            let subdirs = list_directories(&store, &dir_path).await.unwrap_or_default();
+                            // Probe each subdir to see if it's a table or needs deeper traversal
+                            let mut table_names = Vec::new();
+                            let mut deeper_dirs = Vec::new();
+                            let probes: Vec<(String, DirProbe)> = stream::iter(subdirs.into_iter())
+                                .map(|subdir| {
+                                    let store = store.clone();
+                                    let dp = dir_path.clone();
+                                    async move {
+                                        let sub_path = format!("{}{}/", dp, subdir);
+                                        let probe = probe_directory(&store, &sub_path).await;
+                                        (subdir, probe)
+                                    }
+                                })
+                                .buffer_unordered(DISCOVERY_DIR_PARALLELISM)
+                                .collect()
+                                .await;
+                            for (subdir, probe) in probes {
+                                if probe.is_table {
+                                    table_names.push(subdir);
+                                } else if probe.has_subdirs {
+                                    deeper_dirs.push(subdir);
+                                }
+                            }
+                            (segments, dir_path, table_names, deeper_dirs)
+                        }
+                    })
+                    .buffer_unordered(DISCOVERY_DIR_PARALLELISM)
+                    .collect()
+                    .await;
+
+            let mut next_explore: Vec<(Vec<String>, String)> = Vec::new();
+            for (segments, dir_path, table_names, deeper_dirs) in explore_results {
+                // For tables found here: compose database name from path segments
+                // If segments = ["consumer", "app_104387_rtef"], database = "app_104387_rtef"
+                //   (skip the catalog-level prefix, use the deepest non-table segment)
+                // If segments = ["sales.db"], database = "sales" (strip .db suffix)
+                let db_name = compose_database_name(&segments);
+
+                for table_dir in table_names {
+                    let table_path = format!("{}{}/", dir_path, table_dir);
+                    // Strip UUID suffix from table dir name
+                    let clean_name = strip_uuid_suffix(&table_dir);
+                    all_table_paths.push((db_name.clone(), clean_name, table_path));
+                }
+
+                // Queue deeper dirs for next iteration
+                for deeper in deeper_dirs {
+                    let mut new_segments = segments.clone();
+                    new_segments.push(deeper.clone());
+                    next_explore.push((
+                        new_segments,
+                        format!("{}{}/", dir_path, deeper),
+                    ));
+                }
+            }
+
+            dirs_to_explore = next_explore;
+            depth += 1;
         }
     }
 
@@ -360,13 +424,13 @@ pub async fn scan_warehouse_with_progress(
         guard.clone()
     };
 
-    // Collect all unique database names
-    let mut db_names: Vec<String> = databases;
-    if !flat_tables.is_empty() && !db_names.contains(&"default".to_string()) {
-        db_names.push("default".to_string());
-    }
+    // Collect all unique database names from discovered tables
+    let mut db_names: Vec<String> = tables.iter()
+        .map(|t| t.database.clone())
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
     db_names.sort();
-    db_names.dedup();
 
     let duration = start.elapsed().as_millis();
     tracing::info!(
@@ -771,6 +835,94 @@ async fn discover_parquet_dir(
         table_type: String::new(),
         properties,
     })
+}
+
+// ── Name cleaning helpers ──────────────────────────────────────────
+
+/// Strip UUID suffix from table directory names.
+///
+/// Iceberg catalogs (Trino, Spark, Nessie) often create table directories with
+/// UUID suffixes: `mars-8c47cb78483c464aaceba11d21658a04`. This function
+/// strips the UUID portion and returns just the clean table name: `mars`.
+///
+/// Pattern: `{name}-{32-hex-char-uuid}` → `{name}`
+///
+/// If the name doesn't match the UUID pattern, it's returned as-is.
+fn strip_uuid_suffix(name: &str) -> String {
+    // UUID hex pattern: 32 lowercase hex chars (no dashes in dir names)
+    // e.g., "mars-8c47cb78483c464aaceba11d21658a04"
+    if let Some(dash_pos) = name.rfind('-') {
+        let suffix = &name[dash_pos + 1..];
+        // Check if suffix looks like a UUID (32 hex chars, no dashes)
+        if suffix.len() == 32 && suffix.chars().all(|c| c.is_ascii_hexdigit()) {
+            let clean = &name[..dash_pos];
+            if !clean.is_empty() {
+                return clean.to_string();
+            }
+        }
+        // Also check for UUID with dashes: 8-4-4-4-12 format (36 chars)
+        // e.g., "table-8c47cb78-4834-c464-aace-ba11d21658a0"
+        // This is less common in S3 paths but worth handling
+    }
+
+    // Check for standard UUID format appended after a dash: name-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+    // Total UUID with dashes = 36 chars
+    if name.len() > 37 {
+        // Try to find pattern where last 36 chars after a dash form a UUID
+        let potential_split = name.len() - 36;
+        if potential_split > 0 && name.as_bytes()[potential_split - 1] == b'-' {
+            let suffix = &name[potential_split..];
+            // Check UUID pattern: 8-4-4-4-12
+            let parts: Vec<&str> = suffix.split('-').collect();
+            if parts.len() == 5
+                && parts[0].len() == 8
+                && parts[1].len() == 4
+                && parts[2].len() == 4
+                && parts[3].len() == 4
+                && parts[4].len() == 12
+                && parts.iter().all(|p| p.chars().all(|c| c.is_ascii_hexdigit()))
+            {
+                let clean = &name[..potential_split - 1];
+                if !clean.is_empty() {
+                    return clean.to_string();
+                }
+            }
+        }
+    }
+
+    name.to_string()
+}
+
+/// Compose a database/schema name from the path segments leading to a table.
+///
+/// Handles various warehouse layouts:
+/// - `["sales.db"]` → `"sales"` (strip .db suffix)
+/// - `["consumer", "app_104387_rtef"]` → `"app_104387_rtef"` (catalog/schema → use schema)
+/// - `["warehouse", "catalog", "schema"]` → `"catalog_schema"` (deep → join non-root segments)
+/// - `["default"]` → `"default"`
+fn compose_database_name(segments: &[String]) -> String {
+    if segments.is_empty() {
+        return "default".to_string();
+    }
+
+    // Single segment: just clean it
+    if segments.len() == 1 {
+        return segments[0].trim_end_matches(".db").to_string();
+    }
+
+    // Multiple segments: skip the first (treated as catalog/warehouse root),
+    // join the rest with underscores. This maps:
+    //   ["consumer", "app_104387_rtef"] → "app_104387_rtef"
+    //   ["warehouse", "ns1", "ns2"] → "ns1_ns2"
+    let meaningful: Vec<&str> = segments[1..].iter()
+        .map(|s| s.trim_end_matches(".db"))
+        .collect();
+
+    if meaningful.is_empty() {
+        segments[0].trim_end_matches(".db").to_string()
+    } else {
+        meaningful.join("_")
+    }
 }
 
 // ── File / Directory helpers ───────────────────────────────────────
@@ -1179,4 +1331,85 @@ fn derive_warehouse_from_schema_location(location: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_strip_uuid_suffix_32hex() {
+        // Trino-style: table-<32 hex chars>
+        assert_eq!(
+            strip_uuid_suffix("mars-8c47cb78483c464aaceba11d21658a04"),
+            "mars"
+        );
+        assert_eq!(
+            strip_uuid_suffix("mars_ccb_new-abcdef0123456789abcdef0123456789"),
+            "mars_ccb_new"
+        );
+    }
+
+    #[test]
+    fn test_strip_uuid_suffix_dashed_uuid() {
+        // Standard UUID format: table-xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+        assert_eq!(
+            strip_uuid_suffix("orders-8c47cb78-4834-c464-aace-ba11d21658a0"),
+            "orders"
+        );
+    }
+
+    #[test]
+    fn test_strip_uuid_no_uuid() {
+        // Regular names without UUIDs — returned unchanged
+        assert_eq!(strip_uuid_suffix("orders"), "orders");
+        assert_eq!(strip_uuid_suffix("tpch_lineitem"), "tpch_lineitem");
+        assert_eq!(strip_uuid_suffix("app_104387_rtef"), "app_104387_rtef");
+        assert_eq!(strip_uuid_suffix("sales.db"), "sales.db");
+    }
+
+    #[test]
+    fn test_strip_uuid_short_hex_not_uuid() {
+        // Short hex suffix that isn't a UUID — preserved
+        assert_eq!(strip_uuid_suffix("table-abc123"), "table-abc123");
+        assert_eq!(strip_uuid_suffix("data-v2"), "data-v2");
+    }
+
+    #[test]
+    fn test_compose_database_name_single() {
+        assert_eq!(compose_database_name(&[s("sales.db")]), "sales");
+        assert_eq!(compose_database_name(&[s("default")]), "default");
+        assert_eq!(compose_database_name(&[s("analytics")]), "analytics");
+    }
+
+    #[test]
+    fn test_compose_database_name_catalog_schema() {
+        // Trino: catalog/schema → use schema as database name
+        assert_eq!(
+            compose_database_name(&[s("consumer"), s("app_104387_rtef")]),
+            "app_104387_rtef"
+        );
+        assert_eq!(
+            compose_database_name(&[s("consumer"), s("airflow_metrics")]),
+            "airflow_metrics"
+        );
+    }
+
+    #[test]
+    fn test_compose_database_name_deep() {
+        // 3+ levels: join non-root segments
+        assert_eq!(
+            compose_database_name(&[s("warehouse"), s("ns1"), s("ns2")]),
+            "ns1_ns2"
+        );
+    }
+
+    #[test]
+    fn test_compose_database_name_empty() {
+        assert_eq!(compose_database_name(&[]), "default");
+    }
+
+    fn s(val: &str) -> String {
+        val.to_string()
+    }
 }
