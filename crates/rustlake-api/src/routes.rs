@@ -5720,6 +5720,45 @@ async fn add_s3_config(
     })))
 }
 
+/// Map Iceberg type strings to Arrow DataType.
+fn iceberg_type_to_arrow(iceberg_type: &str) -> arrow::datatypes::DataType {
+    // Iceberg types can be simple ("long") or parameterized ("decimal(10,2)", "fixed[16]")
+    let lower = iceberg_type.to_lowercase();
+    let base = lower.split('(').next().unwrap_or(&lower).trim();
+    match base {
+        "boolean" => arrow::datatypes::DataType::Boolean,
+        "int" | "integer" => arrow::datatypes::DataType::Int32,
+        "long" | "bigint" => arrow::datatypes::DataType::Int64,
+        "float" => arrow::datatypes::DataType::Float32,
+        "double" => arrow::datatypes::DataType::Float64,
+        "string" => arrow::datatypes::DataType::Utf8,
+        "binary" | "fixed" => arrow::datatypes::DataType::Binary,
+        "date" => arrow::datatypes::DataType::Date32,
+        "time" => arrow::datatypes::DataType::Time64(arrow::datatypes::TimeUnit::Microsecond),
+        "timestamp" => arrow::datatypes::DataType::Timestamp(
+            arrow::datatypes::TimeUnit::Microsecond, None,
+        ),
+        "timestamptz" | "timestamp_ltz" => arrow::datatypes::DataType::Timestamp(
+            arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into()),
+        ),
+        "decimal" => {
+            // Parse decimal(precision, scale) — default to (38, 10)
+            if let Some(params) = iceberg_type.split('(').nth(1) {
+                let parts: Vec<&str> = params.trim_end_matches(')').split(',').collect();
+                let precision = parts.first().and_then(|p| p.trim().parse::<u8>().ok()).unwrap_or(38);
+                let scale = parts.get(1).and_then(|s| s.trim().parse::<i8>().ok()).unwrap_or(10);
+                arrow::datatypes::DataType::Decimal128(precision, scale)
+            } else {
+                arrow::datatypes::DataType::Decimal128(38, 10)
+            }
+        }
+        "uuid" => arrow::datatypes::DataType::Utf8, // UUID stored as string
+        "list" | "array" => arrow::datatypes::DataType::Utf8, // Nested types → JSON string
+        "map" | "struct" => arrow::datatypes::DataType::Utf8, // Nested types → JSON string
+        _ => arrow::datatypes::DataType::Utf8, // Unknown → string fallback
+    }
+}
+
 /// Background task: scan S3 warehouse for Iceberg tables and register them in DataFusion.
 async fn discover_s3_iceberg_tables(
     state: &Arc<AppState>,
@@ -5748,40 +5787,79 @@ async fn discover_s3_iceberg_tables(
     let ctx = state.ctx.read().await;
     let df_ctx = ctx.datafusion_ctx();
 
-    // Register each discovered Iceberg table in DataFusion as a MemTable from its schema
+    // Group tables by database → register as schema-qualified names (s3_{db}.{table})
+    // DataFusion needs MemorySchemaProvider per database, like we do for pg/mysql/mongo
+    let mut db_tables: std::collections::HashMap<String, Vec<&crate::iceberg_s3::IcebergTableInfo>> =
+        std::collections::HashMap::new();
     for table_info in &scan_result.tables {
-        let table_name = format!("s3_{}.{}", table_info.database, table_info.table_name);
+        db_tables.entry(table_info.database.clone()).or_default().push(table_info);
+    }
 
-        // Build an Arrow schema from the discovered columns
-        let arrow_fields: Vec<arrow::datatypes::Field> = table_info.columns.iter().map(|col| {
-            let dt = match col.data_type.as_str() {
-                "boolean" => arrow::datatypes::DataType::Boolean,
-                "int" | "integer" => arrow::datatypes::DataType::Int32,
-                "long" | "bigint" => arrow::datatypes::DataType::Int64,
-                "float" => arrow::datatypes::DataType::Float32,
-                "double" => arrow::datatypes::DataType::Float64,
-                "string" => arrow::datatypes::DataType::Utf8,
-                "binary" => arrow::datatypes::DataType::Binary,
-                "date" => arrow::datatypes::DataType::Date32,
-                "timestamp" | "timestamptz" => arrow::datatypes::DataType::Timestamp(
-                    arrow::datatypes::TimeUnit::Microsecond, None,
-                ),
-                "decimal" => arrow::datatypes::DataType::Decimal128(38, 10),
-                _ => arrow::datatypes::DataType::Utf8,
-            };
-            arrow::datatypes::Field::new(&col.name, dt, col.nullable)
-        }).collect();
+    let mut errors = 0u32;
+    for (db_name, tables) in &db_tables {
+        let schema_name = format!("s3_{}", db_name);
+        let schema_provider = match crate::providers::ensure_schema(df_ctx, &schema_name) {
+            Ok(sp) => sp,
+            Err(e) => {
+                tracing::warn!(schema = %schema_name, error = %e, "Failed to create schema for S3 database");
+                errors += tables.len() as u32;
+                continue;
+            }
+        };
 
-        let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(arrow_fields));
-        // Register an empty MemTable so the table shows up in the catalog with correct schema
-        if let Ok(mem_table) = datafusion::datasource::MemTable::try_new(schema, vec![]) {
-            let provider: std::sync::Arc<dyn datafusion::datasource::TableProvider> =
-                std::sync::Arc::new(mem_table);
-            if df_ctx.register_table(&table_name, provider).is_ok() {
-                registered_tables.push(table_name.clone());
-                tracing::debug!(table = %table_name, "Registered Iceberg table from S3");
+        for table_info in tables {
+            // Build an Arrow schema from the discovered columns
+            let arrow_fields: Vec<arrow::datatypes::Field> = table_info.columns.iter().map(|col| {
+                let dt = iceberg_type_to_arrow(&col.data_type);
+                arrow::datatypes::Field::new(&col.name, dt, col.nullable)
+            }).collect();
+
+            if arrow_fields.is_empty() {
+                tracing::debug!(
+                    db = %db_name, table = %table_info.table_name,
+                    "Skipping Iceberg table with no columns"
+                );
+                errors += 1;
+                continue;
+            }
+
+            let schema = std::sync::Arc::new(arrow::datatypes::Schema::new(arrow_fields));
+            match datafusion::datasource::MemTable::try_new(schema, vec![]) {
+                Ok(mem_table) => {
+                    let provider: std::sync::Arc<dyn datafusion::datasource::TableProvider> =
+                        std::sync::Arc::new(mem_table);
+                    match schema_provider.register_table(
+                        table_info.table_name.clone(), provider,
+                    ) {
+                        Ok(_) => {
+                            let full_name = format!("{}.{}", schema_name, table_info.table_name);
+                            registered_tables.push(full_name);
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                db = %db_name, table = %table_info.table_name,
+                                error = %e, "Failed to register Iceberg table"
+                            );
+                            errors += 1;
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!(
+                        db = %db_name, table = %table_info.table_name,
+                        error = %e, "Failed to create MemTable for Iceberg table"
+                    );
+                    errors += 1;
+                }
             }
         }
+    }
+
+    if errors > 0 {
+        tracing::info!(
+            registered = registered_tables.len(), errors = errors,
+            "S3 Iceberg registration: some tables had issues"
+        );
     }
 
     Ok(registered_tables)
