@@ -201,6 +201,13 @@ export const getEngines = () => request<EnginesResponse>('/api/v1/engines')
 // Providers
 export const getProviders = () => request<{ providers: Array<{ name: string; enabled: boolean; connections: number; tables: number }> }>('/api/v1/providers')
 
+// Connections Import/Export
+export const importConnections = (payload: { connections?: any[]; s3_configs?: any[] }) =>
+  request<{ imported: { connections: any[]; s3_configs: any[] }; total: number; errors: string[] }>('/api/v1/connections/import', { method: 'POST', body: JSON.stringify(payload) })
+
+export const exportConnections = () =>
+  request<{ connections: any[]; s3_configs: any[] }>('/api/v1/connections/export')
+
 // Trino (DuckDB-cached catalog browsing)
 export const trinoBrowse = (connId: string) =>
   request<{ catalogs: Array<{ name: string; schemas: Array<{ name: string; tables: string[] }> }>; cached_at: string | null; total_tables: number }>(`/api/v1/trino/${connId}/browse`)

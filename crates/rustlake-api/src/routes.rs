@@ -690,6 +690,9 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/api/v1/sql/estimate", post(estimate_query))
         // Connection testing
         .route("/api/v1/connections/test", post(test_connection))
+        // Bulk import/export
+        .route("/api/v1/connections/import", post(import_connections))
+        .route("/api/v1/connections/export", get(export_connections))
         // Bootstrap (auto-connect demo services)
         .route("/api/v1/bootstrap", post(run_bootstrap))
         .route("/api/v1/bootstrap/status", get(bootstrap_status))
@@ -1616,8 +1619,8 @@ async fn table_schema(
     let ctx = state.ctx.read().await;
     let df_ctx = ctx.datafusion_ctx();
 
-    // Look up the table provider to get its Arrow schema directly
-    let table_ref = datafusion::common::TableReference::bare(name.clone());
+    // Look up the table provider — support schema-qualified names like "s3_sales.orders"
+    let table_ref = parse_table_reference(&name);
     let provider = df_ctx.table_provider(table_ref).await.map_err(|e| {
         (
             StatusCode::NOT_FOUND,
@@ -1651,7 +1654,13 @@ async fn table_preview(
 ) -> std::result::Result<Json<TablePreviewResponse>, (StatusCode, Json<ErrorResponse>)> {
     let ctx = state.ctx.read().await;
 
-    let sql = format!("SELECT * FROM \"{}\" LIMIT 100", name);
+    // For schema-qualified names like "s3_sales.orders", use schema.table directly
+    let sql_name = if name.contains('.') {
+        name.clone()
+    } else {
+        format!("\"{}\"", name)
+    };
+    let sql = format!("SELECT * FROM {} LIMIT 100", sql_name);
     let batches = ctx.sql(&sql).await.map_err(|e| {
         (
             StatusCode::NOT_FOUND,
@@ -1698,9 +1707,9 @@ async fn table_stats(
 ) -> std::result::Result<Json<TableStatsResponse>, (StatusCode, Json<ErrorResponse>)> {
     let ctx = state.ctx.read().await;
 
-    // Get the schema first
+    // Get the schema first — support schema-qualified names
     let df_ctx = ctx.datafusion_ctx();
-    let table_ref = datafusion::common::TableReference::bare(name.clone());
+    let table_ref = parse_table_reference(&name);
     let provider = df_ctx.table_provider(table_ref).await.map_err(|e| {
         (
             StatusCode::NOT_FOUND,
@@ -5622,8 +5631,8 @@ async fn stop_pipeline(
 
 // ── S3 / Object Storage Config Handlers ─────────────────────────────
 
-#[derive(Deserialize)]
-struct AddS3ConfigRequest {
+#[derive(Clone, Deserialize)]
+pub(crate) struct AddS3ConfigRequest {
     name: String,
     endpoint: String,
     access_key: String,
@@ -5720,6 +5729,265 @@ async fn add_s3_config(
     })))
 }
 
+// ── Bulk Import / Export Handlers ─────────────────────────────────────
+
+/// Request body for bulk-importing multiple connections and S3 configs at once.
+#[derive(Deserialize)]
+struct BulkImportRequest {
+    /// Database connections to add.
+    #[serde(default)]
+    connections: Vec<AddConnectionRequest>,
+    /// S3 storage configs to add.
+    #[serde(default)]
+    s3_configs: Vec<AddS3ConfigRequest>,
+}
+
+/// POST /api/v1/connections/import — bulk-import connections and S3 configs.
+///
+/// Skips connectivity checks for speed; background sync will detect failures.
+async fn import_connections(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<BulkImportRequest>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let mut conn_results = Vec::new();
+    let mut s3_results = Vec::new();
+    let errors: Vec<serde_json::Value> = Vec::new();
+
+    // ── Process database connections ────────────────────────────────
+    for conn_req in req.connections {
+        let id = Uuid::new_v4().to_string();
+        let entry = ConnectionEntry {
+            id: id.clone(),
+            name: conn_req.name.clone(),
+            conn_type: conn_req.conn_type.clone(),
+            host: conn_req.host.clone(),
+            port: conn_req.port,
+            database: conn_req.database.clone(),
+            username: conn_req.username.clone(),
+            status: "connected".to_string(),
+            tables: vec![],
+            created_at: Utc::now(),
+            source: "import".to_string(),
+            sync_status: "syncing".to_string(),
+            sync_error: None,
+            sync_progress: None,
+            auth_method: conn_req.auth_method.clone(),
+            connection_string: if conn_req.connection_string.is_empty() {
+                None
+            } else {
+                Some(conn_req.connection_string.clone())
+            },
+        };
+
+        state.add_connection_entry(entry).await;
+        state.store_password(id.clone(), conn_req.password.clone()).await;
+
+        tracing::info!(
+            id = %id,
+            name = %conn_req.name,
+            conn_type = %conn_req.conn_type,
+            "Bulk import: connection added — starting background table discovery"
+        );
+
+        // Spawn background table discovery (same as add_connection)
+        let bg_state = state.clone();
+        let bg_id = id.clone();
+        let bg_req = conn_req.clone();
+        tokio::spawn(async move {
+            let result = discover_and_register_tables(&bg_state, &bg_id, &bg_req).await;
+            match result {
+                Ok(tables) => {
+                    bg_state
+                        .update_connection_entry(&bg_id, |entry| {
+                            entry.tables = tables.clone();
+                            entry.sync_status = "ready".to_string();
+                            entry.sync_error = None;
+                        })
+                        .await;
+                    tracing::info!(
+                        id = %bg_id,
+                        tables = tables.len(),
+                        "Bulk import: background sync complete — {} tables registered",
+                        tables.len()
+                    );
+                }
+                Err(e) => {
+                    bg_state
+                        .update_connection_entry(&bg_id, |entry| {
+                            entry.sync_status = "error".to_string();
+                            entry.sync_error = Some(e.clone());
+                        })
+                        .await;
+                    tracing::error!(
+                        id = %bg_id,
+                        error = %e,
+                        "Bulk import: background sync failed"
+                    );
+                }
+            }
+        });
+
+        conn_results.push(serde_json::json!({
+            "name": conn_req.name,
+            "id": id,
+            "status": "connected",
+            "sync_status": "syncing",
+        }));
+    }
+
+    // ── Process S3 configs ──────────────────────────────────────────
+    for s3_req in req.s3_configs {
+        let config = S3Config {
+            name: s3_req.name.clone(),
+            endpoint: s3_req.endpoint.clone(),
+            access_key: s3_req.access_key.clone(),
+            secret_key: s3_req.secret_key.clone(),
+            bucket: s3_req.bucket.clone(),
+            region: s3_req.region.clone(),
+            status: "configured".to_string(),
+            created_at: Utc::now(),
+            tables: vec![],
+            sync_status: "syncing".to_string(),
+            sync_error: None,
+        };
+
+        let mut configs = state.s3_configs.write().await;
+        configs.push(config);
+        drop(configs);
+
+        tracing::info!(
+            name = %s3_req.name,
+            bucket = %s3_req.bucket,
+            "Bulk import: S3 config saved — starting background Iceberg table discovery"
+        );
+
+        // Spawn background Iceberg discovery (same as add_s3_config)
+        let bg_state = state.clone();
+        let bg_name = s3_req.name.clone();
+        let bg_endpoint = s3_req.endpoint.clone();
+        let bg_access_key = s3_req.access_key.clone();
+        let bg_secret_key = s3_req.secret_key.clone();
+        let bg_bucket = s3_req.bucket.clone();
+        let bg_region = s3_req.region.clone();
+        tokio::spawn(async move {
+            let result = discover_s3_iceberg_tables(
+                &bg_state,
+                &bg_name,
+                &bg_endpoint,
+                &bg_access_key,
+                &bg_secret_key,
+                &bg_bucket,
+                &bg_region,
+            )
+            .await;
+            match result {
+                Ok(tables) => {
+                    let count = tables.len();
+                    let mut configs = bg_state.s3_configs.write().await;
+                    if let Some(cfg) = configs.iter_mut().find(|c| c.name == bg_name) {
+                        cfg.tables = tables;
+                        cfg.status = "ready".to_string();
+                        cfg.sync_status = "ready".to_string();
+                        cfg.sync_error = None;
+                    }
+                    tracing::info!(
+                        name = %bg_name,
+                        tables = count,
+                        "Bulk import: S3 Iceberg discovery complete — {} tables found",
+                        count
+                    );
+                }
+                Err(e) => {
+                    let mut configs = bg_state.s3_configs.write().await;
+                    if let Some(cfg) = configs.iter_mut().find(|c| c.name == bg_name) {
+                        cfg.status = "error".to_string();
+                        cfg.sync_status = "error".to_string();
+                        cfg.sync_error = Some(e.clone());
+                    }
+                    tracing::error!(
+                        name = %bg_name,
+                        error = %e,
+                        "Bulk import: S3 Iceberg discovery failed"
+                    );
+                }
+            }
+        });
+
+        s3_results.push(serde_json::json!({
+            "name": s3_req.name,
+            "bucket": s3_req.bucket,
+            "status": "configured",
+            "sync_status": "syncing",
+        }));
+    }
+
+    let total = conn_results.len() + s3_results.len();
+
+    Ok(Json(serde_json::json!({
+        "imported": {
+            "connections": conn_results,
+            "s3_configs": s3_results,
+        },
+        "total": total,
+        "errors": errors,
+    })))
+}
+
+/// GET /api/v1/connections/export — export all connections and S3 configs (passwords redacted).
+async fn export_connections(
+    State(state): State<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    let connections = state.connections.read().await;
+    let exported_connections: Vec<serde_json::Value> = connections
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "name": c.name,
+                "conn_type": c.conn_type,
+                "host": c.host,
+                "port": c.port,
+                "database": c.database,
+                "username": c.username,
+                "password": "",
+            })
+        })
+        .collect();
+    drop(connections);
+
+    let s3_configs = state.s3_configs.read().await;
+    let exported_s3: Vec<serde_json::Value> = s3_configs
+        .iter()
+        .map(|c| {
+            serde_json::json!({
+                "name": c.name,
+                "endpoint": c.endpoint,
+                "access_key": c.access_key,
+                "secret_key": "",
+                "bucket": c.bucket,
+                "region": c.region,
+            })
+        })
+        .collect();
+    drop(s3_configs);
+
+    Json(serde_json::json!({
+        "connections": exported_connections,
+        "s3_configs": exported_s3,
+    }))
+}
+
+/// Parse a table name into a DataFusion `TableReference`.
+/// Supports bare names ("my_table"), schema-qualified ("pg.orders"), and
+/// catalog-qualified ("catalog.schema.table").
+fn parse_table_reference(name: &str) -> datafusion::common::TableReference {
+    let parts: Vec<&str> = name.splitn(3, '.').collect();
+    match parts.len() {
+        3 => datafusion::common::TableReference::full(parts[0], parts[1], parts[2]),
+        2 => datafusion::common::TableReference::partial(parts[0], parts[1]),
+        _ => datafusion::common::TableReference::bare(name),
+    }
+}
+
 /// Map Iceberg type strings to Arrow DataType.
 fn iceberg_type_to_arrow(iceberg_type: &str) -> arrow::datatypes::DataType {
     // Iceberg types can be simple ("long") or parameterized ("decimal(10,2)", "fixed[16]")
@@ -5797,7 +6065,9 @@ async fn discover_s3_iceberg_tables(
 
     let mut errors = 0u32;
     for (db_name, tables) in &db_tables {
-        let schema_name = format!("s3_{}", db_name);
+        // Strip common suffixes like ".db" from Iceberg warehouse directory names
+        let clean_db = db_name.trim_end_matches(".db");
+        let schema_name = format!("s3_{}", clean_db);
         let schema_provider = match crate::providers::ensure_schema(df_ctx, &schema_name) {
             Ok(sp) => sp,
             Err(e) => {

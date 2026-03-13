@@ -9,7 +9,7 @@ import { Tabs } from '../components/ui/Tabs'
 import { EmptyState } from '../components/ui/EmptyState'
 import { StatusDot } from '../components/ui/StatusDot'
 import { cn } from '../lib/utils'
-import { getConnections, addConnection, updateConnection, deleteConnection, getS3Configs, addS3Config, deleteS3Config, uploadFile, registerTable, testConnection } from '../api/client'
+import { getConnections, addConnection, updateConnection, deleteConnection, getS3Configs, addS3Config, deleteS3Config, uploadFile, registerTable, testConnection, importConnections, exportConnections } from '../api/client'
 import { useServerEvents } from '../components/layout/Shell'
 import type { TrinoScanEvent } from '../hooks/useEventStream'
 import { useAppStore } from '../stores/app'
@@ -18,7 +18,7 @@ import {
   FolderInput, Database, HardDrive, Upload, Plus, Trash2, Pencil,
   Server, Globe, FileText, Plug, Link2, FolderOpen, Search,
   ArrowRight, CheckCircle2, AlertCircle, Zap, ExternalLink,
-  BarChart3, Layers, Radio, Cloud,
+  BarChart3, Layers, Radio, Cloud, Code, Copy, Download,
 } from 'lucide-react'
 import toast from 'react-hot-toast'
 
@@ -209,6 +209,12 @@ export function DataSources() {
   const [testResult, setTestResult] = useState<ConnectionTestResponse | null>(null)
   const [testing, setTesting] = useState(false)
   const [wizardStep, setWizardStep] = useState<'configure' | 'test' | 'done'>('configure')
+
+  // JSON Import/Export
+  const [importJson, setImportJson] = useState('')
+  const [importError, setImportError] = useState<string | null>(null)
+  const [importResult, setImportResult] = useState<{ imported: { connections: any[]; s3_configs: any[] }; total: number; errors: string[] } | null>(null)
+  const [importing, setImporting] = useState(false)
 
   useEffect(() => {
     getConnections().then(r => setConnections(r.connections || [])).catch(() => {})
@@ -488,6 +494,7 @@ export function DataSources() {
         tabs={[
           { id: 'connectors', label: 'Connector Catalog', count: CONNECTOR_CATALOG.length },
           { id: 'active', label: 'Active Connections', count: activeCount },
+          { id: 'import', label: 'JSON Import' },
         ]}
         active={tab}
         onChange={setTab}
@@ -723,6 +730,131 @@ export function DataSources() {
               })}
             </div>
           )}
+        </div>
+      )}
+
+      {tab === 'import' && (
+        <div className="space-y-4">
+          <Card className="p-4">
+            <div className="space-y-1 mb-4">
+              <h3 className="text-sm font-display font-semibold text-zinc-200">Bulk Import / Export</h3>
+              <p className="text-2xs text-zinc-500 leading-relaxed">
+                Bulk import connections and S3 storage via JSON. Paste your config below or use the sample template.
+              </p>
+              <p className="text-2xs text-zinc-600">
+                Supports: postgres, mysql, mongodb, trino, sqlite + S3/MinIO storage configs
+              </p>
+            </div>
+
+            <div className="flex items-center gap-2 mb-3">
+              <Button variant="secondary" size="sm" icon={<Copy className="w-3.5 h-3.5" />} onClick={() => {
+                const sample = JSON.stringify({
+                  connections: [
+                    { name: 'my-postgres', conn_type: 'postgres', host: 'localhost', port: 5432, database: 'mydb', username: 'user', password: 'pass' },
+                    { name: 'my-mysql', conn_type: 'mysql', host: 'localhost', port: 3306, database: 'mydb', username: 'user', password: 'pass' },
+                    { name: 'my-mongodb', conn_type: 'mongodb', host: 'localhost', port: 27017, database: 'mydb', username: 'user', password: 'pass', auth_method: 'scram' },
+                    { name: 'my-trino', conn_type: 'trino', host: 'localhost', port: 8080, database: 'postgresql', username: 'admin', password: '' },
+                    { name: 'atlas-mongo', conn_type: 'mongodb', host: 'cluster0.abc123.mongodb.net', port: 27017, database: 'mydb', username: '', password: '', auth_method: 'aws_iam', aws_access_key: 'AKIA...', aws_secret_key: 'secret...', aws_session_token: '' },
+                  ],
+                  s3_configs: [
+                    { name: 'my-warehouse', endpoint: 'https://s3.amazonaws.com', access_key: 'AKIA...', secret_key: 'secret...', bucket: 'my-iceberg-warehouse', region: 'us-east-1' },
+                    { name: 'local-minio', endpoint: 'http://localhost:9000', access_key: 'minioadmin', secret_key: 'minioadmin', bucket: 'data-lake', region: 'us-east-1' },
+                  ],
+                }, null, 2)
+                navigator.clipboard.writeText(sample)
+                toast.success('Sample JSON copied to clipboard')
+              }}>
+                Copy Sample
+              </Button>
+              <Button variant="secondary" size="sm" icon={<Download className="w-3.5 h-3.5" />} onClick={async () => {
+                try {
+                  const data = await exportConnections()
+                  setImportJson(JSON.stringify(data, null, 2))
+                  setImportError(null)
+                  setImportResult(null)
+                  toast.success('Current config loaded into editor')
+                } catch (err: any) {
+                  toast.error(err.message || 'Failed to export config')
+                }
+              }}>
+                Export Current Config
+              </Button>
+              <div className="flex-1" />
+              <Button variant="primary" size="sm" icon={<Code className="w-3.5 h-3.5" />} disabled={importing || !importJson.trim()} onClick={async () => {
+                setImportError(null)
+                setImportResult(null)
+                let parsed: any
+                try {
+                  parsed = JSON.parse(importJson)
+                } catch {
+                  setImportError('Invalid JSON — please check syntax and try again')
+                  return
+                }
+                if (!parsed.connections && !parsed.s3_configs) {
+                  setImportError('JSON must contain "connections" and/or "s3_configs" arrays')
+                  return
+                }
+                setImporting(true)
+                try {
+                  const result = await importConnections(parsed)
+                  setImportResult(result)
+                  toast.success(`Imported ${result.total} items`)
+                  // Refresh connections and S3 configs
+                  getConnections().then(r => setConnections(r.connections || [])).catch(() => {})
+                  getS3Configs().then(r => setS3Configs(r.configs || [])).catch(() => {})
+                } catch (err: any) {
+                  setImportError(err.message || 'Import failed')
+                } finally {
+                  setImporting(false)
+                }
+              }}>
+                {importing ? 'Importing...' : 'Import'}
+              </Button>
+            </div>
+
+            {importError && (
+              <div className="flex items-center gap-2 p-2.5 mb-3 rounded-lg bg-red-500/10 border border-red-500/20">
+                <AlertCircle className="w-3.5 h-3.5 text-red-400 flex-shrink-0" />
+                <span className="text-2xs text-red-400">{importError}</span>
+              </div>
+            )}
+
+            {importResult && (
+              <div className="p-3 mb-3 rounded-lg bg-emerald-500/10 border border-emerald-500/20 space-y-1.5">
+                <div className="flex items-center gap-2">
+                  <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400" />
+                  <span className="text-xs font-medium text-emerald-300">Import Complete</span>
+                </div>
+                <div className="flex gap-4 text-2xs text-zinc-400">
+                  <span>{importResult.imported.connections?.length ?? 0} connections added</span>
+                  <span>{importResult.imported.s3_configs?.length ?? 0} S3 configs added</span>
+                  <span className="text-zinc-500">{importResult.total} total</span>
+                </div>
+                {importResult.errors.length > 0 && (
+                  <div className="mt-1.5 space-y-0.5">
+                    {importResult.errors.map((e, i) => (
+                      <div key={i} className="flex items-center gap-1.5 text-2xs text-red-400">
+                        <AlertCircle className="w-3 h-3 flex-shrink-0" />
+                        {e}
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            )}
+
+            <textarea
+              className="w-full rounded-lg bg-navy-900/80 border border-white/[0.06] text-xs text-cyan-300 font-mono p-3 placeholder-zinc-600 focus:outline-none focus:ring-1 focus:ring-amber-400/20 resize-y"
+              style={{ minHeight: 400 }}
+              placeholder={'{\n  "connections": [\n    { "name": "my-postgres", "conn_type": "postgres", ... }\n  ],\n  "s3_configs": [\n    { "name": "my-warehouse", "endpoint": "https://s3.amazonaws.com", ... }\n  ]\n}'}
+              value={importJson}
+              onChange={e => {
+                setImportJson(e.target.value)
+                setImportError(null)
+              }}
+              spellCheck={false}
+            />
+          </Card>
         </div>
       )}
 

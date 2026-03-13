@@ -10,7 +10,7 @@ import { Card } from '../components/ui/Card'
 import { Tabs } from '../components/ui/Tabs'
 import { Modal } from '../components/ui/Modal'
 import { Input } from '../components/ui/Input'
-import { cn, formatDuration, QUERY_TYPE_COLORS, FORMAT_COLORS, inferFormat } from '../lib/utils'
+import { cn, formatDuration, QUERY_TYPE_COLORS } from '../lib/utils'
 import { executeSql, explainSql, estimateQuery, compareSql, getTables, getTableSchema, getConnections, getS3Configs, trinoBrowse, trinoColumns, trinoRefresh } from '../api/client'
 import { useWebSocket } from '../hooks/useWebSocket'
 import type { SqlResponse } from '../types'
@@ -20,7 +20,7 @@ import { Tooltip } from '../components/ui/Tooltip'
 import {
   Play, Plus, X, Table2, BarChart3, LineChart, ScatterChart, PieChart,
   AreaChart, Save, BookOpen, Zap, Clock, Rows3, Terminal, FileSearch, Gauge, ArrowLeftRight, Trophy,
-  ChevronDown, ChevronRight, GitBranch, Radio, Workflow, Database, Plug, Search, Columns3, MousePointerClick, HardDrive, Trash2, RefreshCw, Layers, Square, Wifi,
+  ChevronDown, ChevronRight, GitBranch, Radio, Workflow, Database, Plug, Search, Columns3, MousePointerClick, HardDrive, Trash2, RefreshCw, Layers, Square, Wifi, PanelRightClose, PanelRightOpen,
 } from 'lucide-react'
 
 const chartOptions: Array<{ type: ChartType; icon: React.ReactNode; label: string }> = [
@@ -51,6 +51,12 @@ export function SqlEditorPage() {
   const [workflowOpen, setWorkflowOpen] = useState(false)
   const [demoOpen, setDemoOpen] = useState(false)
   const [sidebarTab, setSidebarTab] = useState<'catalog' | 'saved'>('catalog')
+  const [catalogWidth, setCatalogWidth] = useState(() => {
+    const saved = localStorage.getItem('sql_catalog_width')
+    return saved ? parseInt(saved, 10) : 256
+  })
+  const [catalogCollapsed, setCatalogCollapsed] = useState(() => localStorage.getItem('sql_catalog_collapsed') === 'true')
+  const catalogResizing = useRef(false)
   const [connections, setConnections] = useState<ConnectionEntry[]>([])
   const [expandedConn, setExpandedConn] = useState<Set<string>>(new Set())
   const [expandedTable, setExpandedTable] = useState<string | null>(null)
@@ -95,6 +101,38 @@ export function SqlEditorPage() {
     const onUp = () => { resizing.current = false; document.removeEventListener('mousemove', onMove); document.removeEventListener('mouseup', onUp) }
     document.addEventListener('mousemove', onMove)
     document.addEventListener('mouseup', onUp)
+  }, [])
+
+  // Catalog sidebar resizer (horizontal)
+  const startCatalogResize = useCallback((e: React.MouseEvent) => {
+    e.preventDefault()
+    catalogResizing.current = true
+    document.body.style.cursor = 'col-resize'
+    document.body.style.userSelect = 'none'
+    const onMove = (ev: MouseEvent) => {
+      if (!catalogResizing.current) return
+      const newWidth = window.innerWidth - ev.clientX
+      const clamped = Math.max(180, Math.min(500, newWidth))
+      setCatalogWidth(clamped)
+    }
+    const onUp = () => {
+      catalogResizing.current = false
+      document.body.style.cursor = ''
+      document.body.style.userSelect = ''
+      document.removeEventListener('mousemove', onMove)
+      document.removeEventListener('mouseup', onUp)
+      setCatalogWidth(w => { localStorage.setItem('sql_catalog_width', String(w)); return w })
+    }
+    document.addEventListener('mousemove', onMove)
+    document.addEventListener('mouseup', onUp)
+  }, [])
+
+  const toggleCatalogCollapse = useCallback(() => {
+    setCatalogCollapsed(prev => {
+      const next = !prev
+      localStorage.setItem('sql_catalog_collapsed', String(next))
+      return next
+    })
   }, [])
 
   // Close dropdowns on outside click
@@ -381,16 +419,26 @@ export function SqlEditorPage() {
     store.updateTabSql(store.activeTabId, current ? `${current}\n${text}` : text)
   }
 
-  // Build set of registered table names that belong to a connection (for dedup)
-  const connRegisteredSet = new Set(
-    connections.flatMap(c => (c.tables || []).map(t => resolveRegistered(t, c.conn_type)).filter(Boolean) as string[])
-  )
-  // Also include the raw connection table names for matching
-  const connRawSet = new Set(connections.flatMap(c => c.tables || []))
-  const otherTables = tables.filter(t => !connRegisteredSet.has(t) && !connRawSet.has(t) && !t.startsWith('trino_'))
-  const filteredOther = catalogFilter
-    ? otherTables.filter(t => t.toLowerCase().includes(catalogFilter.toLowerCase()))
-    : otherTables
+  // Group S3 tables by schema for tree display
+  const s3SchemaMap = new Map<string, Map<string, string[]>>() // s3Name -> schema -> tables
+  for (const s3 of s3Configs) {
+    const schemas = new Map<string, string[]>()
+    for (const tbl of (s3.tables || [])) {
+      const dotIdx = tbl.indexOf('.')
+      if (dotIdx > 0) {
+        const schema = tbl.substring(0, dotIdx)
+        const table = tbl.substring(dotIdx + 1)
+        if (!schemas.has(schema)) schemas.set(schema, [])
+        schemas.get(schema)!.push(table)
+      } else {
+        if (!schemas.has('default')) schemas.set('default', [])
+        schemas.get('default')!.push(tbl)
+      }
+    }
+    // Sort schemas and tables
+    for (const [, tbls] of schemas) tbls.sort()
+    s3SchemaMap.set(s3.name, schemas)
+  }
 
   return (
     <div className="flex flex-col h-full">
@@ -850,7 +898,44 @@ export function SqlEditorPage() {
         </div>
 
         {/* Catalog + Saved sidebar */}
-        <div className="w-64 border-l border-white/[0.03] bg-navy-950/50 backdrop-blur-sm flex flex-col flex-shrink-0">
+        <div
+          style={{ width: catalogCollapsed ? 36 : catalogWidth }}
+          className="border-l border-white/[0.03] bg-navy-950/50 backdrop-blur-sm flex flex-col flex-shrink-0 relative transition-[width] duration-150"
+        >
+          {/* Resize drag handle */}
+          {!catalogCollapsed && (
+            <div
+              onMouseDown={startCatalogResize}
+              className="absolute left-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-amber-400/30 active:bg-amber-400/50 z-10 transition-colors"
+            />
+          )}
+          {/* Collapsed state */}
+          {catalogCollapsed ? (
+            <div className="flex flex-col items-center pt-2 gap-2">
+              <button
+                onClick={toggleCatalogCollapse}
+                className="p-1.5 rounded-md text-zinc-500 hover:text-amber-400 hover:bg-white/[0.04] transition-colors"
+                title="Expand catalog"
+              >
+                <PanelRightOpen className="w-4 h-4" />
+              </button>
+              <button
+                onClick={() => { setCatalogCollapsed(false); localStorage.setItem('sql_catalog_collapsed', 'false'); setSidebarTab('catalog') }}
+                className={cn('p-1.5 rounded-md transition-colors', sidebarTab === 'catalog' ? 'text-amber-400 bg-white/[0.04]' : 'text-zinc-600 hover:text-zinc-400')}
+                title="Catalog"
+              >
+                <Database className="w-3.5 h-3.5" />
+              </button>
+              <button
+                onClick={() => { setCatalogCollapsed(false); localStorage.setItem('sql_catalog_collapsed', 'false'); setSidebarTab('saved') }}
+                className={cn('p-1.5 rounded-md transition-colors', sidebarTab === 'saved' ? 'text-amber-400 bg-white/[0.04]' : 'text-zinc-600 hover:text-zinc-400')}
+                title="Saved queries"
+              >
+                <BookOpen className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          ) : (
+          <>
           {/* Tab toggle */}
           <div className="flex border-b border-white/[0.03]">
             <button
@@ -880,6 +965,13 @@ export function SqlEditorPage() {
               {store.savedQueries.length > 0 && (
                 <span className="text-2xs font-normal opacity-60">({store.savedQueries.length})</span>
               )}
+            </button>
+            <button
+              onClick={toggleCatalogCollapse}
+              className="px-2 py-2 text-zinc-600 hover:text-zinc-400 transition-colors"
+              title="Collapse sidebar"
+            >
+              <PanelRightClose className="w-3.5 h-3.5" />
             </button>
           </div>
 
@@ -1133,7 +1225,9 @@ export function SqlEditorPage() {
               {s3Configs.map(s3 => {
                 const s3Id = `s3-${s3.name}`
                 const isExpanded = expandedConn.has(s3Id)
-                if (catalogFilter && !s3.name.toLowerCase().includes(catalogFilter.toLowerCase()) && !s3.bucket.toLowerCase().includes(catalogFilter.toLowerCase())) return null
+                const schemas = s3SchemaMap.get(s3.name) || new Map()
+                const tableCount = (s3.tables || []).length
+                if (catalogFilter && !s3.name.toLowerCase().includes(catalogFilter.toLowerCase()) && !s3.bucket.toLowerCase().includes(catalogFilter.toLowerCase()) && !(s3.tables || []).some(t => t.toLowerCase().includes(catalogFilter.toLowerCase()))) return null
                 return (
                   <div key={s3Id}>
                     <button
@@ -1147,84 +1241,104 @@ export function SqlEditorPage() {
                       <HardDrive className="w-3 h-3 text-emerald-400 flex-shrink-0" />
                       <span className="text-xs font-semibold text-zinc-300 truncate">{s3.name}</span>
                       <Badge className="ml-auto text-2xs bg-emerald-500/15 text-emerald-400 border-emerald-500/20">
-                        {s3.status}
+                        {tableCount > 0 ? `${tableCount} tables` : s3.status}
                       </Badge>
                     </button>
                     {isExpanded && (
-                      <div className="border-l-2 border-l-emerald-400/20 ml-4 px-4 py-2 space-y-1">
-                        <p className="text-2xs text-zinc-500"><span className="text-zinc-600">Bucket:</span> {s3.bucket}</p>
-                        <p className="text-2xs text-zinc-500"><span className="text-zinc-600">Endpoint:</span> {s3.endpoint}</p>
-                        <p className="text-2xs text-zinc-500"><span className="text-zinc-600">Region:</span> {s3.region}</p>
+                      <div className="ml-4">
+                        {/* Bucket info */}
+                        <div className="border-l-2 border-l-emerald-400/20 px-4 py-1.5 space-y-0.5 mb-1">
+                          <p className="text-2xs text-zinc-500"><span className="text-zinc-600">Bucket:</span> {s3.bucket}</p>
+                          <p className="text-2xs text-zinc-500"><span className="text-zinc-600">Endpoint:</span> {s3.endpoint}</p>
+                          <p className="text-2xs text-zinc-500"><span className="text-zinc-600">Region:</span> {s3.region}</p>
+                        </div>
+                        {/* Schema → Table tree */}
+                        {[...schemas.entries()].sort(([a], [b]) => a.localeCompare(b)).map(([schema, schemaTables]) => {
+                          const schemaKey = `s3-schema-${s3.name}-${schema}`
+                          const isSchemaExpanded = expandedConn.has(schemaKey)
+                          const filteredTables = catalogFilter
+                            ? schemaTables.filter((t: string) => t.toLowerCase().includes(catalogFilter.toLowerCase()) || schema.toLowerCase().includes(catalogFilter.toLowerCase()))
+                            : schemaTables
+                          if (filteredTables.length === 0) return null
+                          return (
+                            <div key={schemaKey}>
+                              <button
+                                onClick={() => toggleConn(schemaKey)}
+                                className="w-full flex items-center gap-1.5 px-3 py-1.5 hover:bg-white/[0.02] transition-colors"
+                              >
+                                {isSchemaExpanded
+                                  ? <ChevronDown className="w-2.5 h-2.5 text-zinc-600 flex-shrink-0" />
+                                  : <ChevronRight className="w-2.5 h-2.5 text-zinc-600 flex-shrink-0" />
+                                }
+                                <Layers className="w-3 h-3 text-emerald-400/60 flex-shrink-0" />
+                                <span className="text-2xs font-medium text-zinc-400 truncate">{schema}</span>
+                                <span className="ml-auto text-2xs text-zinc-700">{filteredTables.length}</span>
+                              </button>
+                              {isSchemaExpanded && (
+                                <div className="ml-4 border-l border-white/[0.04]">
+                                  {filteredTables.map((tblName: string) => {
+                                    const fullName = `${schema}.${tblName}`
+                                    const isTableExpanded = expandedTable === fullName
+                                    const cols = tableSchemas[fullName]
+                                    return (
+                                      <div key={fullName}>
+                                        <div className="flex items-center group">
+                                          <button
+                                            onClick={() => handleExpandTable(fullName)}
+                                            className="flex-1 flex items-center gap-1.5 px-3 py-1 hover:bg-white/[0.02] transition-colors min-w-0"
+                                          >
+                                            {isTableExpanded
+                                              ? <ChevronDown className="w-2.5 h-2.5 text-zinc-600 flex-shrink-0" />
+                                              : <ChevronRight className="w-2.5 h-2.5 text-zinc-600 flex-shrink-0" />
+                                            }
+                                            <Table2 className="w-3 h-3 text-zinc-500 flex-shrink-0" />
+                                            <span className="text-2xs font-mono text-zinc-400 truncate">{tblName}</span>
+                                          </button>
+                                          <Tooltip content="Insert SELECT query" position="left">
+                                            <button
+                                              onClick={() => insertAtCursor(`SELECT * FROM "${fullName}" LIMIT 100;`)}
+                                              className="p-1 mr-2 rounded opacity-0 group-hover:opacity-100 hover:bg-white/[0.04] transition-all"
+                                            >
+                                              <MousePointerClick className="w-3 h-3 text-amber-400/70" />
+                                            </button>
+                                          </Tooltip>
+                                        </div>
+                                        {isTableExpanded && cols && (
+                                          <div className="ml-8 border-l border-white/[0.04]">
+                                            {cols.map(col => (
+                                              <button
+                                                key={col.name}
+                                                onClick={() => insertAtCursor(`"${fullName}".${col.name}`)}
+                                                className="w-full flex items-center gap-1.5 px-3 py-1 hover:bg-white/[0.02] transition-colors cursor-pointer"
+                                                title={`Insert "${fullName}".${col.name}`}
+                                              >
+                                                <Columns3 className="w-2.5 h-2.5 text-zinc-600 flex-shrink-0" />
+                                                <span className="text-2xs font-mono text-zinc-500 truncate">{col.name}</span>
+                                                <span className="ml-auto text-2xs font-mono text-zinc-700 flex-shrink-0">{col.data_type}</span>
+                                              </button>
+                                            ))}
+                                          </div>
+                                        )}
+                                        {isTableExpanded && !cols && (
+                                          <p className="ml-8 px-3 py-1 text-2xs text-zinc-700 italic">Loading...</p>
+                                        )}
+                                      </div>
+                                    )
+                                  })}
+                                </div>
+                              )}
+                            </div>
+                          )
+                        })}
+                        {tableCount === 0 && (
+                          <p className="px-4 py-2 text-2xs text-zinc-600 italic">No tables discovered yet</p>
+                        )}
                       </div>
                     )}
                   </div>
                 )
               })}
 
-              {/* Other tables (not in any connection) */}
-              {filteredOther.length > 0 && (
-                <div>
-                  {(connections.length > 0 || s3Configs.length > 0) && (
-                    <div className="px-3 py-2 border-t border-white/[0.03]">
-                      <p className="text-2xs font-semibold text-zinc-500 uppercase tracking-wider">
-                        Other Tables ({filteredOther.length})
-                      </p>
-                    </div>
-                  )}
-                  {filteredOther.map(tbl => {
-                    const isTableExpanded = expandedTable === tbl
-                    const cols = tableSchemas[tbl]
-                    const { format } = inferFormat(tbl)
-                    return (
-                      <div key={tbl}>
-                        <div className="flex items-center group">
-                          <button
-                            onClick={() => handleExpandTable(tbl)}
-                            className="flex-1 flex items-center gap-1.5 px-3 py-1.5 hover:bg-white/[0.02] transition-colors min-w-0"
-                          >
-                            {isTableExpanded
-                              ? <ChevronDown className="w-2.5 h-2.5 text-zinc-600 flex-shrink-0" />
-                              : <ChevronRight className="w-2.5 h-2.5 text-zinc-600 flex-shrink-0" />
-                            }
-                            <Table2 className="w-3 h-3 text-zinc-500 flex-shrink-0" />
-                            <span className="text-2xs font-mono text-zinc-400 truncate">{tbl}</span>
-                            <Badge className={cn('ml-1 text-2xs', FORMAT_COLORS[format] || 'bg-surface-4 text-zinc-400 border-zinc-700/50')}>
-                              {format}
-                            </Badge>
-                          </button>
-                          <Tooltip content="Insert SELECT query" position="left">
-                            <button
-                              onClick={() => insertAtCursor(`SELECT * FROM ${tbl} LIMIT 100;`)}
-                              className="p-1 mr-2 rounded opacity-0 group-hover:opacity-100 hover:bg-white/[0.04] transition-all"
-                            >
-                              <MousePointerClick className="w-3 h-3 text-amber-400/70" />
-                            </button>
-                          </Tooltip>
-                        </div>
-                        {isTableExpanded && cols && (
-                          <div className="ml-6 border-l border-white/[0.04]">
-                            {cols.map(col => (
-                              <button
-                                key={col.name}
-                                onClick={() => insertAtCursor(`${tbl}.${col.name}`)}
-                                className="w-full flex items-center gap-1.5 px-3 py-1 hover:bg-white/[0.02] transition-colors cursor-pointer"
-                                title={`Insert ${tbl}.${col.name}`}
-                              >
-                                <Columns3 className="w-2.5 h-2.5 text-zinc-600 flex-shrink-0" />
-                                <span className="text-2xs font-mono text-zinc-500 truncate">{col.name}</span>
-                                <span className="ml-auto text-2xs font-mono text-zinc-700 flex-shrink-0">{col.data_type}</span>
-                              </button>
-                            ))}
-                          </div>
-                        )}
-                        {isTableExpanded && !cols && (
-                          <p className="ml-6 px-3 py-1 text-2xs text-zinc-700 italic">Loading...</p>
-                        )}
-                      </div>
-                    )
-                  })}
-                </div>
-              )}
 
               {/* Empty state */}
               {tables.length === 0 && connections.length === 0 && s3Configs.length === 0 && (
@@ -1270,6 +1384,8 @@ export function SqlEditorPage() {
                 ))
               )}
             </div>
+          )}
+          </>
           )}
         </div>
       </div>
