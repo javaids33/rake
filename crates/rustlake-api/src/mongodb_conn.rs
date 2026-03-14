@@ -15,8 +15,8 @@ use arrow::array::{
 };
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
-use mongodb::bson::{doc, Bson, Document};
-use mongodb::options::{AuthMechanism, ClientOptions, Credential};
+use mongodb::bson::{Bson, Document};
+use mongodb::options::ClientOptions;
 use mongodb::Client;
 
 /// Supported MongoDB authentication methods.
@@ -126,17 +126,59 @@ impl MongoConnParams {
                     .map_err(|e| format!("Failed to parse SCRAM connection string: {}", e))?
             }
             MongoAuthMethod::AwsIam => {
-                // AWS IAM: build a clean URI without credentials — they go in the Credential object
+                // AWS IAM: embed credentials directly in the URI per MongoDB connection string spec
+                // mongodb+srv://<access_key>:<secret_key>@host/db?authSource=$external&authMechanism=MONGODB-AWS
+                //   &authMechanismProperties=AWS_SESSION_TOKEN:<token>
+                let access_key = self.aws_access_key.as_deref().unwrap_or("");
+                let secret_key = self.aws_secret_key.as_deref().unwrap_or("");
+
+                if access_key.is_empty() || secret_key.is_empty() {
+                    return Err("AWS IAM auth requires aws_access_key and aws_secret_key".to_string());
+                }
+
+                // Percent-encode credentials for URI safety
+                fn uri_encode(s: &str) -> String {
+                    s.replace('%', "%25")
+                     .replace(':', "%3A")
+                     .replace('/', "%2F")
+                     .replace('?', "%3F")
+                     .replace('#', "%23")
+                     .replace('[', "%5B")
+                     .replace(']', "%5D")
+                     .replace('@', "%40")
+                     .replace('$', "%24")
+                     .replace('+', "%2B")
+                     .replace('=', "%3D")
+                     .replace(' ', "%20")
+                }
+
+                let session_token_param = if let Some(ref token) = self.aws_session_token {
+                    tracing::info!("Including AWS_SESSION_TOKEN in URI (token length: {})", token.len());
+                    format!("&authMechanismProperties=AWS_SESSION_TOKEN:{}", uri_encode(token))
+                } else {
+                    String::new()
+                };
+
                 let uri = if self.host.contains(".mongodb.net") {
-                    // Atlas cluster — use SRV
-                    format!("mongodb+srv://{}/{}?authSource=%24external&authMechanism=MONGODB-AWS&retryWrites=true&w=majority",
-                        self.host, self.database)
+                    format!(
+                        "mongodb+srv://{}:{}@{}/{}?authSource=%24external&authMechanism=MONGODB-AWS&retryWrites=true&w=majority{}",
+                        uri_encode(access_key), uri_encode(secret_key),
+                        self.host, self.database, session_token_param
+                    )
                 } else {
                     let tls_flag = if self.tls { "&tls=true" } else { "" };
-                    format!("mongodb://{}:{}/{}?authSource=%24external&authMechanism=MONGODB-AWS{}",
-                        self.host, self.port, self.database, tls_flag)
+                    format!(
+                        "mongodb://{}:{}@{}:{}/{}?authSource=%24external&authMechanism=MONGODB-AWS{}{}",
+                        uri_encode(access_key), uri_encode(secret_key),
+                        self.host, self.port, self.database, tls_flag, session_token_param
+                    )
                 };
-                tracing::info!(uri = %uri, "Parsing AWS IAM MongoDB URI");
+
+                // Log URI with credentials redacted
+                let redacted_uri = uri.replacen(&uri_encode(access_key), "***", 1)
+                    .replacen(&uri_encode(secret_key), "***", 1);
+                tracing::info!(uri = %redacted_uri, "Parsing AWS IAM MongoDB URI (credentials in URI)");
+
                 ClientOptions::parse(&uri)
                     .await
                     .map_err(|e| format!("Failed to parse AWS IAM connection string: {}", e))?
@@ -157,35 +199,20 @@ impl MongoConnParams {
             }
         };
 
-        // For AWS IAM, set credential with AWS properties
+        // Log the credential that was parsed from the URI
         if matches!(self.auth_method, MongoAuthMethod::AwsIam) {
-            if self.aws_access_key.is_none() || self.aws_secret_key.is_none() {
-                return Err("AWS IAM auth requires aws_access_key and aws_secret_key".to_string());
-            }
-
-            let mechanism_props = if let Some(ref token) = self.aws_session_token {
-                tracing::info!("Setting AWS_SESSION_TOKEN in mechanism properties (token length: {})", token.len());
-                Some(doc! { "AWS_SESSION_TOKEN": token })
+            if let Some(ref cred) = options.credential {
+                tracing::info!(
+                    username_set = cred.username.is_some(),
+                    password_set = cred.password.is_some(),
+                    mechanism = ?cred.mechanism,
+                    source = ?cred.source,
+                    has_mechanism_properties = cred.mechanism_properties.is_some(),
+                    "MONGODB-AWS credential parsed from URI"
+                );
             } else {
-                None
-            };
-
-            let credential = Credential::builder()
-                .username(self.aws_access_key.clone())
-                .password(self.aws_secret_key.clone())
-                .mechanism(AuthMechanism::MongoDbAws)
-                .source(Some("$external".to_string()))
-                .mechanism_properties(mechanism_props)
-                .build();
-
-            tracing::info!(
-                username_set = credential.username.is_some(),
-                password_set = credential.password.is_some(),
-                mechanism = ?credential.mechanism,
-                source = ?credential.source,
-                "Built MONGODB-AWS credential"
-            );
-            options.credential = Some(credential);
+                tracing::warn!("No credential found after parsing AWS IAM URI — auth will likely fail");
+            }
         }
 
         // Apply replica set if specified
