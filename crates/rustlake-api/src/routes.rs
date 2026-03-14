@@ -2612,9 +2612,9 @@ fn build_mongo_params_from_entry(
         password: password.to_string(),
         auth_method,
         auth_source: None,
-        aws_access_key: None, // AWS keys are not persisted in ConnectionEntry for security
-        aws_secret_key: None,
-        aws_session_token: None,
+        aws_access_key: conn.aws_access_key.clone(),
+        aws_secret_key: conn.aws_secret_key.clone(),
+        aws_session_token: conn.aws_session_token.clone(),
         tls: conn.auth_method == "aws_iam" || conn.auth_method == "x509",
         replica_set: None,
     }
@@ -3094,6 +3094,9 @@ async fn add_connection(
         sync_progress: None,
         auth_method: req.auth_method.clone(),
         connection_string: if req.connection_string.is_empty() { None } else { Some(req.connection_string.clone()) },
+        aws_access_key: if req.aws_access_key.is_empty() { None } else { Some(req.aws_access_key.clone()) },
+        aws_secret_key: if req.aws_secret_key.is_empty() { None } else { Some(req.aws_secret_key.clone()) },
+        aws_session_token: if req.aws_session_token.is_empty() { None } else { Some(req.aws_session_token.clone()) },
     };
 
     state.add_connection_entry(entry).await;
@@ -3773,6 +3776,9 @@ async fn update_connection(
         entry.sync_progress = None;
         entry.auth_method = req.auth_method.clone();
         entry.connection_string = if req.connection_string.is_empty() { None } else { Some(req.connection_string.clone()) };
+        entry.aws_access_key = if req.aws_access_key.is_empty() { None } else { Some(req.aws_access_key.clone()) };
+        entry.aws_secret_key = if req.aws_secret_key.is_empty() { None } else { Some(req.aws_secret_key.clone()) };
+        entry.aws_session_token = if req.aws_session_token.is_empty() { None } else { Some(req.aws_session_token.clone()) };
     }).await;
 
     // Update stored password
@@ -4382,6 +4388,9 @@ async fn run_bootstrap(
                     sync_progress: None,
                     auth_method: "scram".to_string(),
                     connection_string: None,
+                    aws_access_key: None,
+                    aws_secret_key: None,
+                    aws_session_token: None,
                 };
                 state.seed_connection(entry, pg_pass).await;
                 results.insert("postgres".to_string(), serde_json::json!({
@@ -4467,6 +4476,9 @@ async fn run_bootstrap(
                     sync_progress: None,
                     auth_method: "scram".to_string(),
                     connection_string: None,
+                    aws_access_key: None,
+                    aws_secret_key: None,
+                    aws_session_token: None,
                 };
                 state.seed_connection(entry, mysql_pass).await;
                 results.insert("mysql".to_string(), serde_json::json!({
@@ -4520,6 +4532,9 @@ async fn run_bootstrap(
                 sync_progress: None,
                 auth_method: "scram".to_string(),
                 connection_string: None,
+                aws_access_key: None,
+                aws_secret_key: None,
+                aws_session_token: None,
             };
             state.seed_connection(entry, "rustlake".to_string()).await;
 
@@ -5843,6 +5858,9 @@ async fn import_connections(
             } else {
                 Some(conn_req.connection_string.clone())
             },
+            aws_access_key: if conn_req.aws_access_key.is_empty() { None } else { Some(conn_req.aws_access_key.clone()) },
+            aws_secret_key: if conn_req.aws_secret_key.is_empty() { None } else { Some(conn_req.aws_secret_key.clone()) },
+            aws_session_token: if conn_req.aws_session_token.is_empty() { None } else { Some(conn_req.aws_session_token.clone()) },
         };
 
         state.add_connection_entry(entry).await;

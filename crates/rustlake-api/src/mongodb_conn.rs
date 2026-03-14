@@ -89,12 +89,36 @@ impl Default for MongoConnParams {
 impl MongoConnParams {
     /// Build a MongoDB `Client` from these parameters, respecting the auth method.
     pub async fn build_client(&self) -> Result<Client, String> {
+        tracing::info!(
+            host = %self.host, port = %self.port, database = %self.database,
+            auth_method = ?self.auth_method, tls = %self.tls,
+            has_aws_access_key = self.aws_access_key.is_some(),
+            has_aws_secret_key = self.aws_secret_key.is_some(),
+            has_aws_session_token = self.aws_session_token.is_some(),
+            "Building MongoDB client"
+        );
+
         let mut options = match &self.auth_method {
             MongoAuthMethod::Scram => {
                 let auth_source = self.auth_source.as_deref().unwrap_or("admin");
+                // Percent-encode username and password per MongoDB connection string spec
+                // Characters that must be encoded: : / ? # [ ] @
+                fn mongo_percent_encode(s: &str) -> String {
+                    s.replace('%', "%25")
+                     .replace(':', "%3A")
+                     .replace('/', "%2F")
+                     .replace('?', "%3F")
+                     .replace('#', "%23")
+                     .replace('[', "%5B")
+                     .replace(']', "%5D")
+                     .replace('@', "%40")
+                     .replace('$', "%24")
+                }
                 let uri = format!(
                     "mongodb://{}:{}@{}:{}/{}?authSource={}&directConnection=true",
-                    self.username, self.password, self.host, self.port,
+                    mongo_percent_encode(&self.username),
+                    mongo_percent_encode(&self.password),
+                    self.host, self.port,
                     self.database, auth_source
                 );
                 ClientOptions::parse(&uri)
@@ -102,16 +126,17 @@ impl MongoConnParams {
                     .map_err(|e| format!("Failed to parse SCRAM connection string: {}", e))?
             }
             MongoAuthMethod::AwsIam => {
-                // AWS IAM uses mongodb+srv:// for Atlas or mongodb:// with explicit params
+                // AWS IAM: build a clean URI without credentials — they go in the Credential object
                 let uri = if self.host.contains(".mongodb.net") {
                     // Atlas cluster — use SRV
-                    format!("mongodb+srv://{}/{}?authSource=$external&authMechanism=MONGODB-AWS",
+                    format!("mongodb+srv://{}/{}?authSource=%24external&authMechanism=MONGODB-AWS&retryWrites=true&w=majority",
                         self.host, self.database)
                 } else {
                     let tls_flag = if self.tls { "&tls=true" } else { "" };
-                    format!("mongodb://{}:{}/{}?authSource=$external&authMechanism=MONGODB-AWS{}",
+                    format!("mongodb://{}:{}/{}?authSource=%24external&authMechanism=MONGODB-AWS{}",
                         self.host, self.port, self.database, tls_flag)
                 };
+                tracing::info!(uri = %uri, "Parsing AWS IAM MongoDB URI");
                 ClientOptions::parse(&uri)
                     .await
                     .map_err(|e| format!("Failed to parse AWS IAM connection string: {}", e))?
@@ -134,9 +159,17 @@ impl MongoConnParams {
 
         // For AWS IAM, set credential with AWS properties
         if matches!(self.auth_method, MongoAuthMethod::AwsIam) {
-            let mechanism_props = self.aws_session_token.as_ref().map(|token| {
-                doc! { "AWS_SESSION_TOKEN": token }
-            });
+            if self.aws_access_key.is_none() || self.aws_secret_key.is_none() {
+                return Err("AWS IAM auth requires aws_access_key and aws_secret_key".to_string());
+            }
+
+            let mechanism_props = if let Some(ref token) = self.aws_session_token {
+                tracing::info!("Setting AWS_SESSION_TOKEN in mechanism properties (token length: {})", token.len());
+                Some(doc! { "AWS_SESSION_TOKEN": token })
+            } else {
+                None
+            };
+
             let credential = Credential::builder()
                 .username(self.aws_access_key.clone())
                 .password(self.aws_secret_key.clone())
@@ -144,6 +177,14 @@ impl MongoConnParams {
                 .source(Some("$external".to_string()))
                 .mechanism_properties(mechanism_props)
                 .build();
+
+            tracing::info!(
+                username_set = credential.username.is_some(),
+                password_set = credential.password.is_some(),
+                mechanism = ?credential.mechanism,
+                source = ?credential.source,
+                "Built MONGODB-AWS credential"
+            );
             options.credential = Some(credential);
         }
 
@@ -163,11 +204,21 @@ pub async fn connect_and_discover(params: &MongoConnParams) -> Result<Vec<String
     let client = params.build_client().await?;
 
     let db = client.database(&params.database);
+    tracing::info!(database = %params.database, "Listing MongoDB collections...");
 
     let collections = db
         .list_collection_names(None)
         .await
-        .map_err(|e| format!("Failed to list collections: {}", e))?;
+        .map_err(|e| {
+            tracing::error!(
+                database = %params.database,
+                host = %params.host,
+                auth_method = ?params.auth_method,
+                error = %e,
+                "Failed to list collections — authentication or permission error"
+            );
+            format!("Failed to list collections: {}", e)
+        })?;
 
     // Filter out system collections
     let user_collections: Vec<String> = collections

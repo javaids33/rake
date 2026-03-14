@@ -152,6 +152,15 @@ pub struct ConnectionEntry {
     /// Raw connection string (for auth_method = "connection_string").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connection_string: Option<String>,
+    /// AWS access key ID (for auth_method = "aws_iam"). Not serialized to JSON responses.
+    #[serde(default, skip_serializing)]
+    pub aws_access_key: Option<String>,
+    /// AWS secret access key (for auth_method = "aws_iam"). Not serialized to JSON responses.
+    #[serde(default, skip_serializing)]
+    pub aws_secret_key: Option<String>,
+    /// AWS session token (for auth_method = "aws_iam"). Not serialized to JSON responses.
+    #[serde(default, skip_serializing)]
+    pub aws_session_token: Option<String>,
 }
 
 fn default_sync_ready() -> String {

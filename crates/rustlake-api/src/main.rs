@@ -145,6 +145,9 @@ async fn bootstrap_demo_connections(state: Arc<AppState>) {
                     sync_progress: None,
                     auth_method: "scram".to_string(),
                     connection_string: None,
+                    aws_access_key: None,
+                    aws_secret_key: None,
+                    aws_session_token: None,
                 };
                 state.seed_connection(entry, pg_pass).await;
                 tracing::info!(count = tables.len(), "Bootstrap: Postgres tables registered (federated)");
@@ -202,6 +205,9 @@ async fn bootstrap_demo_connections(state: Arc<AppState>) {
                     sync_progress: None,
                     auth_method: "scram".to_string(),
                     connection_string: None,
+                    aws_access_key: None,
+                    aws_secret_key: None,
+                    aws_session_token: None,
                 };
                 state.seed_connection(entry, mysql_pass).await;
                 tracing::info!(count = tables.len(), "Bootstrap: MySQL tables registered (federated)");
@@ -251,6 +257,9 @@ async fn bootstrap_demo_connections(state: Arc<AppState>) {
                 sync_progress: None,
                 auth_method: "scram".to_string(),
                 connection_string: None,
+                aws_access_key: None,
+                aws_secret_key: None,
+                aws_session_token: None,
             };
 
             if state.seed_connection(entry, mongo_pass.clone()).await {
