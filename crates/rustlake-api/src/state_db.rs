@@ -1,0 +1,383 @@
+//! DuckDB-backed persistent state store.
+//!
+//! Caches connection metadata, discovered tables, column schemas, S3 configs,
+//! and streaming pipelines so the server starts instantly from cache and
+//! re-syncs external databases in the background.
+
+use std::sync::{Arc, Mutex};
+
+/// Persistent state store backed by a local DuckDB file.
+#[cfg(feature = "duckdb")]
+pub struct StateDb {
+    db: Arc<Mutex<duckdb::Connection>>,
+}
+
+#[cfg(feature = "duckdb")]
+impl StateDb {
+    /// Open (or create) the state database at the given path.
+    pub fn open(path: &str) -> Result<Self, String> {
+        let conn = duckdb::Connection::open(path)
+            .map_err(|e| format!("StateDb open '{}': {}", path, e))?;
+        let store = Self { db: Arc::new(Mutex::new(conn)) };
+        store.init_schema()?;
+        Ok(store)
+    }
+
+    /// Create all tables if they don't exist.
+    fn init_schema(&self) -> Result<(), String> {
+        let db = self.db.lock().map_err(|e| e.to_string())?;
+        db.execute_batch(
+            "
+            -- Connections: one row per external database connection
+            CREATE TABLE IF NOT EXISTS connections (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                conn_type TEXT NOT NULL,
+                host TEXT NOT NULL,
+                port INTEGER NOT NULL DEFAULT 5432,
+                database_name TEXT NOT NULL DEFAULT '',
+                username TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'connected',
+                source TEXT NOT NULL DEFAULT 'user',
+                auth_method TEXT NOT NULL DEFAULT 'scram',
+                connection_string TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
+            -- Discovered tables per connection
+            CREATE TABLE IF NOT EXISTS connection_tables (
+                conn_id TEXT NOT NULL,
+                table_name TEXT NOT NULL,
+                schema_name TEXT,
+                table_type TEXT DEFAULT 'TABLE',
+                cached_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (conn_id, table_name)
+            );
+
+            -- Column schemas per table (optional — for immediate catalog display)
+            CREATE TABLE IF NOT EXISTS connection_columns (
+                conn_id TEXT NOT NULL,
+                table_name TEXT NOT NULL,
+                column_name TEXT NOT NULL,
+                data_type TEXT NOT NULL DEFAULT 'TEXT',
+                is_nullable BOOLEAN DEFAULT TRUE,
+                ordinal_position INTEGER DEFAULT 0,
+                cached_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (conn_id, table_name, column_name)
+            );
+
+            -- S3 storage configurations
+            CREATE TABLE IF NOT EXISTS s3_configs (
+                name TEXT PRIMARY KEY,
+                endpoint TEXT NOT NULL DEFAULT '',
+                bucket TEXT NOT NULL,
+                region TEXT NOT NULL DEFAULT 'us-east-1',
+                status TEXT NOT NULL DEFAULT 'configured',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+
+            -- S3 discovered tables
+            CREATE TABLE IF NOT EXISTS s3_tables (
+                config_name TEXT NOT NULL,
+                table_name TEXT NOT NULL,
+                schema_name TEXT,
+                format TEXT DEFAULT 'iceberg',
+                table_type TEXT DEFAULT 'TABLE',
+                s3_location TEXT,
+                cached_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (config_name, table_name)
+            );
+
+            -- Streaming pipelines
+            CREATE TABLE IF NOT EXISTS pipelines (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                source_type TEXT NOT NULL,
+                source_config TEXT NOT NULL DEFAULT '{}',
+                transform_sql TEXT,
+                sink_table TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'created',
+                events_processed BIGINT DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            "
+        ).map_err(|e| format!("StateDb schema init: {}", e))?;
+        Ok(())
+    }
+
+    // ── Connection CRUD ─────────────────────────────────────────────
+
+    /// Save or update a connection.
+    pub fn upsert_connection(&self, conn: &super::state::ConnectionEntry) -> Result<(), String> {
+        let db = self.db.lock().map_err(|e| e.to_string())?;
+        db.execute(
+            "INSERT OR REPLACE INTO connections (id, name, conn_type, host, port, database_name, username, status, source, auth_method, connection_string, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+            duckdb::params![
+                conn.id, conn.name, conn.conn_type, conn.host, conn.port as i32,
+                conn.database, conn.username, conn.status, conn.source,
+                conn.auth_method, conn.connection_string.as_deref().unwrap_or(""),
+            ],
+        ).map_err(|e| format!("Upsert connection '{}': {}", conn.id, e))?;
+        Ok(())
+    }
+
+    /// Remove a connection and its cached tables/columns.
+    pub fn delete_connection(&self, conn_id: &str) -> Result<(), String> {
+        let db = self.db.lock().map_err(|e| e.to_string())?;
+        db.execute("DELETE FROM connection_columns WHERE conn_id = ?", duckdb::params![conn_id])
+            .map_err(|e| e.to_string())?;
+        db.execute("DELETE FROM connection_tables WHERE conn_id = ?", duckdb::params![conn_id])
+            .map_err(|e| e.to_string())?;
+        db.execute("DELETE FROM connections WHERE id = ?", duckdb::params![conn_id])
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Save discovered tables for a connection (replaces old cache).
+    pub fn cache_tables(&self, conn_id: &str, tables: &[String]) -> Result<(), String> {
+        let db = self.db.lock().map_err(|e| e.to_string())?;
+        db.execute("DELETE FROM connection_tables WHERE conn_id = ?", duckdb::params![conn_id])
+            .map_err(|e| e.to_string())?;
+        let mut stmt = db.prepare(
+            "INSERT INTO connection_tables (conn_id, table_name) VALUES (?, ?)"
+        ).map_err(|e| e.to_string())?;
+        for t in tables {
+            stmt.execute(duckdb::params![conn_id, t]).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// Save column schema for a table.
+    pub fn cache_columns(&self, conn_id: &str, table_name: &str, columns: &[(String, String, bool)]) -> Result<(), String> {
+        let db = self.db.lock().map_err(|e| e.to_string())?;
+        db.execute(
+            "DELETE FROM connection_columns WHERE conn_id = ? AND table_name = ?",
+            duckdb::params![conn_id, table_name],
+        ).map_err(|e| e.to_string())?;
+        let mut stmt = db.prepare(
+            "INSERT INTO connection_columns (conn_id, table_name, column_name, data_type, is_nullable, ordinal_position) VALUES (?, ?, ?, ?, ?, ?)"
+        ).map_err(|e| e.to_string())?;
+        for (i, (col_name, col_type, nullable)) in columns.iter().enumerate() {
+            stmt.execute(duckdb::params![conn_id, table_name, col_name, col_type, nullable, i as i32])
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// Load all connections from cache.
+    pub fn load_connections(&self) -> Vec<CachedConnection> {
+        let db = match self.db.lock() {
+            Ok(db) => db,
+            Err(_) => return vec![],
+        };
+        let mut stmt = match db.prepare(
+            "SELECT id, name, conn_type, host, port, database_name, username, status, source, auth_method, connection_string FROM connections ORDER BY created_at"
+        ) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        let rows = stmt.query_map([], |row| {
+            Ok(CachedConnection {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                conn_type: row.get(2)?,
+                host: row.get(3)?,
+                port: row.get::<_, i32>(4)? as u16,
+                database: row.get(5)?,
+                username: row.get(6)?,
+                status: row.get(7)?,
+                source: row.get(8)?,
+                auth_method: row.get(9)?,
+                connection_string: row.get::<_, String>(10).ok().filter(|s| !s.is_empty()),
+            })
+        });
+        match rows {
+            Ok(r) => r.filter_map(|r| r.ok()).collect(),
+            Err(_) => vec![],
+        }
+    }
+
+    /// Load cached table names for a connection.
+    pub fn load_tables(&self, conn_id: &str) -> Vec<String> {
+        let db = match self.db.lock() {
+            Ok(db) => db,
+            Err(_) => return vec![],
+        };
+        let mut stmt = match db.prepare("SELECT table_name FROM connection_tables WHERE conn_id = ? ORDER BY table_name") {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        match stmt.query_map(duckdb::params![conn_id], |row| row.get(0)) {
+            Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+            Err(_) => vec![],
+        }
+    }
+
+    /// Load cached columns for a table.
+    pub fn load_columns(&self, conn_id: &str, table_name: &str) -> Vec<(String, String, bool)> {
+        let db = match self.db.lock() {
+            Ok(db) => db,
+            Err(_) => return vec![],
+        };
+        let mut stmt = match db.prepare(
+            "SELECT column_name, data_type, is_nullable FROM connection_columns WHERE conn_id = ? AND table_name = ? ORDER BY ordinal_position"
+        ) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        match stmt.query_map(duckdb::params![conn_id, table_name], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, bool>(2)?))
+        }) {
+            Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+            Err(_) => vec![],
+        }
+    }
+
+    // ── S3 Config CRUD ──────────────────────────────────────────────
+
+    /// Save or update an S3 config.
+    pub fn upsert_s3_config(&self, name: &str, endpoint: &str, bucket: &str, region: &str) -> Result<(), String> {
+        let db = self.db.lock().map_err(|e| e.to_string())?;
+        db.execute(
+            "INSERT OR REPLACE INTO s3_configs (name, endpoint, bucket, region) VALUES (?, ?, ?, ?)",
+            duckdb::params![name, endpoint, bucket, region],
+        ).map_err(|e| format!("Upsert S3 config '{}': {}", name, e))?;
+        Ok(())
+    }
+
+    /// Save discovered S3 tables (replaces old cache).
+    pub fn cache_s3_tables(&self, config_name: &str, tables: &[(String, String, String)]) -> Result<(), String> {
+        let db = self.db.lock().map_err(|e| e.to_string())?;
+        db.execute("DELETE FROM s3_tables WHERE config_name = ?", duckdb::params![config_name])
+            .map_err(|e| e.to_string())?;
+        let mut stmt = db.prepare(
+            "INSERT INTO s3_tables (config_name, table_name, format, s3_location) VALUES (?, ?, ?, ?)"
+        ).map_err(|e| e.to_string())?;
+        for (table_name, format, location) in tables {
+            stmt.execute(duckdb::params![config_name, table_name, format, location])
+                .map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// Load S3 table names for a config.
+    pub fn load_s3_tables(&self, config_name: &str) -> Vec<(String, String, String)> {
+        let db = match self.db.lock() {
+            Ok(db) => db,
+            Err(_) => return vec![],
+        };
+        let mut stmt = match db.prepare(
+            "SELECT table_name, format, COALESCE(s3_location, '') FROM s3_tables WHERE config_name = ? ORDER BY table_name"
+        ) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        match stmt.query_map(duckdb::params![config_name], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+        }) {
+            Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+            Err(_) => vec![],
+        }
+    }
+
+    // ── Pipeline CRUD ───────────────────────────────────────────────
+
+    /// Save or update a pipeline.
+    pub fn upsert_pipeline(&self, p: &super::state::StreamingPipeline) -> Result<(), String> {
+        let db = self.db.lock().map_err(|e| e.to_string())?;
+        let source_json = serde_json::to_string(&p.source_config).unwrap_or_default();
+        db.execute(
+            "INSERT OR REPLACE INTO pipelines (id, name, source_type, source_config, transform_sql, sink_table, status, events_processed)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            duckdb::params![
+                p.id, p.name, p.source_type, source_json,
+                p.transform_sql.as_deref().unwrap_or(""),
+                p.sink_table, p.status, p.events_processed as i64,
+            ],
+        ).map_err(|e| format!("Upsert pipeline '{}': {}", p.id, e))?;
+        Ok(())
+    }
+
+    /// Delete a pipeline.
+    pub fn delete_pipeline(&self, id: &str) -> Result<(), String> {
+        let db = self.db.lock().map_err(|e| e.to_string())?;
+        db.execute("DELETE FROM pipelines WHERE id = ?", duckdb::params![id])
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+
+    /// Load all pipelines.
+    pub fn load_pipelines(&self) -> Vec<super::state::StreamingPipeline> {
+        let db = match self.db.lock() {
+            Ok(db) => db,
+            Err(_) => return vec![],
+        };
+        let mut stmt = match db.prepare(
+            "SELECT id, name, source_type, source_config, transform_sql, sink_table, status, events_processed, created_at FROM pipelines ORDER BY created_at"
+        ) {
+            Ok(s) => s,
+            Err(_) => return vec![],
+        };
+        let rows = stmt.query_map([], |row| {
+            let source_json: String = row.get(3)?;
+            let transform_sql: String = row.get(4)?;
+            let ts_str: String = row.get(8)?;
+            Ok(super::state::StreamingPipeline {
+                id: row.get(0)?,
+                name: row.get(1)?,
+                source_type: row.get(2)?,
+                source_config: serde_json::from_str(&source_json).unwrap_or_default(),
+                transform_sql: if transform_sql.is_empty() { None } else { Some(transform_sql) },
+                sink_table: row.get(5)?,
+                status: row.get(6)?,
+                events_processed: row.get::<_, i64>(7)? as u64,
+                created_at: chrono::DateTime::parse_from_rfc3339(&ts_str)
+                    .map(|dt| dt.with_timezone(&chrono::Utc))
+                    .unwrap_or_else(|_| chrono::Utc::now()),
+            })
+        });
+        match rows {
+            Ok(r) => r.filter_map(|r| r.ok()).collect(),
+            Err(_) => vec![],
+        }
+    }
+
+    // ── Stats ───────────────────────────────────────────────────────
+
+    /// Get summary counts for logging.
+    pub fn summary(&self) -> (usize, usize, usize, usize) {
+        let db = match self.db.lock() {
+            Ok(db) => db,
+            Err(_) => return (0, 0, 0, 0),
+        };
+        let count = |sql: &str| -> usize {
+            db.query_row(sql, [], |row| row.get::<_, i64>(0))
+                .unwrap_or(0) as usize
+        };
+        (
+            count("SELECT COUNT(*) FROM connections"),
+            count("SELECT COUNT(*) FROM connection_tables"),
+            count("SELECT COUNT(*) FROM s3_configs"),
+            count("SELECT COUNT(*) FROM pipelines"),
+        )
+    }
+}
+
+/// A connection loaded from the DuckDB cache.
+#[cfg(feature = "duckdb")]
+#[allow(dead_code)]
+pub struct CachedConnection {
+    pub id: String,
+    pub name: String,
+    pub conn_type: String,
+    pub host: String,
+    pub port: u16,
+    pub database: String,
+    pub username: String,
+    pub status: String,
+    pub source: String,
+    pub auth_method: String,
+    pub connection_string: Option<String>,
+}

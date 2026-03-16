@@ -652,6 +652,9 @@ pub struct AppState {
     pub credential_store: crate::credential_store::CredentialStore,
     /// Active MongoDB CDC sources keyed by pipeline ID.
     pub cdc_sources: RwLock<std::collections::HashMap<String, std::sync::Arc<crate::mongodb_cdc::MongoDbCdcSource>>>,
+    /// DuckDB-backed persistent state store for connections, tables, and pipelines.
+    #[cfg(feature = "duckdb")]
+    pub state_db: Option<crate::state_db::StateDb>,
 }
 
 impl AppState {
@@ -728,6 +731,17 @@ impl AppState {
             read_only_tables: RwLock::new(std::collections::HashSet::new()),
             credential_store: crate::credential_store::CredentialStore::new(),
             cdc_sources: RwLock::new(std::collections::HashMap::new()),
+            #[cfg(feature = "duckdb")]
+            state_db: match crate::state_db::StateDb::open("rustlake_state.duckdb") {
+                Ok(db) => {
+                    tracing::info!("StateDb opened: rustlake_state.duckdb");
+                    Some(db)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "StateDb unavailable — falling back to JSONL persistence");
+                    None
+                }
+            },
         }
     }
 
@@ -780,6 +794,17 @@ impl AppState {
             read_only_tables: RwLock::new(std::collections::HashSet::new()),
             credential_store: crate::credential_store::CredentialStore::new(),
             cdc_sources: RwLock::new(std::collections::HashMap::new()),
+            #[cfg(feature = "duckdb")]
+            state_db: match crate::state_db::StateDb::open("rustlake_state.duckdb") {
+                Ok(db) => {
+                    tracing::info!("StateDb opened: rustlake_state.duckdb");
+                    Some(db)
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "StateDb unavailable — falling back to JSONL persistence");
+                    None
+                }
+            },
         }
     }
 
@@ -815,6 +840,12 @@ impl AppState {
         if let Err(e) = append_json_line(CONNECTIONS_PATH, &entry) {
             tracing::error!(error = %e, "Failed to persist connection to disk");
         }
+        #[cfg(feature = "duckdb")]
+        if let Some(ref db) = self.state_db {
+            if let Err(e) = db.upsert_connection(&entry) {
+                tracing::warn!(error = %e, "StateDb: failed to upsert connection");
+            }
+        }
         self.connections.write().await.push(entry);
     }
 
@@ -823,6 +854,16 @@ impl AppState {
         let mut connections = self.connections.write().await;
         if let Some(entry) = connections.iter_mut().find(|c| c.id == id) {
             f(entry);
+            #[cfg(feature = "duckdb")]
+            if let Some(ref db) = self.state_db {
+                if let Err(e) = db.upsert_connection(entry) {
+                    tracing::warn!(error = %e, "StateDb: failed to update connection");
+                }
+                // Also cache table list if it changed
+                if !entry.tables.is_empty() {
+                    let _ = db.cache_tables(&entry.id, &entry.tables);
+                }
+            }
         }
         if let Err(e) = rewrite_json_lines(CONNECTIONS_PATH, &*connections) {
             tracing::error!(error = %e, "Failed to rewrite connections file");
@@ -837,6 +878,10 @@ impl AppState {
         if connections.len() < before {
             if let Err(e) = rewrite_json_lines(CONNECTIONS_PATH, &*connections) {
                 tracing::error!(error = %e, "Failed to rewrite connections file");
+            }
+            #[cfg(feature = "duckdb")]
+            if let Some(ref db) = self.state_db {
+                let _ = db.delete_connection(id);
             }
             true
         } else {

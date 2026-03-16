@@ -27,6 +27,7 @@ mod state;
 mod trino_client;
 mod trino_provider;
 mod credential_store;
+mod state_db;
 mod ws;
 
 use state::{
@@ -785,6 +786,48 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Load cached data from DuckDB state store (instant startup)
+    #[cfg(feature = "duckdb")]
+    {
+        if let Some(ref db) = state.state_db {
+            let (conns, tables, s3s, pipes) = db.summary();
+            if conns > 0 || s3s > 0 || pipes > 0 {
+                tracing::info!(
+                    connections = conns, cached_tables = tables,
+                    s3_configs = s3s, pipelines = pipes,
+                    "StateDb cache loaded from rustlake_state.duckdb"
+                );
+            }
+
+            // Restore pipelines from DuckDB if we have none from JSONL
+            let pipelines = state.streaming_pipelines.get_mut();
+            if pipelines.is_empty() {
+                let cached_pipelines = db.load_pipelines();
+                if !cached_pipelines.is_empty() {
+                    tracing::info!(count = cached_pipelines.len(), "Restored pipelines from StateDb");
+                    *pipelines = cached_pipelines;
+                }
+            }
+
+            // Restore cached table lists for connections that have none
+            let connections = state.connections.get_mut();
+            for conn in connections.iter_mut() {
+                if conn.tables.is_empty() {
+                    let cached = db.load_tables(&conn.id);
+                    if !cached.is_empty() {
+                        tracing::info!(
+                            conn_id = %conn.id, name = %conn.name,
+                            tables = cached.len(),
+                            "Restored cached table list from StateDb"
+                        );
+                        conn.tables = cached;
+                        conn.sync_status = "cached".to_string();
+                    }
+                }
+            }
+        }
+    }
+
     let state = Arc::new(state);
 
     // Auto-reconnect previously saved connections (non-blocking)
@@ -872,9 +915,18 @@ async fn main() -> anyhow::Result<()> {
         flight = flight_enabled,
         "Engines"
     );
+    let state_db_status = {
+        #[cfg(feature = "duckdb")]
+        {
+            if state.state_db.is_some() { "active" } else { "unavailable" }
+        }
+        #[cfg(not(feature = "duckdb"))]
+        { "disabled" }
+    };
     tracing::info!(
         connections = saved_conns, passwords = saved_passwords,
         s3_creds = saved_s3, encrypted = cred_secured,
+        state_db = state_db_status,
         "Restored state"
     );
     tracing::info!(role = ?node_role, bind = %bind_addr, "HTTP API server starting");

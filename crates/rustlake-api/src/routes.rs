@@ -5457,6 +5457,10 @@ async fn create_pipeline(
         created_at: Utc::now(),
     };
 
+    #[cfg(feature = "duckdb")]
+    if let Some(ref db) = state.state_db {
+        let _ = db.upsert_pipeline(&pipeline);
+    }
     state.streaming_pipelines.write().await.push(pipeline);
 
     Ok(Json(serde_json::json!({
@@ -5480,6 +5484,10 @@ async fn delete_pipeline(
                 error: format!("Pipeline '{}' not found", id),
             }),
         ));
+    }
+    #[cfg(feature = "duckdb")]
+    if let Some(ref db) = state.state_db {
+        let _ = db.delete_pipeline(&id);
     }
     Ok(Json(serde_json::json!({
         "status": "deleted",
@@ -5740,6 +5748,10 @@ async fn add_s3_config(
         format_counts: std::collections::HashMap::new(),
     };
 
+    #[cfg(feature = "duckdb")]
+    if let Some(ref db) = state.state_db {
+        let _ = db.upsert_s3_config(&req.name, &req.endpoint, &req.bucket, &req.region);
+    }
     let mut configs = state.s3_configs.write().await;
     configs.push(config);
     drop(configs);
