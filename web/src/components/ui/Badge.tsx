@@ -15,10 +15,7 @@ export function Badge({ children, className, dot, dotColor = 'bg-emerald-400' }:
       className
     )}>
       {dot && (
-        <span className="relative">
-          <span className={cn('w-1.5 h-1.5 rounded-full inline-block', dotColor)} />
-          <span className={cn('absolute inset-0 w-1.5 h-1.5 rounded-full animate-ping opacity-40', dotColor)} />
-        </span>
+        <span className={cn('w-1.5 h-1.5 rounded-full inline-block', dotColor)} />
       )}
       {children}
     </span>

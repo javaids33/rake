@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, useCallback } from 'react'
+import { useEffect, useRef, useState, useCallback, useMemo } from 'react'
 
 /** Combined status payload pushed by the SSE `/api/v1/events` stream. */
 export interface ServerStatus {
@@ -53,12 +53,13 @@ type S3ScanListener = (event: S3ScanEvent) => void
  * Returns the latest server status (health, metrics, tables, engines)
  * and a way to subscribe to connection sync and trino scan events.
  *
- * Replaces 3 polling intervals (health 15s, metrics+tables 10s, engine 5s)
- * with a single persistent connection.
+ * Uses ref-based status to avoid re-rendering the entire component tree
+ * on every SSE tick. Only updates state when values actually change.
  */
 export function useEventStream() {
   const [status, setStatus] = useState<ServerStatus | null>(null)
   const [connected, setConnected] = useState(false)
+  const lastStatusRef = useRef<string>('')
   const syncListenersRef = useRef<Set<SyncListener>>(new Set())
   const trinoScanListenersRef = useRef<Set<TrinoScanListener>>(new Set())
   const s3ScanListenersRef = useRef<Set<S3ScanListener>>(new Set())
@@ -92,8 +93,14 @@ export function useEventStream() {
 
       es.addEventListener('status', (e) => {
         try {
+          // Only trigger a re-render if the values actually changed
+          // Compare a lightweight fingerprint instead of deep comparison
           const data: ServerStatus = JSON.parse(e.data)
-          setStatus(data)
+          const fingerprint = `${data.health}|${data.cpu.toFixed(0)}|${Math.round(data.mem_pct)}|${data.total_queries}|${data.uptime}|${data.tables}|${data.engines.length}`
+          if (fingerprint !== lastStatusRef.current) {
+            lastStatusRef.current = fingerprint
+            setStatus(data)
+          }
           setConnected(true)
         } catch { /* ignore parse errors */ }
       })
@@ -122,8 +129,8 @@ export function useEventStream() {
       es.onerror = () => {
         setConnected(false)
         es.close()
-        // Reconnect after 3 seconds
-        retryTimeout = setTimeout(connect, 3000)
+        // Reconnect after 5 seconds
+        retryTimeout = setTimeout(connect, 5000)
       }
     }
 
@@ -136,5 +143,9 @@ export function useEventStream() {
     }
   }, [])
 
-  return { status, connected, onConnectionSync, onTrinoScan, onS3Scan }
+  // Memoize the return value so context consumers don't re-render
+  // unless the actual status/connected values change
+  return useMemo(() => ({
+    status, connected, onConnectionSync, onTrinoScan, onS3Scan
+  }), [status, connected, onConnectionSync, onTrinoScan, onS3Scan])
 }

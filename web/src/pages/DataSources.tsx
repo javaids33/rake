@@ -676,7 +676,7 @@ export function DataSources() {
                         <Badge className="bg-zinc-400/8 text-zinc-400/80 border-zinc-400/10 text-2xs">Snapshot</Badge>
                       )}
                       {isSyncing ? (
-                        <Badge className="bg-amber-400/10 text-amber-400 border-amber-400/20 text-2xs animate-pulse">
+                        <Badge className="bg-amber-400/10 text-amber-400 border-amber-400/20 text-2xs ">
                           Discovering tables...
                         </Badge>
                       ) : isSyncError ? (

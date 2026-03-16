@@ -17,11 +17,13 @@ export function StatusDot({ status, label, pulse }: StatusDotProps) {
   return (
     <span className="inline-flex items-center gap-1.5">
       <span className="relative flex h-2 w-2">
-        {(pulse || status === 'healthy') && (
+        <span className={cn('relative inline-flex rounded-full h-2 w-2', colors[status])} />
+        {status !== 'idle' && (
+          <span className={cn('absolute -inset-0.5 rounded-full opacity-20', colors[status])} />
+        )}
+        {pulse && (
           <span className={cn('absolute inset-0 rounded-full animate-ping opacity-30', colors[status])} />
         )}
-        <span className={cn('relative inline-flex rounded-full h-2 w-2', colors[status])} />
-        <span className={cn('absolute -inset-1 rounded-full blur-sm opacity-30', colors[status])} />
       </span>
       {label && <span className="text-2xs text-zinc-400 tracking-wide">{label}</span>}
     </span>

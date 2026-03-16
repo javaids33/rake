@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useState, memo } from 'react'
 import { getEngines } from '../../api/client'
 import { useAppStore } from '../../stores/app'
 import { cn } from '../../lib/utils'
@@ -25,7 +25,7 @@ interface HeaderProps {
   sseConnected: boolean
 }
 
-export function Header({ serverStatus, sseConnected }: HeaderProps) {
+export const Header = memo(function Header({ serverStatus, sseConnected }: HeaderProps) {
   const [engines, setEngines] = useState<EngineInfo[]>([])
   const { darkMode } = useAppStore()
 
@@ -162,10 +162,7 @@ export function Header({ serverStatus, sseConnected }: HeaderProps) {
               serverStatus === null ? 'bg-zinc-500' : healthy ? 'bg-emerald-400' : 'bg-rose-400'
             }`} />
             {healthy && (
-              <>
-                <div className="absolute inset-0 rounded-full bg-emerald-400 animate-ping opacity-30" />
-                <div className="absolute -inset-1 rounded-full bg-emerald-400/10 blur-sm" />
-              </>
+              <div className="absolute -inset-1 rounded-full bg-emerald-400/10 blur-sm" />
             )}
           </div>
           <span className={cn('text-2xs font-medium tracking-wide', {
@@ -182,4 +179,4 @@ export function Header({ serverStatus, sseConnected }: HeaderProps) {
       </div>
     </header>
   )
-}
+})
