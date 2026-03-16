@@ -229,7 +229,19 @@ export function DataCatalog() {
             </div>
           )}
           {filtered.length === 0 && (
-            <EmptyState icon={<Database className="w-5 h-5" />} title="No tables found" description="Register tables from Data Sources" />
+            <div className="flex flex-col items-center justify-center py-12 px-6 text-center">
+              <Database className="w-8 h-8 text-zinc-700 mb-3" />
+              <h3 className="text-sm font-semibold text-zinc-300 mb-1">No tables registered</h3>
+              <p className="text-2xs text-zinc-500 mb-4 max-w-xs">Connect a database or upload a file to start discovering your data</p>
+              <div className="flex gap-2">
+                <Button variant="primary" size="sm" onClick={() => navigate('/sources')}>
+                  Add Data Source
+                </Button>
+                <Button variant="secondary" size="sm" onClick={() => navigate('/sql')}>
+                  Upload File
+                </Button>
+              </div>
+            </div>
           )}
         </div>
       </div>

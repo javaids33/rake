@@ -461,3 +461,130 @@ fn default_k8s_port_name() -> String {
 fn default_k8s_poll_interval() -> u64 {
     15
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_default_config() {
+        let cfg = RustLakeConfig::default();
+        assert_eq!(cfg.api.host, "127.0.0.1");
+        assert_eq!(cfg.api.port, 3000);
+        assert_eq!(cfg.engine.batch_size, 8192);
+        assert!(cfg.engine.memory_limit.is_none());
+        assert!(!cfg.stream.enabled);
+        assert!(!cfg.vector.enabled);
+        assert!(!cfg.flight.enabled);
+    }
+
+    #[test]
+    fn test_default_storage_is_local() {
+        let cfg = RustLakeConfig::default();
+        match &cfg.storage.backend {
+            StorageBackend::Local { path } => assert_eq!(path, "./data"),
+            _ => panic!("Expected Local storage backend"),
+        }
+    }
+
+    #[test]
+    fn test_config_from_toml() {
+        let toml = r#"
+[api]
+host = "0.0.0.0"
+port = 8080
+
+[engine]
+batch_size = 4096
+
+[stream]
+enabled = true
+batch_size = 500
+
+[vector]
+enabled = true
+default_dimensions = 768
+"#;
+        let cfg: RustLakeConfig = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.api.host, "0.0.0.0");
+        assert_eq!(cfg.api.port, 8080);
+        assert_eq!(cfg.engine.batch_size, 4096);
+        assert!(cfg.stream.enabled);
+        assert_eq!(cfg.stream.batch_size, 500);
+        assert!(cfg.vector.enabled);
+        assert_eq!(cfg.vector.default_dimensions, 768);
+    }
+
+    #[test]
+    fn test_config_s3_backend() {
+        let toml = r#"
+[storage.backend]
+type = "s3"
+bucket = "my-bucket"
+region = "us-west-2"
+"#;
+        let cfg: RustLakeConfig = toml::from_str(toml).unwrap();
+        match &cfg.storage.backend {
+            StorageBackend::S3 { bucket, region, endpoint } => {
+                assert_eq!(bucket, "my-bucket");
+                assert_eq!(region, "us-west-2");
+                assert!(endpoint.is_none());
+            }
+            _ => panic!("Expected S3 storage backend"),
+        }
+    }
+
+    #[test]
+    fn test_config_s3_with_endpoint() {
+        let toml = r#"
+[storage.backend]
+type = "s3"
+bucket = "test"
+region = "us-east-1"
+endpoint = "http://localhost:9000"
+"#;
+        let cfg: RustLakeConfig = toml::from_str(toml).unwrap();
+        match &cfg.storage.backend {
+            StorageBackend::S3 { endpoint, .. } => {
+                assert_eq!(endpoint.as_deref(), Some("http://localhost:9000"));
+            }
+            _ => panic!("Expected S3 storage backend"),
+        }
+    }
+
+    #[test]
+    fn test_config_serialization_roundtrip() {
+        let cfg = RustLakeConfig::default();
+        let toml_str = toml::to_string(&cfg).unwrap();
+        let cfg2: RustLakeConfig = toml::from_str(&toml_str).unwrap();
+        assert_eq!(cfg2.api.port, cfg.api.port);
+        assert_eq!(cfg2.engine.batch_size, cfg.engine.batch_size);
+    }
+
+    #[test]
+    fn test_config_from_nonexistent_file() {
+        let result = RustLakeConfig::from_file("/nonexistent/path.toml");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_stream_config_defaults() {
+        let cfg = StreamConfig::default();
+        assert!(!cfg.enabled);
+        assert_eq!(cfg.batch_size, 1000);
+        assert_eq!(cfg.checkpoint_interval_secs, 30);
+    }
+
+    #[test]
+    fn test_engine_config_target_partitions() {
+        let cfg = EngineConfig::default();
+        assert!(cfg.target_partitions > 0, "target_partitions should be > 0 (CPU count)");
+    }
+
+    #[test]
+    fn test_vector_config_defaults() {
+        let cfg = VectorConfig::default();
+        assert!(!cfg.enabled);
+        assert_eq!(cfg.default_dimensions, 384);
+    }
+}

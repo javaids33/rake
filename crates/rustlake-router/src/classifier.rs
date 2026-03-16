@@ -191,4 +191,115 @@ mod tests {
         let qt = QueryClassifier::classify("INSERT INTO test VALUES (1)").unwrap();
         assert_eq!(qt, QueryType::Dml);
     }
+
+    #[test]
+    fn test_classify_update() {
+        let qt = QueryClassifier::classify("UPDATE orders SET status = 'shipped' WHERE id = 1").unwrap();
+        assert_eq!(qt, QueryType::Dml);
+    }
+
+    #[test]
+    fn test_classify_delete() {
+        let qt = QueryClassifier::classify("DELETE FROM orders WHERE id = 1").unwrap();
+        assert_eq!(qt, QueryType::Dml);
+    }
+
+    #[test]
+    fn test_classify_drop_table() {
+        let qt = QueryClassifier::classify("DROP TABLE test").unwrap();
+        assert_eq!(qt, QueryType::Ddl);
+    }
+
+    #[test]
+    fn test_classify_alter_table() {
+        let qt = QueryClassifier::classify("ALTER TABLE test ADD COLUMN name TEXT").unwrap();
+        assert_eq!(qt, QueryType::Ddl);
+    }
+
+    #[test]
+    fn test_classify_show_tables() {
+        let qt = QueryClassifier::classify("SHOW TABLES").unwrap();
+        assert_eq!(qt, QueryType::Utility);
+    }
+
+    #[test]
+    fn test_classify_explain() {
+        let qt = QueryClassifier::classify("EXPLAIN SELECT * FROM orders").unwrap();
+        assert_eq!(qt, QueryType::Utility);
+    }
+
+    #[test]
+    fn test_classify_join_is_olap() {
+        let qt = QueryClassifier::classify(
+            "SELECT o.id, c.name FROM orders o JOIN customers c ON o.customer_id = c.id"
+        ).unwrap();
+        assert_eq!(qt, QueryType::Olap);
+    }
+
+    #[test]
+    fn test_classify_select_with_limit_is_interactive() {
+        let qt = QueryClassifier::classify("SELECT * FROM orders LIMIT 10").unwrap();
+        assert_eq!(qt, QueryType::Interactive);
+    }
+
+    #[test]
+    fn test_classify_vector_search_is_ml() {
+        let qt = QueryClassifier::classify(
+            "SELECT * FROM products ORDER BY vector_search(embedding, 'shoes', 10)"
+        ).unwrap();
+        assert_eq!(qt, QueryType::MachineLearning);
+    }
+
+    #[test]
+    fn test_classify_empty_sql_is_error() {
+        let result = QueryClassifier::classify("");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_classify_invalid_sql_is_error() {
+        let result = QueryClassifier::classify("NOT VALID SQL AT ALL !!!");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_classify_with_engine_olap_targets_duckdb() {
+        let result = QueryClassifier::classify_with_engine(
+            "SELECT region, SUM(sales) FROM orders GROUP BY region"
+        ).unwrap();
+        assert_eq!(result.query_type, QueryType::Olap);
+        assert_eq!(result.engine, EngineTarget::DuckDb);
+    }
+
+    #[test]
+    fn test_classify_with_engine_ddl_targets_datafusion() {
+        let result = QueryClassifier::classify_with_engine("CREATE TABLE t (id INT)").unwrap();
+        assert_eq!(result.query_type, QueryType::Ddl);
+        assert_eq!(result.engine, EngineTarget::DataFusion);
+    }
+
+    #[test]
+    fn test_classify_with_engine_interactive_targets_either() {
+        let result = QueryClassifier::classify_with_engine("SELECT 1 + 1").unwrap();
+        assert_eq!(result.query_type, QueryType::Interactive);
+        assert_eq!(result.engine, EngineTarget::Either);
+    }
+
+    #[test]
+    fn test_query_type_display() {
+        assert_eq!(format!("{}", QueryType::Olap), "OLAP");
+        assert_eq!(format!("{}", QueryType::Interactive), "Interactive");
+        assert_eq!(format!("{}", QueryType::Ddl), "DDL");
+        assert_eq!(format!("{}", QueryType::Dml), "DML");
+        assert_eq!(format!("{}", QueryType::Streaming), "Streaming");
+        assert_eq!(format!("{}", QueryType::MachineLearning), "ML");
+        assert_eq!(format!("{}", QueryType::Utility), "Utility");
+    }
+
+    #[test]
+    fn test_engine_target_display() {
+        assert_eq!(format!("{}", EngineTarget::DataFusion), "DataFusion");
+        assert_eq!(format!("{}", EngineTarget::DuckDb), "DuckDB");
+        assert_eq!(format!("{}", EngineTarget::Either), "Either");
+    }
 }

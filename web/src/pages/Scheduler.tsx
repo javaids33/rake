@@ -4,12 +4,13 @@ import { Card } from '../components/ui/Card'
 import { Button } from '../components/ui/Button'
 import { Badge } from '../components/ui/Badge'
 import { Tabs } from '../components/ui/Tabs'
-import { Modal } from '../components/ui/Modal'
+import { Drawer } from '../components/ui/Drawer'
 import { Input, Select, Textarea } from '../components/ui/Input'
 import { EmptyState } from '../components/ui/EmptyState'
 import { StatusDot } from '../components/ui/StatusDot'
 import { Tooltip } from '../components/ui/Tooltip'
 import { cn, formatDuration, formatRelativeTime } from '../lib/utils'
+import { useDraftForm } from '../hooks/useDraftForm'
 import { getSchedules, createSchedule, updateSchedule, deleteSchedule, runSchedule, getScheduleRuns, getSchedulerDag } from '../api/client'
 import { useEditorStore } from '../stores/editor'
 import type { ScheduledJob, JobRun, DagNode, DagEdge } from '../types'
@@ -147,7 +148,7 @@ export function Scheduler() {
   const [runs, setRuns] = useState<JobRun[]>([])
   const [createOpen, setCreateOpen] = useState(false)
   const [selectedJob, setSelectedJob] = useState<string | null>(null)
-  const [form, setForm] = useState({
+  const [form, setForm, { clearDraft, hasDraft }] = useDraftForm('draft:job', {
     name: '', job_type: 'etl_pipeline', cron: '0 * * * *', target: '',
     retries: '3', tags: '', timeout: '3600', sla_minutes: '60',
     source: '', sink: 'iceberg', write_mode: 'append', engine: 'auto',
@@ -213,7 +214,7 @@ export function Scheduler() {
       })
       toast.success('Job created')
       setCreateOpen(false)
-      setForm({ name: '', job_type: 'etl_pipeline', cron: '0 * * * *', target: '', retries: '3', tags: '', timeout: '3600', sla_minutes: '60', source: '', sink: 'iceberg', write_mode: 'append', engine: 'auto' })
+      clearDraft()
       loadAll()
     } catch (e) { toast.error((e as Error).message) }
   }
@@ -948,7 +949,7 @@ export function Scheduler() {
       </div>
 
       {/* ─── Create Job Modal ─── */}
-      <Modal open={createOpen} onClose={() => setCreateOpen(false)} title="Create Scheduled Job" width="max-w-2xl">
+      <Drawer open={createOpen} onClose={() => setCreateOpen(false)} title="Create Scheduled Job" subtitle="Configure job type, schedule, and SQL" width="max-w-xl" draftSaved={hasDraft}>
         <div className="space-y-4">
           <Input label="Job Name" value={form.name} onChange={e => setForm(f => ({ ...f, name: e.target.value }))} placeholder="nightly-orders-etl" />
 
@@ -1095,12 +1096,16 @@ export function Scheduler() {
             <Input label="Tags" value={form.tags} onChange={e => setForm(f => ({ ...f, tags: e.target.value }))} placeholder="etl,prod" />
           </div>
 
-          <div className="flex justify-end gap-2 pt-2">
+          <div className="flex justify-end gap-2 pt-4 border-t border-white/[0.06] mt-4">
+            {hasDraft && (
+              <Button variant="secondary" size="sm" onClick={clearDraft}>Clear Draft</Button>
+            )}
+            <div className="flex-1" />
             <Button variant="secondary" size="sm" onClick={() => setCreateOpen(false)}>Cancel</Button>
             <Button variant="primary" size="sm" onClick={handleCreate} icon={<Plus className="w-3.5 h-3.5" />}>Create Job</Button>
           </div>
         </div>
-      </Modal>
+      </Drawer>
     </div>
   )
 }

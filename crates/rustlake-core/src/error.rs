@@ -67,3 +67,55 @@ pub enum RustLakeError {
 
 /// A `Result` type alias using [`RustLakeError`] as the error type.
 pub type Result<T> = std::result::Result<T, RustLakeError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_error_display_query() {
+        let err = RustLakeError::Query("bad sql".into());
+        assert_eq!(err.to_string(), "Query error: bad sql");
+    }
+
+    #[test]
+    fn test_error_display_storage() {
+        let err = RustLakeError::Storage("file not found".into());
+        assert_eq!(err.to_string(), "Storage error: file not found");
+    }
+
+    #[test]
+    fn test_error_display_catalog() {
+        let err = RustLakeError::Catalog("table not found".into());
+        assert_eq!(err.to_string(), "Catalog error: table not found");
+    }
+
+    #[test]
+    fn test_error_display_config() {
+        let err = RustLakeError::Config("missing field".into());
+        assert_eq!(err.to_string(), "Config error: missing field");
+    }
+
+    #[test]
+    fn test_error_from_io() {
+        let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "gone");
+        let err: RustLakeError = io_err.into();
+        assert!(err.to_string().contains("gone"));
+    }
+
+    #[test]
+    fn test_error_from_serde_json() {
+        let json_err = serde_json::from_str::<serde_json::Value>("not json").unwrap_err();
+        let err: RustLakeError = json_err.into();
+        assert!(err.to_string().contains("Serde JSON"));
+    }
+
+    #[test]
+    fn test_result_type_alias() {
+        let ok: Result<i32> = Ok(42);
+        assert_eq!(ok.unwrap(), 42);
+
+        let err: Result<i32> = Err(RustLakeError::Other("oops".into()));
+        assert!(err.is_err());
+    }
+}

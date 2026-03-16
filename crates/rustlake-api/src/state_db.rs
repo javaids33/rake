@@ -323,7 +323,6 @@ impl StateDb {
         let rows = stmt.query_map([], |row| {
             let source_json: String = row.get(3)?;
             let transform_sql: String = row.get(4)?;
-            let ts_str: String = row.get(8)?;
             Ok(super::state::StreamingPipeline {
                 id: row.get(0)?,
                 name: row.get(1)?,
@@ -333,9 +332,7 @@ impl StateDb {
                 sink_table: row.get(5)?,
                 status: row.get(6)?,
                 events_processed: row.get::<_, i64>(7)? as u64,
-                created_at: chrono::DateTime::parse_from_rfc3339(&ts_str)
-                    .map(|dt| dt.with_timezone(&chrono::Utc))
-                    .unwrap_or_else(|_| chrono::Utc::now()),
+                created_at: chrono::Utc::now(), // Use current time — DuckDB TIMESTAMP format varies
             })
         });
         match rows {
@@ -380,4 +377,264 @@ pub struct CachedConnection {
     pub source: String,
     pub auth_method: String,
     pub connection_string: Option<String>,
+}
+
+#[cfg(test)]
+#[cfg(feature = "duckdb")]
+mod tests {
+    use super::*;
+
+    fn temp_db() -> StateDb {
+        StateDb::open(":memory:").expect("in-memory DuckDB should open")
+    }
+
+    #[test]
+    fn test_open_and_init_schema() {
+        let db = temp_db();
+        let (conns, tables, s3s, pipes) = db.summary();
+        assert_eq!(conns, 0);
+        assert_eq!(tables, 0);
+        assert_eq!(s3s, 0);
+        assert_eq!(pipes, 0);
+    }
+
+    #[test]
+    fn test_upsert_and_load_connection() {
+        let db = temp_db();
+        let entry = crate::state::ConnectionEntry {
+            id: "test-1".into(),
+            name: "Test Postgres".into(),
+            conn_type: "postgres".into(),
+            host: "localhost".into(),
+            port: 5432,
+            database: "testdb".into(),
+            username: "user".into(),
+            status: "connected".into(),
+            tables: vec![],
+            created_at: chrono::Utc::now(),
+            source: "user".into(),
+            sync_status: "ready".into(),
+            sync_error: None,
+            sync_progress: None,
+            auth_method: "scram".into(),
+            connection_string: None,
+            aws_access_key: None,
+            aws_secret_key: None,
+            aws_session_token: None,
+        };
+        db.upsert_connection(&entry).unwrap();
+
+        let (conns, _, _, _) = db.summary();
+        assert_eq!(conns, 1);
+
+        let loaded = db.load_connections();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].name, "Test Postgres");
+        assert_eq!(loaded[0].conn_type, "postgres");
+        assert_eq!(loaded[0].host, "localhost");
+    }
+
+    #[test]
+    fn test_upsert_connection_is_idempotent() {
+        let db = temp_db();
+        let entry = crate::state::ConnectionEntry {
+            id: "test-1".into(),
+            name: "Version 1".into(),
+            conn_type: "postgres".into(),
+            host: "host1".into(),
+            port: 5432,
+            database: "db".into(),
+            username: "u".into(),
+            status: "connected".into(),
+            tables: vec![],
+            created_at: chrono::Utc::now(),
+            source: "user".into(),
+            sync_status: "ready".into(),
+            sync_error: None,
+            sync_progress: None,
+            auth_method: "scram".into(),
+            connection_string: None,
+            aws_access_key: None,
+            aws_secret_key: None,
+            aws_session_token: None,
+        };
+        db.upsert_connection(&entry).unwrap();
+
+        // Update same ID
+        let mut entry2 = entry.clone();
+        entry2.name = "Version 2".into();
+        entry2.host = "host2".into();
+        db.upsert_connection(&entry2).unwrap();
+
+        let (conns, _, _, _) = db.summary();
+        assert_eq!(conns, 1); // Still 1, not 2
+
+        let loaded = db.load_connections();
+        assert_eq!(loaded[0].name, "Version 2");
+        assert_eq!(loaded[0].host, "host2");
+    }
+
+    #[test]
+    fn test_delete_connection() {
+        let db = temp_db();
+        let entry = crate::state::ConnectionEntry {
+            id: "del-me".into(),
+            name: "Delete Me".into(),
+            conn_type: "mysql".into(),
+            host: "localhost".into(),
+            port: 3306,
+            database: "db".into(),
+            username: "u".into(),
+            status: "connected".into(),
+            tables: vec![],
+            created_at: chrono::Utc::now(),
+            source: "user".into(),
+            sync_status: "ready".into(),
+            sync_error: None,
+            sync_progress: None,
+            auth_method: "scram".into(),
+            connection_string: None,
+            aws_access_key: None,
+            aws_secret_key: None,
+            aws_session_token: None,
+        };
+        db.upsert_connection(&entry).unwrap();
+        db.cache_tables("del-me", &["table1".into(), "table2".into()]).unwrap();
+
+        assert_eq!(db.summary().0, 1);
+        assert_eq!(db.load_tables("del-me").len(), 2);
+
+        db.delete_connection("del-me").unwrap();
+        assert_eq!(db.summary().0, 0);
+        assert_eq!(db.load_tables("del-me").len(), 0);
+    }
+
+    #[test]
+    fn test_cache_and_load_tables() {
+        let db = temp_db();
+        let tables = vec!["users".into(), "orders".into(), "products".into()];
+        db.cache_tables("conn-1", &tables).unwrap();
+
+        let loaded = db.load_tables("conn-1");
+        assert_eq!(loaded.len(), 3);
+        assert!(loaded.contains(&"orders".to_string()));
+        assert!(loaded.contains(&"users".to_string()));
+    }
+
+    #[test]
+    fn test_cache_tables_replaces_old() {
+        let db = temp_db();
+        db.cache_tables("conn-1", &["old1".into(), "old2".into()]).unwrap();
+        assert_eq!(db.load_tables("conn-1").len(), 2);
+
+        db.cache_tables("conn-1", &["new1".into()]).unwrap();
+        let loaded = db.load_tables("conn-1");
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0], "new1");
+    }
+
+    #[test]
+    fn test_cache_and_load_columns() {
+        let db = temp_db();
+        let cols = vec![
+            ("id".into(), "INTEGER".into(), false),
+            ("name".into(), "TEXT".into(), true),
+            ("email".into(), "TEXT".into(), true),
+        ];
+        db.cache_columns("conn-1", "users", &cols).unwrap();
+
+        let loaded = db.load_columns("conn-1", "users");
+        assert_eq!(loaded.len(), 3);
+        assert_eq!(loaded[0].0, "id");
+        assert_eq!(loaded[0].1, "INTEGER");
+        assert!(!loaded[0].2); // not nullable
+        assert!(loaded[2].2); // nullable
+    }
+
+    #[test]
+    fn test_s3_config_crud() {
+        let db = temp_db();
+        db.upsert_s3_config("prod", "https://s3.amazonaws.com", "my-bucket", "us-east-1").unwrap();
+
+        let (_, _, s3s, _) = db.summary();
+        assert_eq!(s3s, 1);
+    }
+
+    #[test]
+    fn test_s3_table_cache() {
+        let db = temp_db();
+        db.upsert_s3_config("test", "", "test-bucket", "us-east-1").unwrap();
+
+        let tables = vec![
+            ("events".into(), "iceberg".into(), "warehouse/events".into()),
+            ("users".into(), "delta".into(), "warehouse/users".into()),
+        ];
+        db.cache_s3_tables("test", &tables).unwrap();
+
+        let loaded = db.load_s3_tables("test");
+        assert_eq!(loaded.len(), 2);
+        // Sorted alphabetically by table_name: events < users
+        assert_eq!(loaded[0].0, "events");
+        assert_eq!(loaded[0].1, "iceberg");
+        assert_eq!(loaded[1].0, "users");
+        assert_eq!(loaded[1].1, "delta");
+    }
+
+    #[test]
+    fn test_pipeline_crud() {
+        let db = temp_db();
+        let pipeline = crate::state::StreamingPipeline {
+            id: "pipe-1".into(),
+            name: "kafka-events".into(),
+            source_type: "kafka".into(),
+            source_config: serde_json::json!({"broker": "localhost:9092", "topic": "events"}),
+            transform_sql: Some("SELECT * FROM source WHERE event_type != 'heartbeat'".into()),
+            sink_table: "iceberg://warehouse.events".into(),
+            status: "created".into(),
+            events_processed: 0,
+            created_at: chrono::Utc::now(),
+        };
+        db.upsert_pipeline(&pipeline).unwrap();
+
+        let loaded = db.load_pipelines();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].name, "kafka-events");
+        assert_eq!(loaded[0].source_type, "kafka");
+        assert_eq!(loaded[0].sink_table, "iceberg://warehouse.events");
+        assert!(loaded[0].transform_sql.is_some());
+
+        db.delete_pipeline("pipe-1").unwrap();
+        assert_eq!(db.load_pipelines().len(), 0);
+    }
+
+    #[test]
+    fn test_multiple_connections() {
+        let db = temp_db();
+        for i in 0..5 {
+            let entry = crate::state::ConnectionEntry {
+                id: format!("conn-{}", i),
+                name: format!("Connection {}", i),
+                conn_type: "postgres".into(),
+                host: "localhost".into(),
+                port: 5432 + i as u16,
+                database: format!("db{}", i),
+                username: "user".into(),
+                status: "connected".into(),
+                tables: vec![],
+                created_at: chrono::Utc::now(),
+                source: "user".into(),
+                sync_status: "ready".into(),
+                sync_error: None,
+                sync_progress: None,
+                auth_method: "scram".into(),
+                connection_string: None,
+                aws_access_key: None,
+                aws_secret_key: None,
+                aws_session_token: None,
+            };
+            db.upsert_connection(&entry).unwrap();
+        }
+        assert_eq!(db.summary().0, 5);
+        assert_eq!(db.load_connections().len(), 5);
+    }
 }

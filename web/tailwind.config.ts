@@ -65,6 +65,7 @@ export default {
         'float': 'float 6s ease-in-out infinite',
         'scan': 'scan 4s linear infinite',
         'count-up': 'countUp 0.8s cubic-bezier(0.16, 1, 0.3, 1)',
+        'slide-in-right': 'slideInRight 0.25s cubic-bezier(0.16, 1, 0.3, 1)',
       },
       keyframes: {
         fadeIn: {
@@ -94,6 +95,10 @@ export default {
         countUp: {
           '0%': { opacity: '0', transform: 'translateY(8px)' },
           '100%': { opacity: '1', transform: 'translateY(0)' },
+        },
+        slideInRight: {
+          '0%': { opacity: '0', transform: 'translateX(100%)' },
+          '100%': { opacity: '1', transform: 'translateX(0)' },
         },
       },
       boxShadow: {

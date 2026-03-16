@@ -4,7 +4,7 @@ import { Card } from '../components/ui/Card'
 import { Button } from '../components/ui/Button'
 import { Badge } from '../components/ui/Badge'
 import { Tabs } from '../components/ui/Tabs'
-import { Modal } from '../components/ui/Modal'
+import { Drawer } from '../components/ui/Drawer'
 import { Input } from '../components/ui/Input'
 import { Textarea } from '../components/ui/Input'
 import { Select } from '../components/ui/Input'
@@ -12,6 +12,7 @@ import { EmptyState } from '../components/ui/EmptyState'
 import { StatusDot } from '../components/ui/StatusDot'
 import { Tooltip } from '../components/ui/Tooltip'
 import { cn, formatNumber, formatDuration } from '../lib/utils'
+import { useDraftForm } from '../hooks/useDraftForm'
 import { getStreamStatus, getStreamEvents, ingestStream, getPipelines, createPipeline, deletePipeline, getConnections, getS3Configs, startPipeline, stopPipeline } from '../api/client'
 import type { StreamingMetrics, StreamEvent, StreamingPipeline, ConnectionEntry, S3Config } from '../types'
 import {
@@ -81,7 +82,7 @@ export function Streaming() {
   const [pipelines, setPipelines] = useState<StreamingPipeline[]>([])
   const [createOpen, setCreateOpen] = useState(false)
   const [selectedPipeline, setSelectedPipeline] = useState<string | null>(null)
-  const [form, setForm] = useState<PipelineForm>({ ...EMPTY_FORM })
+  const [form, setForm, { clearDraft, hasDraft }] = useDraftForm<PipelineForm>('draft:pipeline', EMPTY_FORM)
 
   // Connections and S3 configs for auto-populate
   const [allConnections, setAllConnections] = useState<ConnectionEntry[]>([])
@@ -223,7 +224,7 @@ export function Streaming() {
       })
       toast.success('Pipeline created')
       setCreateOpen(false)
-      setForm({ ...EMPTY_FORM })
+      clearDraft()
       loadAll()
     } catch (e) { toast.error((e as Error).message) }
   }
@@ -680,7 +681,7 @@ export function Streaming() {
       </div>
 
       {/* ═══════════════ Create pipeline modal ═══════════════ */}
-      <Modal open={createOpen} onClose={() => setCreateOpen(false)} title="Create Streaming Pipeline" width="max-w-2xl">
+      <Drawer open={createOpen} onClose={() => setCreateOpen(false)} title="Create Streaming Pipeline" subtitle="Configure source, sink, and transform" width="max-w-xl" draftSaved={hasDraft}>
         <div className="space-y-4 max-h-[75vh] overflow-y-auto pr-1">
           <Input label="Pipeline Name" value={form.name} onChange={e => setForm(f => ({ ...f, name: e.target.value }))} placeholder="events-pipeline" />
 
@@ -984,12 +985,16 @@ export function Streaming() {
           />
 
           {/* Action buttons */}
-          <div className="flex justify-end gap-2 pt-2 sticky bottom-0 bg-navy-950/95 backdrop-blur pb-1">
+          <div className="flex justify-end gap-2 pt-4 border-t border-white/[0.06] mt-4">
+            {hasDraft && (
+              <Button variant="secondary" size="sm" onClick={clearDraft}>Clear Draft</Button>
+            )}
+            <div className="flex-1" />
             <Button variant="secondary" size="sm" onClick={() => setCreateOpen(false)}>Cancel</Button>
             <Button variant="primary" size="sm" onClick={handleCreate}>Create Pipeline</Button>
           </div>
         </div>
-      </Modal>
+      </Drawer>
     </div>
   )
 }

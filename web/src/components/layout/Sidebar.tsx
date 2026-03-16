@@ -4,25 +4,61 @@ import { useAppStore } from '../../stores/app'
 import {
   Home, Terminal, Database, FolderInput, Radio, Search,
   GitBranch, Clock, Settings, Info, Layers, PanelLeftClose, PanelLeft,
-  Gauge, ShieldCheck, Timer, Sun, Moon, ArrowLeftRight,
+  Gauge, ShieldCheck, Timer, Sun, Moon, ArrowLeftRight, Plus,
 } from 'lucide-react'
 
-const nav = [
-  { to: '/', icon: Home, label: 'Home', accent: 'amber' },
-  { to: '/sql', icon: Terminal, label: 'SQL Editor', accent: 'amber' },
-  { to: '/catalog', icon: Database, label: 'Data Catalog', accent: 'cyan' },
-  { to: '/sources', icon: FolderInput, label: 'Data Sources', accent: 'cyan' },
-  { to: '/quality', icon: ShieldCheck, label: 'Data Quality', accent: 'cyan' },
-  { to: '/streaming', icon: Radio, label: 'Streaming', accent: 'cyan' },
-  { to: '/vector', icon: Search, label: 'Vector Search', accent: 'rose' },
-  { to: '/transforms', icon: GitBranch, label: 'Transforms', accent: 'violet' },
-  { to: '/scheduler', icon: Clock, label: 'Scheduler', accent: 'amber' },
-  { to: '/benchmarks', icon: Timer, label: 'Benchmarks', accent: 'amber' },
-  { to: '/migration', icon: ArrowLeftRight, label: 'Migration', accent: 'rose' },
-  { to: '/metrics', icon: Gauge, label: 'Engine Metrics', accent: 'emerald' },
-  { to: '/history', icon: Layers, label: 'Query History', accent: 'emerald' },
-  { to: '/settings', icon: Settings, label: 'Settings', accent: 'zinc' },
-  { to: '/about', icon: Info, label: 'About', accent: 'zinc' },
+interface NavItem {
+  to: string
+  icon: typeof Home
+  label: string
+  accent: string
+}
+
+interface NavSection {
+  title?: string
+  items: NavItem[]
+}
+
+const sections: NavSection[] = [
+  {
+    items: [
+      { to: '/', icon: Home, label: 'Home', accent: 'amber' },
+      { to: '/catalog', icon: Database, label: 'Catalog', accent: 'cyan' },
+      { to: '/scheduler', icon: Clock, label: 'Jobs & Pipelines', accent: 'amber' },
+      { to: '/sources', icon: FolderInput, label: 'Data Sources', accent: 'cyan' },
+    ],
+  },
+  {
+    title: 'SQL',
+    items: [
+      { to: '/sql', icon: Terminal, label: 'SQL Editor', accent: 'amber' },
+      { to: '/history', icon: Layers, label: 'Query History', accent: 'emerald' },
+    ],
+  },
+  {
+    title: 'Data Engineering',
+    items: [
+      { to: '/streaming', icon: Radio, label: 'Streaming / CDC', accent: 'cyan' },
+      { to: '/transforms', icon: GitBranch, label: 'Transforms', accent: 'violet' },
+      { to: '/quality', icon: ShieldCheck, label: 'Data Quality', accent: 'cyan' },
+      { to: '/migration', icon: ArrowLeftRight, label: 'Migration', accent: 'rose' },
+    ],
+  },
+  {
+    title: 'AI / ML',
+    items: [
+      { to: '/vector', icon: Search, label: 'Vector Search', accent: 'rose' },
+    ],
+  },
+  {
+    title: 'Infrastructure',
+    items: [
+      { to: '/metrics', icon: Gauge, label: 'Engine Metrics', accent: 'emerald' },
+      { to: '/benchmarks', icon: Timer, label: 'Benchmarks', accent: 'amber' },
+      { to: '/settings', icon: Settings, label: 'Settings', accent: 'zinc' },
+      { to: '/about', icon: Info, label: 'About', accent: 'zinc' },
+    ],
+  },
 ]
 
 const accentMap: Record<string, { active: string; glow: string }> = {
@@ -49,7 +85,7 @@ export function Sidebar() {
       {/* Right edge glow line — dark only */}
       {darkMode && <div className="absolute right-0 top-0 bottom-0 w-px bg-gradient-to-b from-transparent via-amber-400/10 to-transparent" />}
 
-      {/* Logo */}
+      {/* Logo + New button */}
       <div className={cn(
         'flex items-center h-14 px-3',
         darkMode ? 'border-b border-amber-500/[0.06]' : 'border-b border-slate-200',
@@ -57,52 +93,85 @@ export function Sidebar() {
       )}>
         <div className="relative w-8 h-8 rounded-xl bg-gradient-to-br from-amber-400 to-amber-600 flex items-center justify-center flex-shrink-0 shadow-lg shadow-amber-500/20">
           <span className="text-navy-950 font-display font-bold text-sm">R</span>
-          {/* Logo glow */}
           <div className="absolute inset-0 rounded-xl bg-amber-400/20 blur-md -z-10" />
         </div>
         {!sidebarCollapsed && (
-          <div className="flex flex-col min-w-0">
+          <div className="flex flex-col min-w-0 flex-1">
             <span className={cn('text-sm font-display font-bold tracking-tight', darkMode ? 'text-zinc-50' : 'text-slate-900')}>RustLake</span>
             <span className={cn('text-2xs font-mono tracking-wider', darkMode ? 'text-amber-400/50' : 'text-amber-600/60')}>v0.4.0</span>
           </div>
         )}
       </div>
 
-      {/* Nav */}
-      <nav className="flex-1 py-3 px-2 space-y-0.5 overflow-y-auto stagger">
-        {nav.map(item => {
-          const isActive = item.to === '/'
-            ? location.pathname === '/'
-            : location.pathname.startsWith(item.to)
-          const accent = accentMap[item.accent]
-          return (
-            <NavLink
-              key={item.to}
-              to={item.to}
-              className={cn(
-                'group flex items-center gap-2.5 rounded-lg transition-all duration-200 border',
-                sidebarCollapsed ? 'justify-center p-2.5' : 'px-3 py-2',
-                isActive
-                  ? darkMode ? accent.active : `text-amber-700 bg-amber-50 border-amber-200`
-                  : darkMode
-                    ? 'text-zinc-500 border-transparent hover:text-zinc-300 hover:bg-white/[0.02] hover:border-white/[0.03]'
-                    : 'text-slate-500 border-transparent hover:text-slate-700 hover:bg-slate-100 hover:border-slate-200'
-              )}
-              title={sidebarCollapsed ? item.label : undefined}
-            >
-              <div className="relative">
-                <item.icon className={cn('flex-shrink-0 transition-all duration-200', sidebarCollapsed ? 'w-[18px] h-[18px]' : 'w-4 h-4')} />
-                {/* Active indicator dot */}
-                {isActive && (
-                  <div className={cn('absolute -right-1 -top-1 w-1.5 h-1.5 rounded-full animate-glow-pulse', accent.glow)} />
-                )}
+      {/* + New button */}
+      <div className="px-2 pt-3 pb-1">
+        <NavLink
+          to="/sql"
+          className={cn(
+            'flex items-center gap-2 rounded-lg font-medium transition-all',
+            sidebarCollapsed ? 'justify-center p-2.5' : 'px-3 py-2',
+            darkMode
+              ? 'bg-amber-400/10 border border-amber-400/20 text-amber-400 hover:bg-amber-400/15'
+              : 'bg-amber-500 border border-amber-600 text-white hover:bg-amber-600'
+          )}
+          title={sidebarCollapsed ? 'New Query' : undefined}
+        >
+          <Plus className={cn('flex-shrink-0', sidebarCollapsed ? 'w-[18px] h-[18px]' : 'w-4 h-4')} />
+          {!sidebarCollapsed && <span className="text-[13px]">New</span>}
+        </NavLink>
+      </div>
+
+      {/* Nav sections */}
+      <nav className="flex-1 py-1 px-2 overflow-y-auto">
+        {sections.map((section, si) => (
+          <div key={si} className={si > 0 ? 'mt-3' : ''}>
+            {section.title && !sidebarCollapsed && (
+              <div className={cn(
+                'px-3 py-1.5 text-2xs font-semibold uppercase tracking-wider',
+                darkMode ? 'text-zinc-600' : 'text-slate-400'
+              )}>
+                {section.title}
               </div>
-              {!sidebarCollapsed && (
-                <span className="text-[13px] font-medium truncate tracking-[-0.01em]">{item.label}</span>
-              )}
-            </NavLink>
-          )
-        })}
+            )}
+            {section.title && sidebarCollapsed && (
+              <div className={cn('mx-2 my-1 h-px', darkMode ? 'bg-white/[0.04]' : 'bg-slate-200')} />
+            )}
+            <div className="space-y-0.5">
+              {section.items.map(item => {
+                const isActive = item.to === '/'
+                  ? location.pathname === '/'
+                  : location.pathname.startsWith(item.to)
+                const accent = accentMap[item.accent]
+                return (
+                  <NavLink
+                    key={item.to}
+                    to={item.to}
+                    className={cn(
+                      'group flex items-center gap-2.5 rounded-lg transition-all duration-200 border',
+                      sidebarCollapsed ? 'justify-center p-2.5' : 'px-3 py-2',
+                      isActive
+                        ? darkMode ? accent.active : `text-amber-700 bg-amber-50 border-amber-200`
+                        : darkMode
+                          ? 'text-zinc-500 border-transparent hover:text-zinc-300 hover:bg-white/[0.02] hover:border-white/[0.03]'
+                          : 'text-slate-500 border-transparent hover:text-slate-700 hover:bg-slate-100 hover:border-slate-200'
+                    )}
+                    title={sidebarCollapsed ? item.label : undefined}
+                  >
+                    <div className="relative">
+                      <item.icon className={cn('flex-shrink-0 transition-all duration-200', sidebarCollapsed ? 'w-[18px] h-[18px]' : 'w-4 h-4')} />
+                      {isActive && (
+                        <div className={cn('absolute -right-1 -top-1 w-1.5 h-1.5 rounded-full', accent.glow)} />
+                      )}
+                    </div>
+                    {!sidebarCollapsed && (
+                      <span className="text-[13px] font-medium truncate tracking-[-0.01em]">{item.label}</span>
+                    )}
+                  </NavLink>
+                )
+              })}
+            </div>
+          </div>
+        ))}
       </nav>
 
       {/* Theme + Collapse toggles */}
