@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from 'react'
+import { useState, useEffect, useMemo, useCallback } from 'react'
 import { useLocation } from 'react-router-dom'
 import { Card } from '../components/ui/Card'
 import { Button } from '../components/ui/Button'
@@ -12,14 +12,14 @@ import { EmptyState } from '../components/ui/EmptyState'
 import { StatusDot } from '../components/ui/StatusDot'
 import { Tooltip } from '../components/ui/Tooltip'
 import { cn, formatNumber, formatDuration } from '../lib/utils'
-import { getStreamStatus, getStreamEvents, ingestStream, getPipelines, createPipeline, deletePipeline, getConnections } from '../api/client'
-import type { StreamingMetrics, StreamEvent, StreamingPipeline, ConnectionEntry } from '../types'
+import { getStreamStatus, getStreamEvents, ingestStream, getPipelines, createPipeline, deletePipeline, getConnections, getS3Configs, startPipeline, stopPipeline } from '../api/client'
+import type { StreamingMetrics, StreamEvent, StreamingPipeline, ConnectionEntry, S3Config } from '../types'
 import {
   Radio, Activity, Zap, Clock, Plus, Play, Trash2, ArrowRightLeft,
   Gauge, Waves, Server, GitMerge, Database, ArrowDown, ArrowRight,
   Shield, RefreshCw, Settings, Eye, AlertTriangle,
   Search, ChevronDown, ChevronRight, Copy, MoreVertical, CheckCircle2,
-  XCircle, Beaker,
+  XCircle, Beaker, FolderOpen, HardDrive, Camera, Square,
 } from 'lucide-react'
 import toast from 'react-hot-toast'
 
@@ -47,6 +47,32 @@ const EVENT_TYPE_COLORS: Record<string, string> = {
   search: 'bg-indigo-400/10 text-indigo-400 border-indigo-400/20',
 }
 
+type SinkType = 'iceberg' | 's3_new' | 's3_existing'
+
+interface PipelineForm {
+  name: string
+  source_type: string
+  sink_table: string
+  transform_sql: string
+  broker: string
+  topic: string
+  connection_id: string
+  collection: string
+  full_document: string
+  sink_type: SinkType
+  s3_config_name: string
+  s3_path: string
+  s3_existing_table: string
+  initial_snapshot: boolean
+}
+
+const EMPTY_FORM: PipelineForm = {
+  name: '', source_type: 'kafka', sink_table: '', transform_sql: '',
+  broker: '', topic: '', connection_id: '', collection: '', full_document: 'updateLookup',
+  sink_type: 'iceberg', s3_config_name: '', s3_path: '', s3_existing_table: '',
+  initial_snapshot: false,
+}
+
 export function Streaming() {
   const location = useLocation()
   const [tab, setTab] = useState('overview')
@@ -55,10 +81,11 @@ export function Streaming() {
   const [pipelines, setPipelines] = useState<StreamingPipeline[]>([])
   const [createOpen, setCreateOpen] = useState(false)
   const [selectedPipeline, setSelectedPipeline] = useState<string | null>(null)
-  const [form, setForm] = useState({ name: '', source_type: 'kafka', sink_table: '', transform_sql: '', broker: '', topic: '', connection_id: '', collection: '', full_document: 'updateLookup' })
+  const [form, setForm] = useState<PipelineForm>({ ...EMPTY_FORM })
 
-  // MongoDB connections for CDC pipeline creation
-  const [mongoConnections, setMongoConnections] = useState<ConnectionEntry[]>([])
+  // Connections and S3 configs for auto-populate
+  const [allConnections, setAllConnections] = useState<ConnectionEntry[]>([])
+  const [s3Configs, setS3Configs] = useState<S3Config[]>([])
 
   // Event tab state
   const [expandedEvent, setExpandedEvent] = useState<number | null>(null)
@@ -68,6 +95,24 @@ export function Streaming() {
 
   // Pipeline action menu
   const [pipelineMenu, setPipelineMenu] = useState<string | null>(null)
+
+  // Derived connection lists
+  const mongoConnections = useMemo(() => allConnections.filter(c => c.conn_type === 'mongodb' || c.conn_type === 'cdc_mongodb'), [allConnections])
+  const pgConnections = useMemo(() => allConnections.filter(c => c.conn_type === 'postgres' || c.conn_type === 'postgresql'), [allConnections])
+
+  // Collections from selected connection
+  const selectedConnTables = useMemo(() => {
+    if (!form.connection_id) return []
+    const conn = allConnections.find(c => c.id === form.connection_id)
+    return conn?.tables || []
+  }, [form.connection_id, allConnections])
+
+  // S3 tables from selected S3 config
+  const selectedS3Tables = useMemo(() => {
+    if (!form.s3_config_name) return []
+    const cfg = s3Configs.find(c => c.name === form.s3_config_name)
+    return cfg?.tables || []
+  }, [form.s3_config_name, s3Configs])
 
   // Auto-open create modal when navigated with SQL from SQL Editor
   useEffect(() => {
@@ -80,13 +125,38 @@ export function Streaming() {
     }
   }, [location.state])
 
-  const loadAll = () => {
+  const loadAll = useCallback(() => {
     getStreamStatus().then(r => { if (r?.metrics) setMetrics(r.metrics) }).catch(() => {})
     getStreamEvents(100).then(r => setEvents(r.events || [])).catch(() => {})
     getPipelines().then(r => setPipelines(r.pipelines || [])).catch(() => {})
-    getConnections().then(r => setMongoConnections((r.connections || []).filter(c => c.conn_type === 'mongodb' || c.conn_type === 'cdc_mongodb'))).catch(() => {})
-  }
-  useEffect(loadAll, [])
+    getConnections().then(r => setAllConnections(r.connections || [])).catch(() => {})
+    getS3Configs().then(r => setS3Configs(r.configs || [])).catch(() => {})
+  }, [])
+  useEffect(loadAll, [loadAll])
+
+  // Auto-select first connection when source type changes
+  useEffect(() => {
+    if (form.source_type === 'mongodb-cdc' && mongoConnections.length > 0 && !form.connection_id) {
+      const first = mongoConnections[0]
+      setForm(f => ({ ...f, connection_id: first.id, name: f.name || `${first.database}-cdc` }))
+    }
+    if (form.source_type === 'postgres-cdc' && pgConnections.length > 0 && !form.connection_id) {
+      const first = pgConnections[0]
+      setForm(f => ({
+        ...f,
+        connection_id: first.id,
+        broker: `${first.host}:${first.port}`,
+        name: f.name || `${first.database}-cdc`,
+      }))
+    }
+  }, [form.source_type, mongoConnections, pgConnections, form.connection_id])
+
+  // Auto-populate S3 config when switching to S3 sink
+  useEffect(() => {
+    if ((form.sink_type === 's3_new' || form.sink_type === 's3_existing') && s3Configs.length > 0 && !form.s3_config_name) {
+      setForm(f => ({ ...f, s3_config_name: s3Configs[0].name }))
+    }
+  }, [form.sink_type, s3Configs, form.s3_config_name])
 
   const handleIngest = async () => {
     try {
@@ -96,9 +166,21 @@ export function Streaming() {
     } catch (e) { toast.error((e as Error).message) }
   }
 
+  const resolveSinkTable = (): string => {
+    if (form.sink_type === 'iceberg') return form.sink_table
+    if (form.sink_type === 's3_existing') return form.s3_existing_table || form.sink_table
+    if (form.sink_type === 's3_new') {
+      const cfg = s3Configs.find(c => c.name === form.s3_config_name)
+      if (cfg && form.s3_path) return `s3://${cfg.bucket}/${form.s3_path}`
+      return form.sink_table
+    }
+    return form.sink_table
+  }
+
   const handleCreate = async () => {
     if (!form.name.trim()) { toast.error('Pipeline name is required'); return }
-    if (!form.sink_table.trim()) { toast.error('Sink table is required'); return }
+    const sinkTable = resolveSinkTable()
+    if (!sinkTable.trim()) { toast.error('Sink target is required'); return }
     if (form.source_type === 'kafka') {
       if (!form.broker.trim()) { toast.error('Broker address is required for Kafka'); return }
       if (!form.topic.trim()) { toast.error('Topic is required'); return }
@@ -107,17 +189,27 @@ export function Streaming() {
       if (!form.connection_id && !form.broker.trim()) { toast.error('Select a MongoDB connection or enter a URI'); return }
       if (!form.collection.trim()) { toast.error('Collection name is required'); return }
     }
-    if (form.source_type === 'postgres-cdc' && !form.broker.trim()) { toast.error('Host is required for Postgres CDC'); return }
+    if (form.source_type === 'postgres-cdc' && !form.connection_id && !form.broker.trim()) { toast.error('Select a Postgres connection or enter host'); return }
     try {
       let sourceConfig: Record<string, unknown>
       if (form.source_type === 'mongodb-cdc') {
-        const selectedConn = mongoConnections.find(c => c.id === form.connection_id)
+        const selectedConn = allConnections.find(c => c.id === form.connection_id)
         sourceConfig = {
           connection_id: form.connection_id || undefined,
           database: selectedConn?.database || form.broker.split('/').pop() || '',
           collection: form.collection,
           full_document: form.full_document,
+          initial_snapshot: form.initial_snapshot,
           ...(form.broker ? { broker: form.broker } : {}),
+        }
+      } else if (form.source_type === 'postgres-cdc') {
+        const selectedConn = allConnections.find(c => c.id === form.connection_id)
+        sourceConfig = {
+          connection_id: form.connection_id || undefined,
+          broker: selectedConn ? `${selectedConn.host}:${selectedConn.port}` : form.broker,
+          topic: form.topic || form.collection,
+          database: selectedConn?.database || '',
+          initial_snapshot: form.initial_snapshot,
         }
       } else {
         sourceConfig = { broker: form.broker, topic: form.topic }
@@ -127,11 +219,27 @@ export function Streaming() {
         source_type: form.source_type,
         source_config: sourceConfig,
         transform_sql: form.transform_sql || undefined,
-        sink_table: form.sink_table,
+        sink_table: sinkTable,
       })
       toast.success('Pipeline created')
       setCreateOpen(false)
-      setForm({ name: '', source_type: 'kafka', sink_table: '', transform_sql: '', broker: '', topic: '', connection_id: '', collection: '', full_document: 'updateLookup' })
+      setForm({ ...EMPTY_FORM })
+      loadAll()
+    } catch (e) { toast.error((e as Error).message) }
+  }
+
+  const handleStartPipeline = async (id: string) => {
+    try {
+      await startPipeline(id)
+      toast.success('Pipeline started')
+      loadAll()
+    } catch (e) { toast.error((e as Error).message) }
+  }
+
+  const handleStopPipeline = async (id: string) => {
+    try {
+      await stopPipeline(id)
+      toast.success('Pipeline stopped')
       loadAll()
     } catch (e) { toast.error((e as Error).message) }
   }
@@ -168,8 +276,6 @@ export function Streaming() {
     }
     return statuses
   }, [pipelines])
-
-  const activePipeline = pipelines.find(p => p.id === selectedPipeline)
 
   return (
     <div className="flex h-full animate-fade-in">
@@ -247,6 +353,7 @@ export function Streaming() {
                 />
               ) : pipelines.map(p => {
                 const cfg = SOURCE_TYPE_CONFIG[p.source_type as keyof typeof SOURCE_TYPE_CONFIG] || SOURCE_TYPE_CONFIG.kafka
+                const isRunning = p.status === 'running'
                 return (
                   <button
                     key={p.id}
@@ -275,6 +382,26 @@ export function Streaming() {
                         </div>
                       </div>
                       <div className="flex items-center gap-1 flex-shrink-0" onClick={e => e.stopPropagation()}>
+                        {/* Start / Stop button */}
+                        {isRunning ? (
+                          <Tooltip content="Stop pipeline" position="left">
+                            <button
+                              onClick={() => handleStopPipeline(p.id)}
+                              className="p-1.5 rounded-lg hover:bg-rose-400/10 transition-colors"
+                            >
+                              <Square className="w-4 h-4 text-rose-400" />
+                            </button>
+                          </Tooltip>
+                        ) : (
+                          <Tooltip content="Start pipeline" position="left">
+                            <button
+                              onClick={() => handleStartPipeline(p.id)}
+                              className="p-1.5 rounded-lg hover:bg-emerald-400/10 transition-colors"
+                            >
+                              <Play className="w-4 h-4 text-emerald-400" />
+                            </button>
+                          </Tooltip>
+                        )}
                         <div className="relative">
                           <button
                             onClick={() => setPipelineMenu(pipelineMenu === p.id ? null : p.id)}
@@ -535,7 +662,7 @@ export function Streaming() {
                       <Database className="w-5 h-5 text-amber-400" />
                     </div>
                     <span className="text-zinc-300 font-medium">Sink</span>
-                    <span className="text-2xs text-zinc-600">Iceberg Table</span>
+                    <span className="text-2xs text-zinc-600">Iceberg / S3</span>
                   </div>
                   <ArrowRight className="w-5 h-5 text-zinc-600" />
                   <div className="flex flex-col items-center gap-1.5 w-28">
@@ -552,18 +679,19 @@ export function Streaming() {
         </div>
       </div>
 
-      {/* Create pipeline modal */}
-      <Modal open={createOpen} onClose={() => setCreateOpen(false)} title="Create Streaming Pipeline" width="max-w-xl">
-        <div className="space-y-4">
+      {/* ═══════════════ Create pipeline modal ═══════════════ */}
+      <Modal open={createOpen} onClose={() => setCreateOpen(false)} title="Create Streaming Pipeline" width="max-w-2xl">
+        <div className="space-y-4 max-h-[75vh] overflow-y-auto pr-1">
           <Input label="Pipeline Name" value={form.name} onChange={e => setForm(f => ({ ...f, name: e.target.value }))} placeholder="events-pipeline" />
-          {/* Source type cards */}
+
+          {/* ── Source Type ── */}
           <div>
             <span className="text-xs font-medium text-zinc-400 mb-2 block">Source Type</span>
             <div className="grid grid-cols-3 gap-2">
               {Object.entries(SOURCE_TYPE_CONFIG).map(([key, cfg]) => (
                 <button
                   key={key}
-                  onClick={() => setForm(f => ({ ...f, source_type: key }))}
+                  onClick={() => setForm(f => ({ ...f, source_type: key, connection_id: '', broker: '', topic: '', collection: '' }))}
                   className={cn(
                     'p-3 rounded-lg border text-left transition-all',
                     form.source_type === key
@@ -578,25 +706,55 @@ export function Streaming() {
               ))}
             </div>
           </div>
-          {/* Source-specific fields */}
-          {form.source_type === 'mongodb-cdc' ? (
+
+          {/* ── Source Config: MongoDB CDC ── */}
+          {form.source_type === 'mongodb-cdc' && (
             <>
-              {/* MongoDB connection selector */}
-              {mongoConnections.length > 0 && (
+              {mongoConnections.length > 0 ? (
                 <Select
                   label="MongoDB Connection"
                   value={form.connection_id}
-                  onChange={e => setForm(f => ({ ...f, connection_id: e.target.value }))}
+                  onChange={e => {
+                    const conn = mongoConnections.find(c => c.id === e.target.value)
+                    setForm(f => ({
+                      ...f,
+                      connection_id: e.target.value,
+                      collection: '',
+                      name: f.name || (conn ? `${conn.database}-cdc` : ''),
+                    }))
+                  }}
                   options={[
                     { value: '', label: 'Manual URI (below)' },
-                    ...mongoConnections.map(c => ({ value: c.id, label: `${c.name} (${c.host}/${c.database})` })),
+                    ...mongoConnections.map(c => ({
+                      value: c.id,
+                      label: `${c.name} — ${c.host}/${c.database} (${c.tables?.length || 0} collections)`,
+                    })),
                   ]}
                 />
+              ) : (
+                <div className="flex items-center gap-2 p-3 rounded-lg bg-amber-400/[0.04] border border-amber-400/10">
+                  <AlertTriangle className="w-4 h-4 text-amber-400/60 flex-shrink-0" />
+                  <p className="text-2xs text-amber-400/60">No MongoDB connections found. Add one in Data Sources first, or enter a URI below.</p>
+                </div>
               )}
               {!form.connection_id && (
                 <Input label="MongoDB URI *" value={form.broker} onChange={e => setForm(f => ({ ...f, broker: e.target.value }))} placeholder="mongodb://localhost:27017/mydb" />
               )}
-              <Input label="Collection *" value={form.collection} onChange={e => setForm(f => ({ ...f, collection: e.target.value }))} placeholder="events (or * for all collections)" />
+              {/* Collection picker — auto-populated from connection */}
+              {selectedConnTables.length > 0 ? (
+                <Select
+                  label="Collection *"
+                  value={form.collection}
+                  onChange={e => setForm(f => ({ ...f, collection: e.target.value }))}
+                  options={[
+                    { value: '', label: 'Select a collection...' },
+                    { value: '*', label: '* (All collections)' },
+                    ...selectedConnTables.map(t => ({ value: t, label: t })),
+                  ]}
+                />
+              ) : (
+                <Input label="Collection *" value={form.collection} onChange={e => setForm(f => ({ ...f, collection: e.target.value }))} placeholder="events (or * for all collections)" />
+              )}
               <Select
                 label="Full Document Mode"
                 value={form.full_document}
@@ -607,22 +765,226 @@ export function Streaming() {
                   { value: 'whenAvailable', label: 'whenAvailable' },
                 ]}
               />
+              {/* Initial snapshot toggle */}
+              <label className="flex items-center gap-3 p-3 rounded-lg bg-white/[0.02] border border-white/[0.04] cursor-pointer hover:bg-white/[0.03] transition-colors">
+                <input
+                  type="checkbox"
+                  checked={form.initial_snapshot}
+                  onChange={e => setForm(f => ({ ...f, initial_snapshot: e.target.checked }))}
+                  className="w-4 h-4 rounded border-zinc-600 bg-white/[0.05] accent-amber-400"
+                />
+                <div className="flex-1">
+                  <div className="flex items-center gap-2">
+                    <Camera className="w-3.5 h-3.5 text-amber-400/70" />
+                    <span className="text-xs font-medium text-zinc-200">Initial Snapshot</span>
+                  </div>
+                  <p className="text-2xs text-zinc-500 mt-0.5 ml-5.5">Copy all existing documents before starting change stream. Ensures no data is missed.</p>
+                </div>
+              </label>
               <div className="flex items-start gap-2 p-3 rounded-lg bg-emerald-400/[0.04] border border-emerald-400/10">
                 <Database className="w-4 h-4 text-emerald-400/60 flex-shrink-0 mt-0.5" />
                 <p className="text-2xs text-emerald-400/60 leading-relaxed">
-                  MongoDB CDC uses change streams to capture inserts, updates, and deletes in real-time. The "updateLookup" mode includes the full document for update events.
+                  MongoDB CDC uses change streams to capture inserts, updates, and deletes in real-time. The &quot;updateLookup&quot; mode includes the full document for update events.
                 </p>
               </div>
             </>
-          ) : (
+          )}
+
+          {/* ── Source Config: Postgres CDC ── */}
+          {form.source_type === 'postgres-cdc' && (
             <>
-              <Input label="Broker / URI *" value={form.broker} onChange={e => setForm(f => ({ ...f, broker: e.target.value }))} placeholder={form.source_type === 'kafka' ? 'localhost:9092' : 'localhost:5432'} />
-              <Input label="Topic / Collection *" value={form.topic} onChange={e => setForm(f => ({ ...f, topic: e.target.value }))} placeholder={form.source_type === 'kafka' ? 'events' : 'public.users'} />
+              {pgConnections.length > 0 ? (
+                <Select
+                  label="Postgres Connection"
+                  value={form.connection_id}
+                  onChange={e => {
+                    const conn = pgConnections.find(c => c.id === e.target.value)
+                    setForm(f => ({
+                      ...f,
+                      connection_id: e.target.value,
+                      broker: conn ? `${conn.host}:${conn.port}` : f.broker,
+                      topic: '',
+                      name: f.name || (conn ? `${conn.database}-cdc` : ''),
+                    }))
+                  }}
+                  options={[
+                    { value: '', label: 'Manual host (below)' },
+                    ...pgConnections.map(c => ({
+                      value: c.id,
+                      label: `${c.name} — ${c.host}:${c.port}/${c.database} (${c.tables?.length || 0} tables)`,
+                    })),
+                  ]}
+                />
+              ) : (
+                <div className="flex items-center gap-2 p-3 rounded-lg bg-amber-400/[0.04] border border-amber-400/10">
+                  <AlertTriangle className="w-4 h-4 text-amber-400/60 flex-shrink-0" />
+                  <p className="text-2xs text-amber-400/60">No Postgres connections found. Add one in Data Sources first, or enter host below.</p>
+                </div>
+              )}
+              {!form.connection_id && (
+                <Input label="Host:Port *" value={form.broker} onChange={e => setForm(f => ({ ...f, broker: e.target.value }))} placeholder="localhost:5432" />
+              )}
+              {/* Table picker — auto-populated from connection */}
+              {selectedConnTables.length > 0 ? (
+                <Select
+                  label="Table / Slot *"
+                  value={form.topic}
+                  onChange={e => setForm(f => ({ ...f, topic: e.target.value }))}
+                  options={[
+                    { value: '', label: 'Select a table...' },
+                    ...selectedConnTables.map(t => ({ value: t, label: t })),
+                  ]}
+                />
+              ) : (
+                <Input label="Table / Slot *" value={form.topic} onChange={e => setForm(f => ({ ...f, topic: e.target.value }))} placeholder="public.users" />
+              )}
+              {/* Initial snapshot toggle */}
+              <label className="flex items-center gap-3 p-3 rounded-lg bg-white/[0.02] border border-white/[0.04] cursor-pointer hover:bg-white/[0.03] transition-colors">
+                <input
+                  type="checkbox"
+                  checked={form.initial_snapshot}
+                  onChange={e => setForm(f => ({ ...f, initial_snapshot: e.target.checked }))}
+                  className="w-4 h-4 rounded border-zinc-600 bg-white/[0.05] accent-amber-400"
+                />
+                <div className="flex-1">
+                  <div className="flex items-center gap-2">
+                    <Camera className="w-3.5 h-3.5 text-amber-400/70" />
+                    <span className="text-xs font-medium text-zinc-200">Initial Snapshot</span>
+                  </div>
+                  <p className="text-2xs text-zinc-500 mt-0.5 ml-5.5">Copy all existing rows before starting logical replication. Ensures complete data.</p>
+                </div>
+              </label>
             </>
           )}
-          <Input label="Sink Table (Iceberg) *" value={form.sink_table} onChange={e => setForm(f => ({ ...f, sink_table: e.target.value }))} placeholder="iceberg://warehouse.events" />
-          <Textarea label="Transform SQL (optional)" value={form.transform_sql} onChange={e => setForm(f => ({ ...f, transform_sql: e.target.value }))} placeholder="SELECT event_type, data, timestamp FROM source WHERE event_type != 'heartbeat'" />
-          <div className="flex justify-end gap-2 pt-2">
+
+          {/* ── Source Config: Kafka ── */}
+          {form.source_type === 'kafka' && (
+            <>
+              <Input label="Broker Address *" value={form.broker} onChange={e => setForm(f => ({ ...f, broker: e.target.value }))} placeholder="localhost:9092" />
+              <Input label="Topic *" value={form.topic} onChange={e => setForm(f => ({ ...f, topic: e.target.value }))} placeholder="events" />
+            </>
+          )}
+
+          {/* ── Sink Target ── */}
+          <div>
+            <span className="text-xs font-medium text-zinc-400 mb-2 block">Sink Target</span>
+            <div className="grid grid-cols-3 gap-2">
+              {([
+                { key: 'iceberg' as SinkType, label: 'Iceberg Table', icon: Database, color: 'text-amber-400', desc: 'Append to Iceberg table' },
+                { key: 's3_existing' as SinkType, label: 'S3 Existing Path', icon: FolderOpen, color: 'text-cyan-400', desc: 'Write to existing S3 location' },
+                { key: 's3_new' as SinkType, label: 'S3 New Path', icon: HardDrive, color: 'text-violet-400', desc: 'Create new path in S3 bucket' },
+              ]).map(sink => (
+                <button
+                  key={sink.key}
+                  onClick={() => setForm(f => ({ ...f, sink_type: sink.key }))}
+                  className={cn(
+                    'p-3 rounded-lg border text-left transition-all',
+                    form.sink_type === sink.key
+                      ? 'bg-white/[0.06] border-amber-400/30'
+                      : 'bg-white/[0.02] border-white/[0.04] hover:border-white/[0.08]'
+                  )}
+                >
+                  <sink.icon className={cn('w-4 h-4 mb-1', sink.color)} />
+                  <p className="text-xs font-medium text-zinc-200">{sink.label}</p>
+                  <p className="text-2xs text-zinc-600 mt-0.5">{sink.desc}</p>
+                </button>
+              ))}
+            </div>
+          </div>
+
+          {/* Sink-specific fields */}
+          {form.sink_type === 'iceberg' && (
+            <Input
+              label="Sink Table (Iceberg) *"
+              value={form.sink_table}
+              onChange={e => setForm(f => ({ ...f, sink_table: e.target.value }))}
+              placeholder="iceberg://warehouse.events"
+            />
+          )}
+
+          {form.sink_type === 's3_existing' && (
+            <>
+              {s3Configs.length > 0 ? (
+                <>
+                  <Select
+                    label="S3 Bucket"
+                    value={form.s3_config_name}
+                    onChange={e => setForm(f => ({ ...f, s3_config_name: e.target.value, s3_existing_table: '' }))}
+                    options={s3Configs.map(c => ({
+                      value: c.name,
+                      label: `${c.name} — s3://${c.bucket} (${c.tables?.length || 0} tables)`,
+                    }))}
+                  />
+                  {selectedS3Tables.length > 0 ? (
+                    <Select
+                      label="Existing Table / Path *"
+                      value={form.s3_existing_table}
+                      onChange={e => setForm(f => ({ ...f, s3_existing_table: e.target.value }))}
+                      options={[
+                        { value: '', label: 'Select a table...' },
+                        ...selectedS3Tables.map(t => ({ value: t, label: t })),
+                      ]}
+                    />
+                  ) : (
+                    <div className="text-2xs text-zinc-500 p-3 bg-white/[0.02] rounded-lg border border-white/[0.04]">
+                      No tables discovered in this bucket yet. Tables appear after S3 scan completes.
+                    </div>
+                  )}
+                </>
+              ) : (
+                <div className="flex items-center gap-2 p-3 rounded-lg bg-amber-400/[0.04] border border-amber-400/10">
+                  <AlertTriangle className="w-4 h-4 text-amber-400/60 flex-shrink-0" />
+                  <p className="text-2xs text-amber-400/60">No S3 buckets connected. Add one in Data Sources first.</p>
+                </div>
+              )}
+            </>
+          )}
+
+          {form.sink_type === 's3_new' && (
+            <>
+              {s3Configs.length > 0 ? (
+                <>
+                  <Select
+                    label="S3 Bucket"
+                    value={form.s3_config_name}
+                    onChange={e => setForm(f => ({ ...f, s3_config_name: e.target.value }))}
+                    options={s3Configs.map(c => ({
+                      value: c.name,
+                      label: `${c.name} — s3://${c.bucket}`,
+                    }))}
+                  />
+                  <Input
+                    label="Path in Bucket *"
+                    value={form.s3_path}
+                    onChange={e => setForm(f => ({ ...f, s3_path: e.target.value }))}
+                    placeholder="warehouse/cdc/events"
+                  />
+                  {form.s3_config_name && form.s3_path && (
+                    <div className="text-2xs font-mono text-zinc-400 p-2 bg-white/[0.02] rounded border border-white/[0.04]">
+                      <span className="text-zinc-600">Sink:</span>{' '}
+                      s3://{s3Configs.find(c => c.name === form.s3_config_name)?.bucket}/{form.s3_path}
+                    </div>
+                  )}
+                </>
+              ) : (
+                <div className="flex items-center gap-2 p-3 rounded-lg bg-amber-400/[0.04] border border-amber-400/10">
+                  <AlertTriangle className="w-4 h-4 text-amber-400/60 flex-shrink-0" />
+                  <p className="text-2xs text-amber-400/60">No S3 buckets connected. Add one in Data Sources first.</p>
+                </div>
+              )}
+            </>
+          )}
+
+          {/* Transform SQL */}
+          <Textarea
+            label="Transform SQL (optional)"
+            value={form.transform_sql}
+            onChange={e => setForm(f => ({ ...f, transform_sql: e.target.value }))}
+            placeholder="SELECT event_type, data, timestamp FROM source WHERE event_type != 'heartbeat'"
+          />
+
+          {/* Action buttons */}
+          <div className="flex justify-end gap-2 pt-2 sticky bottom-0 bg-navy-950/95 backdrop-blur pb-1">
             <Button variant="secondary" size="sm" onClick={() => setCreateOpen(false)}>Cancel</Button>
             <Button variant="primary" size="sm" onClick={handleCreate}>Create Pipeline</Button>
           </div>
