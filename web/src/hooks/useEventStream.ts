@@ -43,9 +43,21 @@ export interface S3ScanEvent {
   sync_status: string
 }
 
+/** Real-time pipeline event pushed when CDC batches arrive. */
+export interface PipelineEventData {
+  pipeline_id: string
+  pipeline_name: string
+  status: string
+  events_processed: number
+  batch_rows: number
+  source_type: string
+  sink_table: string
+}
+
 type SyncListener = (event: ConnectionSyncEvent) => void
 type TrinoScanListener = (event: TrinoScanEvent) => void
 type S3ScanListener = (event: S3ScanEvent) => void
+type PipelineEventListener = (event: PipelineEventData) => void
 
 /**
  * Hook that maintains a single SSE connection to `/api/v1/events`.
@@ -63,6 +75,7 @@ export function useEventStream() {
   const syncListenersRef = useRef<Set<SyncListener>>(new Set())
   const trinoScanListenersRef = useRef<Set<TrinoScanListener>>(new Set())
   const s3ScanListenersRef = useRef<Set<S3ScanListener>>(new Set())
+  const pipelineListenersRef = useRef<Set<PipelineEventListener>>(new Set())
   const sourceRef = useRef<EventSource | null>(null)
 
   // Allow components to subscribe to connection sync events
@@ -81,6 +94,12 @@ export function useEventStream() {
   const onS3Scan = useCallback((listener: S3ScanListener) => {
     s3ScanListenersRef.current.add(listener)
     return () => { s3ScanListenersRef.current.delete(listener) }
+  }, [])
+
+  // Allow components to subscribe to real-time pipeline events (CDC batch counts)
+  const onPipelineEvent = useCallback((listener: PipelineEventListener) => {
+    pipelineListenersRef.current.add(listener)
+    return () => { pipelineListenersRef.current.delete(listener) }
   }, [])
 
   useEffect(() => {
@@ -126,6 +145,13 @@ export function useEventStream() {
         } catch { /* ignore parse errors */ }
       })
 
+      es.addEventListener('pipeline_event', (e) => {
+        try {
+          const data: PipelineEventData = JSON.parse(e.data)
+          pipelineListenersRef.current.forEach(fn => fn(data))
+        } catch { /* ignore parse errors */ }
+      })
+
       es.onerror = () => {
         setConnected(false)
         es.close()
@@ -146,6 +172,6 @@ export function useEventStream() {
   // Memoize the return value so context consumers don't re-render
   // unless the actual status/connected values change
   return useMemo(() => ({
-    status, connected, onConnectionSync, onTrinoScan, onS3Scan
-  }), [status, connected, onConnectionSync, onTrinoScan, onS3Scan])
+    status, connected, onConnectionSync, onTrinoScan, onS3Scan, onPipelineEvent
+  }), [status, connected, onConnectionSync, onTrinoScan, onS3Scan, onPipelineEvent])
 }

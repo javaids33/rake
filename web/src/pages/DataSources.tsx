@@ -4,10 +4,11 @@ import { Button } from '../components/ui/Button'
 import { Badge } from '../components/ui/Badge'
 import { Input } from '../components/ui/Input'
 import { Textarea, Select } from '../components/ui/Input'
-import { Modal } from '../components/ui/Modal'
+import { Drawer } from '../components/ui/Drawer'
 import { Tabs } from '../components/ui/Tabs'
 import { EmptyState } from '../components/ui/EmptyState'
 import { StatusDot } from '../components/ui/StatusDot'
+import { useNavigate } from 'react-router-dom'
 import { cn } from '../lib/utils'
 import { getConnections, addConnection, updateConnection, deleteConnection, getS3Configs, addS3Config, updateS3Config, deleteS3Config, uploadFile, registerTable, testConnection, importConnections, exportConnections } from '../api/client'
 import { useServerEvents } from '../components/layout/Shell'
@@ -196,6 +197,7 @@ export function DataSources() {
 
   // Dynamic config form
   const [configValues, setConfigValues] = useState<Record<string, string>>({})
+  const navigate = useNavigate()
   const [connName, setConnName] = useState('')
   const [regPath, setRegPath] = useState('')
 
@@ -338,11 +340,11 @@ export function DataSources() {
       setConnections(prev => prev.map(c => {
         if (c.id !== event.id) return c
         if (event.sync_status === 'ready') {
-          toast.success(`${event.table_count} tables discovered`, { id: `sync-${event.id}` })
+          toast.success(`${c.name}: ${event.table_count} tables ready to query`, { id: `sync-${event.id}`, duration: 5000 })
           return { ...c, tables: event.tables, sync_status: 'ready', sync_error: undefined }
         }
         if (event.sync_status === 'error') {
-          toast.error(`Sync failed: ${event.sync_error}`, { id: `sync-${event.id}` })
+          toast.error(`${c.name}: ${event.sync_error || 'Connection failed'}`, { id: `sync-${event.id}`, duration: 8000 })
           return { ...c, sync_status: 'error', sync_error: event.sync_error || 'Unknown error' }
         }
         // Still syncing — update tables if growing
@@ -688,6 +690,26 @@ export function DataSources() {
                       )}
                     </div>
                     <p className="text-2xs font-mono text-zinc-500 mt-0.5">{c.host}:{c.port}/{c.database}</p>
+                    {/* Discovery progress bar */}
+                    {isSyncing && (
+                      <div className="mt-2">
+                        <div className="flex items-center justify-between mb-1">
+                          <span className="text-2xs text-amber-400/80">Discovering tables...</span>
+                          {c.tables.length > 0 && (
+                            <span className="text-2xs font-mono text-amber-400/60">{c.tables.length} found</span>
+                          )}
+                        </div>
+                        <div className={cn("h-1.5 rounded-full overflow-hidden", darkMode ? "bg-white/[0.06]" : "bg-slate-200")}>
+                          <div
+                            className="h-full rounded-full bg-amber-400 transition-all duration-700"
+                            style={{
+                              width: c.tables.length > 0 ? `${Math.min(95, c.tables.length * 5)}%` : '30%',
+                              animation: 'pulse 2s ease-in-out infinite',
+                            }}
+                          />
+                        </div>
+                      </div>
+                    )}
                     {isSyncError && c.sync_error && (
                       <p className="text-2xs text-red-400/80 mt-1">{c.sync_error}</p>
                     )}
@@ -729,8 +751,33 @@ export function DataSources() {
                         {c.tables.length > 5 && <Badge className="text-2xs">+{c.tables.length - 5} more</Badge>}
                       </div>
                     )}
+                    {/* Quick actions */}
+                    {c.status === 'connected' && c.tables.length > 0 && (
+                      <div className="flex items-center gap-1.5 mt-2">
+                        <button
+                          onClick={() => navigate('/sql', { state: { sql: `SELECT * FROM ${c.tables[0]} LIMIT 100;` } })}
+                          className="flex items-center gap-1 px-2 py-1 rounded bg-amber-400/10 border border-amber-400/20 text-amber-400 text-2xs font-medium hover:bg-amber-400/15 transition-colors"
+                        >
+                          <Zap className="w-2.5 h-2.5" /> Query
+                        </button>
+                        {(c.conn_type === 'mongodb' || c.conn_type === 'postgres') && (
+                          <button
+                            onClick={() => navigate('/streaming', { state: { connectionId: c.id, sourceType: c.conn_type === 'mongodb' ? 'mongodb-cdc' : 'postgres-cdc' } })}
+                            className="flex items-center gap-1 px-2 py-1 rounded bg-cyan-400/10 border border-cyan-400/20 text-cyan-400 text-2xs font-medium hover:bg-cyan-400/15 transition-colors"
+                          >
+                            <Radio className="w-2.5 h-2.5" /> CDC Pipeline
+                          </button>
+                        )}
+                        <button
+                          onClick={() => navigate('/catalog')}
+                          className="flex items-center gap-1 px-2 py-1 rounded bg-white/[0.04] border border-white/[0.06] text-zinc-400 text-2xs font-medium hover:bg-white/[0.06] transition-colors"
+                        >
+                          <Database className="w-2.5 h-2.5" /> Catalog
+                        </button>
+                      </div>
+                    )}
                   </div>
-                  <div className="flex items-center gap-1">
+                  <div className="flex items-center gap-1 flex-shrink-0">
                     <Button variant="ghost" size="sm" onClick={() => handleEditConnection(c)}>
                       <Pencil className="w-3.5 h-3.5 text-zinc-500" />
                     </Button>
@@ -1016,7 +1063,7 @@ export function DataSources() {
       )}
 
       {/* Dynamic connector config modal */}
-      <Modal open={connModal} onClose={() => { setConnModal(false); setEditingConnection(null); setEditingS3(null) }} title={selectedConnector ? (editingConnection || editingS3 ? `Edit ${selectedConnector.name} Connection` : `Connect ${selectedConnector.name}`) : 'Connect'} width="max-w-lg">
+      <Drawer open={connModal} onClose={() => { setConnModal(false); setEditingConnection(null); setEditingS3(null) }} title={selectedConnector ? (editingConnection || editingS3 ? `Edit ${selectedConnector.name}` : `Connect ${selectedConnector.name}`) : 'Connect'} subtitle="Configure and test your data source connection" width="max-w-lg">
         {selectedConnector && (
           <div className="space-y-4">
             {/* Wizard step indicator */}
@@ -1177,7 +1224,7 @@ export function DataSources() {
               </div>
             )}
 
-            <div className="flex justify-end gap-2 pt-2">
+            <div className="flex justify-end gap-2 pt-4 border-t border-white/[0.06] mt-4">
               <Button variant="secondary" size="sm" onClick={() => setConnModal(false)}>Cancel</Button>
               <Button variant="primary" size="sm" onClick={handleConnect} icon={<Link2 className="w-3.5 h-3.5" />}>
                 {editingConnection || editingS3 ? 'Update' : selectedConnector.category === 'format' ? 'Register' : 'Connect'}
@@ -1185,10 +1232,10 @@ export function DataSources() {
             </div>
           </div>
         )}
-      </Modal>
+      </Drawer>
 
       {/* Register Path Modal */}
-      <Modal open={regModal} onClose={() => setRegModal(false)} title="Register Table from Path">
+      <Drawer open={regModal} onClose={() => setRegModal(false)} title="Register Table from Path" subtitle="Register a file or directory as a queryable table" width="max-w-md">
         <div className="space-y-4">
           <Input label="File Path" value={regPath} onChange={e => setRegPath(e.target.value)} placeholder="/path/to/data.csv or s3://bucket/prefix" hint="Supports CSV, Parquet, JSON, Avro, ORC, Iceberg, Delta, Hudi, Lance" />
 
@@ -1213,12 +1260,12 @@ export function DataSources() {
             </div>
           </div>
 
-          <div className="flex justify-end gap-2 pt-2">
+          <div className="flex justify-end gap-2 pt-4 border-t border-white/[0.06] mt-4">
             <Button variant="secondary" size="sm" onClick={() => setRegModal(false)}>Cancel</Button>
             <Button variant="primary" size="sm" onClick={handleRegister} icon={<FileText className="w-3.5 h-3.5" />}>Register</Button>
           </div>
         </div>
-      </Modal>
+      </Drawer>
     </div>
   )
 }

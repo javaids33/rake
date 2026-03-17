@@ -92,6 +92,8 @@ export const startPipeline = (id: string) =>
   request<{ status: string; id: string; source_type: string }>(`/api/v1/streaming/pipelines/${id}/start`, { method: 'POST' })
 export const stopPipeline = (id: string) =>
   request<{ status: string; id: string }>(`/api/v1/streaming/pipelines/${id}/stop`, { method: 'POST' })
+export const importPipelines = (pipelines: Array<Partial<StreamingPipeline>>) =>
+  request<{ status: string; count: number; pipelines: Array<{ id: string; name: string }> }>('/api/v1/streaming/pipelines/import', { method: 'POST', body: JSON.stringify(pipelines) })
 
 // Scheduler
 export const getSchedules = () => request<{ schedules: ScheduledJob[] }>('/api/v1/schedules')

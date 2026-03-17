@@ -15,6 +15,7 @@ import { Input } from '../components/ui/Input'
 import { cn, formatDuration, QUERY_TYPE_COLORS } from '../lib/utils'
 import { executeSql, explainSql, estimateQuery, compareSql, getTables, getTableSchema, getConnections, getS3Configs, trinoBrowse, trinoColumns, trinoRefresh } from '../api/client'
 import { useWebSocket } from '../hooks/useWebSocket'
+import { useServerEvents } from '../components/layout/Shell'
 import type { SqlResponse } from '../types'
 import type { SqlCompareResponse } from '../api/client'
 import type { ChartType, ColumnSchema, ConnectionEntry, S3Config, ExplainResponse, QueryEstimateResponse } from '../types'
@@ -206,6 +207,24 @@ export function SqlEditorPage() {
     }).catch(() => {})
     getS3Configs().then(r => setS3Configs(r.configs || [])).catch(() => {})
   }, [])
+
+  // Refresh connections when background sync completes (SSE)
+  const { onConnectionSync } = useServerEvents()
+  useEffect(() => {
+    const unsub = onConnectionSync((event) => {
+      if (event.sync_status === 'ready' || event.sync_status === 'error') {
+        // Refresh the full connections list so sidebar shows updated tables
+        getConnections().then(r => setConnections(r.connections || [])).catch(() => {})
+        // Also refresh registered tables for the catalog tab
+        getTables().then(async r => {
+          const raw = r.tables || []
+          const names: string[] = raw.map((t: string | { name: string }) => typeof t === 'string' ? t : t.name)
+          setTables(names)
+        }).catch(() => {})
+      }
+    })
+    return unsub
+  }, [onConnectionSync])
 
   const handleCancelQuery = useCallback(() => {
     if (activeQueryIdRef.current) {

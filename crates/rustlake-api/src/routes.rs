@@ -663,6 +663,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/api/v1/streaming/pipelines/{id}", delete(delete_pipeline))
         .route("/api/v1/streaming/pipelines/{id}/start", post(start_pipeline))
         .route("/api/v1/streaming/pipelines/{id}/stop", post(stop_pipeline))
+        .route("/api/v1/streaming/pipelines/import", post(import_pipelines))
         // S3/Object storage config
         .route(
             "/api/v1/storage/s3",
@@ -759,7 +760,22 @@ async fn event_stream(
         // Track last-seen sync_progress so we can push trino_scan events on change
         let mut last_progress: std::collections::HashMap<String, String> = std::collections::HashMap::new();
 
+        // Subscribe to real-time pipeline events from CDC consumers
+        let mut pipeline_rx = state.pipeline_events_tx.subscribe();
+
         loop {
+            // ── Drain any pending pipeline events (non-blocking) ─────
+            loop {
+                match pipeline_rx.try_recv() {
+                    Ok(evt) => {
+                        let payload = serde_json::to_string(&evt).unwrap_or_default();
+                        yield Ok(Event::default().event("pipeline_event").data(payload));
+                    }
+                    Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                    Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => break,
+                    Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+                }
+            }
             // ── Build combined status payload ─────────────────────
             let total_queries = state.query_count.load(Ordering::Relaxed);
             let uptime = state.start_time.elapsed().as_secs();
@@ -870,7 +886,37 @@ async fn event_stream(
                 }
             }
 
-            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            // ── Check pipeline status changes ──────────────────────
+            {
+                let pipelines = state.streaming_pipelines.read().await;
+                for p in pipelines.iter() {
+                    if p.status == "running" || p.status == "snapshotting" {
+                        let key = format!("pipe:{}", p.id);
+                        let current = format!("{}:{}:{}", p.status, p.events_processed, p.sink_table);
+                        let prev = last_progress.get(&key).map(|s| s.as_str()).unwrap_or("");
+                        if current != prev {
+                            last_progress.insert(key, current);
+                            let event = serde_json::json!({
+                                "id": p.id,
+                                "name": p.name,
+                                "status": p.status,
+                                "events_processed": p.events_processed,
+                                "source_type": p.source_type,
+                                "sink_table": p.sink_table,
+                            });
+                            yield Ok(Event::default().event("pipeline_status").data(event.to_string()));
+                        }
+                    }
+                }
+            }
+
+            // Adaptive sleep: 2s when pipelines are running (for real-time event counts), 10s otherwise
+            let has_running = {
+                let pipelines = state.streaming_pipelines.read().await;
+                pipelines.iter().any(|p| p.status == "running" || p.status == "snapshotting")
+            };
+            let sleep_secs = if has_running { 2 } else { 10 };
+            tokio::time::sleep(std::time::Duration::from_secs(sleep_secs)).await;
         }
     };
 
@@ -3201,37 +3247,90 @@ async fn discover_and_register_tables(
         "mongodb" => {
             use futures::stream::{self, StreamExt};
             let mongo_params = build_mongo_params(req);
+            tracing::info!(
+                host = %mongo_params.host, database = %mongo_params.database,
+                auth_method = ?mongo_params.auth_method,
+                "MongoDB discovery: connecting and listing collections"
+            );
             let collections = crate::mongodb_conn::connect_and_discover(&mongo_params)
                 .await?;
+            tracing::info!(
+                collections = collections.len(),
+                names = ?collections.iter().take(10).collect::<Vec<_>>(),
+                "MongoDB discovery: {} collections found",
+                collections.len()
+            );
+
             let ctx = state.ctx.read().await;
             let mongo_schema = crate::providers::ensure_schema(ctx.datafusion_ctx(), "mongo")
                 .map_err(|e| e.to_string())?;
 
-            // Fetch collections in parallel (up to 8 concurrent)
-            let results: Vec<Option<(String, arrow::record_batch::RecordBatch)>> = stream::iter(collections.iter().cloned())
-                .map(|coll_name| {
+            // Fetch collections in parallel (up to 4 concurrent to avoid overwhelming large DBs)
+            let total = collections.len();
+            let fetch_start = Instant::now();
+            let results: Vec<Option<(String, arrow::record_batch::RecordBatch)>> = stream::iter(collections.iter().cloned().enumerate())
+                .map(|(i, coll_name)| {
                     let params = mongo_params.clone();
+                    let total = total;
                     async move {
+                        tracing::info!(
+                            collection = %coll_name,
+                            progress = format!("{}/{}", i + 1, total),
+                            "MongoDB discovery: fetching collection"
+                        );
+                        let start = Instant::now();
                         match crate::mongodb_conn::fetch_collection_as_arrow(&params, &coll_name).await {
-                            Ok(batch) => Some((coll_name, batch)),
-                            Err(_) => None,
+                            Ok(batch) => {
+                                tracing::info!(
+                                    collection = %coll_name,
+                                    rows = batch.num_rows(),
+                                    columns = batch.num_columns(),
+                                    elapsed_ms = start.elapsed().as_millis(),
+                                    "MongoDB discovery: collection fetched OK"
+                                );
+                                Some((coll_name, batch))
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    collection = %coll_name,
+                                    error = %e,
+                                    elapsed_ms = start.elapsed().as_millis(),
+                                    "MongoDB discovery: collection fetch FAILED — skipping"
+                                );
+                                None
+                            }
                         }
                     }
                 })
-                .buffer_unordered(8)
+                .buffer_unordered(4)
                 .collect()
                 .await;
+
+            let fetch_ms = fetch_start.elapsed().as_millis();
+            let fetched_count = results.iter().filter(|r| r.is_some()).count();
+            tracing::info!(
+                fetched = fetched_count, skipped = total - fetched_count,
+                elapsed_ms = fetch_ms,
+                "MongoDB discovery: fetch phase complete"
+            );
 
             let mut mongo_registered = Vec::new();
             for (coll_name, batch) in results.into_iter().flatten() {
                 let schema = batch.schema();
                 if let Ok(mem_table) = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]) {
                     let df_name = format!("mongo.{}", coll_name);
-                    if mongo_schema.register_table(coll_name, std::sync::Arc::new(mem_table)).is_ok() {
+                    if mongo_schema.register_table(coll_name.clone(), std::sync::Arc::new(mem_table)).is_ok() {
                         mongo_registered.push(df_name);
+                    } else {
+                        tracing::warn!(collection = %coll_name, "MongoDB discovery: failed to register table in DataFusion");
                     }
                 }
             }
+            tracing::info!(
+                registered = mongo_registered.len(),
+                tables = ?mongo_registered.iter().take(10).collect::<Vec<_>>(),
+                "MongoDB discovery: registration complete"
+            );
             Ok(mongo_registered)
         }
         "trino" | "presto" => {
@@ -3474,9 +3573,19 @@ pub(crate) async fn reconnect_saved_connections(state: Arc<AppState>) {
             }
             "mongodb" => {
                 let mongo_params = build_mongo_params_from_entry(&conn, &password);
+                tracing::info!(
+                    conn_id = %conn.id, name = %conn.name,
+                    host = %mongo_params.host, database = %mongo_params.database,
+                    has_aws_key = mongo_params.aws_access_key.is_some(),
+                    "MongoDB reconnect: starting"
+                );
                 match crate::mongodb_conn::connect_and_discover(&mongo_params).await {
                     Ok(collections) => {
-                        // Register each collection as a MemTable in the "mongo" schema
+                        tracing::info!(
+                            conn_id = %conn.id, collections = collections.len(),
+                            "MongoDB reconnect: {} collections found, starting fetch",
+                            collections.len()
+                        );
                         let ctx = state.ctx.read().await;
                         let df_ctx = ctx.datafusion_ctx();
                         let mongo_schema = match crate::providers::ensure_schema(df_ctx, "mongo") {
@@ -3490,18 +3599,40 @@ pub(crate) async fn reconnect_saved_connections(state: Arc<AppState>) {
                         };
 
                         let mut mongo_registered = Vec::new();
-                        for coll_name in &collections {
-                            if let Ok(batch) = crate::mongodb_conn::fetch_collection_as_arrow(&mongo_params, coll_name).await {
-                                let schema = batch.schema();
-                                if let Ok(mem_table) = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]) {
-                                    let df_name = format!("mongo.{}", coll_name);
-                                    if mongo_schema.register_table(coll_name.clone(), std::sync::Arc::new(mem_table)).is_ok() {
-                                        mongo_registered.push(df_name);
+                        let mut mongo_errors = 0u32;
+                        for (i, coll_name) in collections.iter().enumerate() {
+                            tracing::debug!(
+                                collection = %coll_name,
+                                progress = format!("{}/{}", i + 1, collections.len()),
+                                "MongoDB reconnect: fetching collection"
+                            );
+                            match crate::mongodb_conn::fetch_collection_as_arrow(&mongo_params, coll_name).await {
+                                Ok(batch) => {
+                                    let schema = batch.schema();
+                                    if let Ok(mem_table) = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]) {
+                                        let df_name = format!("mongo.{}", coll_name);
+                                        if mongo_schema.register_table(coll_name.clone(), std::sync::Arc::new(mem_table)).is_ok() {
+                                            mongo_registered.push(df_name);
+                                        }
                                     }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        collection = %coll_name, error = %e,
+                                        "MongoDB reconnect: collection fetch failed, skipping"
+                                    );
+                                    mongo_errors += 1;
                                 }
                             }
                         }
                         drop(ctx);
+
+                        tracing::info!(
+                            conn_id = %conn.id,
+                            registered = mongo_registered.len(),
+                            errors = mongo_errors,
+                            "MongoDB reconnect: complete"
+                        );
 
                         state.update_connection_entry(&conn.id, |c| {
                             c.status = "connected".to_string();
@@ -3511,7 +3642,6 @@ pub(crate) async fn reconnect_saved_connections(state: Arc<AppState>) {
                             c.sync_error = None;
                         }).await;
                         reconnected += 1;
-                        tracing::info!(conn_id = %conn.id, "MongoDB reconnected");
                     }
                     Err(e) => {
                         state.update_connection_entry(&conn.id, |c| {
@@ -5603,6 +5733,9 @@ async fn start_pipeline(
                 // Spawn background task to consume CDC events
                 let state_clone = state.clone();
                 let pipeline_id = id.clone();
+                let pipeline_name = pipeline.name.clone();
+                let pipeline_sink = pipeline.sink_table.clone();
+                let pipeline_source = pipeline.source_type.clone();
                 tokio::spawn(async move {
                     let mut total_events: u64 = 0;
                     while let Some(result) = rx.recv().await {
@@ -5624,6 +5757,20 @@ async fn start_pipeline(
                                 {
                                     p.events_processed = total_events;
                                 }
+                                drop(pipelines);
+
+                                // Broadcast real-time event to SSE listeners
+                                let _ = state_clone.pipeline_events_tx.send(
+                                    crate::state::PipelineEvent {
+                                        pipeline_id: pipeline_id.clone(),
+                                        pipeline_name: pipeline_name.clone(),
+                                        status: "running".to_string(),
+                                        events_processed: total_events,
+                                        batch_rows: rows,
+                                        source_type: pipeline_source.clone(),
+                                        sink_table: pipeline_sink.clone(),
+                                    }
+                                );
                             }
                             Err(e) => {
                                 tracing::error!(
@@ -5702,6 +5849,43 @@ async fn stop_pipeline(
             }),
         ))
     }
+}
+
+/// POST /api/v1/streaming/pipelines/import — bulk import pipelines from JSON.
+async fn import_pipelines(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<Vec<CreatePipelineRequest>>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let mut created = Vec::new();
+    for p_req in req {
+        if p_req.name.is_empty() || p_req.sink_table.is_empty() {
+            continue;
+        }
+        let id = Uuid::new_v4().to_string();
+        let pipeline = crate::state::StreamingPipeline {
+            id: id.clone(),
+            name: p_req.name.clone(),
+            source_type: p_req.source_type,
+            source_config: p_req.source_config,
+            transform_sql: p_req.transform_sql,
+            sink_table: p_req.sink_table,
+            status: "created".to_string(),
+            events_processed: 0,
+            created_at: Utc::now(),
+        };
+        #[cfg(feature = "duckdb")]
+        if let Some(ref db) = state.state_db {
+            let _ = db.upsert_pipeline(&pipeline);
+        }
+        state.streaming_pipelines.write().await.push(pipeline);
+        created.push(serde_json::json!({ "id": id, "name": p_req.name }));
+    }
+    tracing::info!(count = created.len(), "Imported {} pipelines", created.len());
+    Ok(Json(serde_json::json!({
+        "status": "imported",
+        "count": created.len(),
+        "pipelines": created,
+    })))
 }
 
 // ── S3 / Object Storage Config Handlers ─────────────────────────────

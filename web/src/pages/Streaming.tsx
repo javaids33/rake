@@ -1,5 +1,5 @@
 import { useState, useEffect, useMemo, useCallback } from 'react'
-import { useLocation } from 'react-router-dom'
+import { useLocation, useNavigate } from 'react-router-dom'
 import { Card } from '../components/ui/Card'
 import { Button } from '../components/ui/Button'
 import { Badge } from '../components/ui/Badge'
@@ -13,6 +13,7 @@ import { StatusDot } from '../components/ui/StatusDot'
 import { Tooltip } from '../components/ui/Tooltip'
 import { cn, formatNumber, formatDuration } from '../lib/utils'
 import { useDraftForm } from '../hooks/useDraftForm'
+import { useServerEvents } from '../components/layout/Shell'
 import { getStreamStatus, getStreamEvents, ingestStream, getPipelines, createPipeline, deletePipeline, getConnections, getS3Configs, startPipeline, stopPipeline } from '../api/client'
 import type { StreamingMetrics, StreamEvent, StreamingPipeline, ConnectionEntry, S3Config } from '../types'
 import {
@@ -20,7 +21,7 @@ import {
   Gauge, Waves, Server, GitMerge, Database, ArrowDown, ArrowRight,
   Shield, RefreshCw, Settings, Eye, AlertTriangle,
   Search, ChevronDown, ChevronRight, Copy, MoreVertical, CheckCircle2,
-  XCircle, Beaker, FolderOpen, HardDrive, Camera, Square,
+  XCircle, Beaker, FolderOpen, HardDrive, Camera, Square, Terminal,
 } from 'lucide-react'
 import toast from 'react-hot-toast'
 
@@ -76,6 +77,7 @@ const EMPTY_FORM: PipelineForm = {
 
 export function Streaming() {
   const location = useLocation()
+  const navigate = useNavigate()
   const [tab, setTab] = useState('overview')
   const [metrics, setMetrics] = useState<StreamingMetrics | null>(null)
   const [events, setEvents] = useState<StreamEvent[]>([])
@@ -134,6 +136,18 @@ export function Streaming() {
     getS3Configs().then(r => setS3Configs(r.configs || [])).catch(() => {})
   }, [])
   useEffect(loadAll, [loadAll])
+
+  // Real-time pipeline event updates via SSE
+  const { onPipelineEvent } = useServerEvents()
+  useEffect(() => {
+    const unsub = onPipelineEvent((event) => {
+      setPipelines(prev => prev.map(p => {
+        if (p.id !== event.pipeline_id) return p
+        return { ...p, events_processed: event.events_processed, status: event.status }
+      }))
+    })
+    return unsub
+  }, [onPipelineEvent])
 
   // Auto-select first connection when source type changes
   useEffect(() => {
@@ -433,29 +447,69 @@ export function Streaming() {
                     </div>
                     {/* Expanded detail */}
                     {selectedPipeline === p.id && (
-                      <div className="mt-4 pt-4 border-t border-white/[0.04] grid grid-cols-3 gap-4">
-                        <div>
-                          <p className="text-2xs text-zinc-500 mb-1 font-semibold">Source Config</p>
-                          <div className="space-y-1 text-2xs font-mono text-zinc-400">
-                            {Object.entries(p.source_config || {}).map(([k, v]) => (
-                              <div key={k}><span className="text-zinc-600">{k}:</span> {String(v)}</div>
-                            ))}
-                            {Object.keys(p.source_config || {}).length === 0 && <span className="text-zinc-600">No config</span>}
+                      <div className="mt-4 pt-4 border-t border-white/[0.04]">
+                        {/* Quick actions row */}
+                        <div className="flex items-center gap-2 mb-4">
+                          <Tooltip content={`SELECT * FROM ${p.sink_table.replace('iceberg://', '')} LIMIT 100`} position="bottom">
+                            <button
+                              onClick={(e) => { e.stopPropagation(); navigate('/sql', { state: { sql: `SELECT * FROM ${p.sink_table.replace('iceberg://', '').replace('s3://', '')} LIMIT 100;` } }) }}
+                              className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-amber-400/10 border border-amber-400/20 text-amber-400 text-2xs font-medium hover:bg-amber-400/15 transition-colors"
+                            >
+                              <Terminal className="w-3 h-3" /> Query Sink
+                            </button>
+                          </Tooltip>
+                          <Tooltip content="View in catalog" position="bottom">
+                            <button
+                              onClick={(e) => { e.stopPropagation(); navigate('/catalog') }}
+                              className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-cyan-400/10 border border-cyan-400/20 text-cyan-400 text-2xs font-medium hover:bg-cyan-400/15 transition-colors"
+                            >
+                              <Database className="w-3 h-3" /> Catalog
+                            </button>
+                          </Tooltip>
+                          <Tooltip content="Schedule as recurring job" position="bottom">
+                            <button
+                              onClick={(e) => { e.stopPropagation(); navigate('/scheduler', { state: { name: p.name, jobType: 'pipeline' } }) }}
+                              className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-violet-400/10 border border-violet-400/20 text-violet-400 text-2xs font-medium hover:bg-violet-400/15 transition-colors"
+                            >
+                              <Clock className="w-3 h-3" /> Schedule
+                            </button>
+                          </Tooltip>
+                          {!!(p.source_config as Record<string, unknown>)?.connection_id && (
+                            <Tooltip content="View source connection" position="bottom">
+                              <button
+                                onClick={(e) => { e.stopPropagation(); navigate('/sources') }}
+                                className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-white/[0.04] border border-white/[0.06] text-zinc-400 text-2xs font-medium hover:bg-white/[0.06] transition-colors"
+                              >
+                                <Server className="w-3 h-3" /> Source
+                              </button>
+                            </Tooltip>
+                          )}
+                        </div>
+
+                        <div className="grid grid-cols-3 gap-4">
+                          <div>
+                            <p className="text-2xs text-zinc-500 mb-1 font-semibold">Source Config</p>
+                            <div className="space-y-1 text-2xs font-mono text-zinc-400">
+                              {Object.entries(p.source_config || {}).map(([k, v]) => (
+                                <div key={k}><span className="text-zinc-600">{k}:</span> {String(v)}</div>
+                              ))}
+                              {Object.keys(p.source_config || {}).length === 0 && <span className="text-zinc-600">No config</span>}
+                            </div>
                           </div>
-                        </div>
-                        <div>
-                          <p className="text-2xs text-zinc-500 mb-1 font-semibold">Transform SQL</p>
-                          <pre className="text-2xs font-mono text-zinc-400 bg-white/[0.02] rounded p-2 overflow-x-auto">
-                            {p.transform_sql || 'None (passthrough)'}
-                          </pre>
-                        </div>
-                        <div>
-                          <p className="text-2xs text-zinc-500 mb-1 font-semibold">Pipeline Status</p>
-                          <div className="space-y-1.5 text-2xs">
-                            <div className="flex justify-between"><span className="text-zinc-500">Status</span><StatusDot status={p.status === 'running' ? 'healthy' : 'idle'} label={p.status} /></div>
-                            <div className="flex justify-between"><span className="text-zinc-500">Events</span><span className="font-mono text-zinc-300">{formatNumber(p.events_processed)}</span></div>
-                            <div className="flex justify-between"><span className="text-zinc-500">Delivery</span><span className="text-emerald-400">Exactly Once</span></div>
-                            <div className="flex justify-between"><span className="text-zinc-500">Created</span><span className="text-zinc-400">{p.created_at ? new Date(p.created_at).toLocaleDateString() : '-'}</span></div>
+                          <div>
+                            <p className="text-2xs text-zinc-500 mb-1 font-semibold">Transform SQL</p>
+                            <pre className="text-2xs font-mono text-zinc-400 bg-white/[0.02] rounded p-2 overflow-x-auto">
+                              {p.transform_sql || 'None (passthrough)'}
+                            </pre>
+                          </div>
+                          <div>
+                            <p className="text-2xs text-zinc-500 mb-1 font-semibold">Pipeline Status</p>
+                            <div className="space-y-1.5 text-2xs">
+                              <div className="flex justify-between"><span className="text-zinc-500">Status</span><StatusDot status={p.status === 'running' ? 'healthy' : 'idle'} label={p.status} /></div>
+                              <div className="flex justify-between"><span className="text-zinc-500">Events</span><span className="font-mono text-zinc-300">{formatNumber(p.events_processed)}</span></div>
+                              <div className="flex justify-between"><span className="text-zinc-500">Delivery</span><span className="text-emerald-400">Exactly Once</span></div>
+                              <div className="flex justify-between"><span className="text-zinc-500">Created</span><span className="text-zinc-400">{p.created_at ? new Date(p.created_at).toLocaleDateString() : '-'}</span></div>
+                            </div>
                           </div>
                         </div>
                       </div>

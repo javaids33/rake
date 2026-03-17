@@ -652,9 +652,24 @@ pub struct AppState {
     pub credential_store: crate::credential_store::CredentialStore,
     /// Active MongoDB CDC sources keyed by pipeline ID.
     pub cdc_sources: RwLock<std::collections::HashMap<String, std::sync::Arc<crate::mongodb_cdc::MongoDbCdcSource>>>,
+    /// Broadcast channel for real-time pipeline event updates.
+    /// The CDC consumer sends updates here, and the SSE loop reads them to push to the UI immediately.
+    pub pipeline_events_tx: tokio::sync::broadcast::Sender<PipelineEvent>,
     /// DuckDB-backed persistent state store for connections, tables, and pipelines.
     #[cfg(feature = "duckdb")]
     pub state_db: Option<crate::state_db::StateDb>,
+}
+
+/// Real-time pipeline event pushed through SSE when CDC events arrive.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct PipelineEvent {
+    pub pipeline_id: String,
+    pub pipeline_name: String,
+    pub status: String,
+    pub events_processed: u64,
+    pub batch_rows: u64,
+    pub source_type: String,
+    pub sink_table: String,
 }
 
 impl AppState {
@@ -731,6 +746,7 @@ impl AppState {
             read_only_tables: RwLock::new(std::collections::HashSet::new()),
             credential_store: crate::credential_store::CredentialStore::new(),
             cdc_sources: RwLock::new(std::collections::HashMap::new()),
+            pipeline_events_tx: tokio::sync::broadcast::channel(256).0,
             #[cfg(feature = "duckdb")]
             state_db: match crate::state_db::StateDb::open("rustlake_state.duckdb") {
                 Ok(db) => {
@@ -794,6 +810,7 @@ impl AppState {
             read_only_tables: RwLock::new(std::collections::HashSet::new()),
             credential_store: crate::credential_store::CredentialStore::new(),
             cdc_sources: RwLock::new(std::collections::HashMap::new()),
+            pipeline_events_tx: tokio::sync::broadcast::channel(256).0,
             #[cfg(feature = "duckdb")]
             state_db: match crate::state_db::StateDb::open("rustlake_state.duckdb") {
                 Ok(db) => {
