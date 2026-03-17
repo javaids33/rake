@@ -887,7 +887,31 @@ export function DataSources() {
                     { name: 'my-mysql', conn_type: 'mysql', host: 'localhost', port: 3306, database: 'mydb', username: 'user', password: 'pass' },
                     { name: 'my-mongodb', conn_type: 'mongodb', host: 'localhost', port: 27017, database: 'mydb', username: 'user', password: 'pass', auth_method: 'scram' },
                     { name: 'my-trino', conn_type: 'trino', host: 'localhost', port: 8080, database: 'postgresql', username: 'admin', password: '' },
-                    { name: 'atlas-mongo', conn_type: 'mongodb', host: 'cluster0.abc123.mongodb.net', port: 27017, database: 'mydb', username: '', password: '', auth_method: 'aws_iam', aws_access_key: 'AKIA...', aws_secret_key: 'secret...', aws_session_token: '' },
+                    {
+                      name: 'atlas-mongo-iam',
+                      conn_type: 'mongodb',
+                      host: 'cluster0.abc123.mongodb.net',
+                      port: 27017,
+                      database: 'mydb',
+                      username: '',
+                      password: '',
+                      auth_method: 'aws_iam',
+                      aws_access_key: 'AKIAIOSFODNN7EXAMPLE',
+                      aws_secret_key: 'wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY',
+                      aws_session_token: 'FwoGZXIvYXdzEBYaDHqa0AP...(your session token)',
+                      aws_region: 'us-east-1'
+                    },
+                    {
+                      name: 'atlas-connection-string',
+                      conn_type: 'mongodb',
+                      host: 'cluster0.abc123.mongodb.net',
+                      port: 27017,
+                      database: 'mydb',
+                      username: '',
+                      password: '',
+                      auth_method: 'connection_string',
+                      connection_string: 'mongodb+srv://user:pass@cluster0.abc123.mongodb.net/mydb?retryWrites=true&w=majority'
+                    },
                   ],
                   s3_configs: [
                     { name: 'my-warehouse', endpoint: 'https://s3.amazonaws.com', access_key: 'AKIA...', secret_key: 'secret...', bucket: 'my-iceberg-warehouse', region: 'us-east-1' },
@@ -979,7 +1003,7 @@ export function DataSources() {
             <textarea
               className="w-full rounded-lg bg-navy-900/80 border border-white/[0.06] text-xs text-cyan-300 font-mono p-3 placeholder-zinc-600 focus:outline-none focus:ring-1 focus:ring-amber-400/20 resize-y"
               style={{ minHeight: 400 }}
-              placeholder={'{\n  "connections": [\n    { "name": "my-postgres", "conn_type": "postgres", ... }\n  ],\n  "s3_configs": [\n    { "name": "my-warehouse", "endpoint": "https://s3.amazonaws.com", ... }\n  ]\n}'}
+              placeholder={'{\n  "connections": [\n    { "name": "my-db", "conn_type": "postgres", "host": "...", "port": 5432, "database": "...", "username": "...", "password": "..." },\n    { "name": "atlas", "conn_type": "mongodb", "host": "cluster.mongodb.net", "database": "...", "auth_method": "aws_iam", "aws_access_key": "AKIA...", "aws_secret_key": "...", "aws_session_token": "..." }\n  ],\n  "s3_configs": [\n    { "name": "warehouse", "endpoint": "https://s3.amazonaws.com", "access_key": "...", "secret_key": "...", "bucket": "...", "region": "us-east-1" }\n  ]\n}'}
               value={importJson}
               onChange={e => {
                 setImportJson(e.target.value)
