@@ -826,6 +826,31 @@ async fn main() -> anyhow::Result<()> {
                 }
             }
         }
+
+        // ── Migrate JSONL → DuckDB (one-time) ──
+        if let Some(ref db) = state.state_db {
+            // Migrate connections
+            let connections = state.connections.get_mut();
+            if !connections.is_empty() {
+                if let Err(e) = db.migrate_connections(connections) {
+                    tracing::warn!(error = %e, "JSONL → DuckDB migration failed for connections");
+                }
+            }
+            // Migrate jobs
+            let jobs = state.scheduled_jobs.get_mut();
+            if !jobs.is_empty() {
+                if let Err(e) = db.migrate_jobs(jobs) {
+                    tracing::warn!(error = %e, "JSONL → DuckDB migration failed for scheduled_jobs");
+                }
+            }
+            // Migrate transforms
+            let transforms = state.user_transforms.get_mut();
+            if !transforms.is_empty() {
+                if let Err(e) = db.migrate_transforms(transforms) {
+                    tracing::warn!(error = %e, "JSONL → DuckDB migration failed for user_transforms");
+                }
+            }
+        }
     }
 
     let state = Arc::new(state);

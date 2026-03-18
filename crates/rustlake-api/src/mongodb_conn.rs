@@ -256,6 +256,76 @@ pub async fn connect_and_discover(params: &MongoConnParams) -> Result<Vec<String
     Ok(user_collections)
 }
 
+/// Infer schema from a MongoDB collection by sampling a few documents.
+///
+/// Returns an empty RecordBatch with the inferred schema. This is fast —
+/// only reads `sample_size` documents (default 20) to discover all fields.
+/// Used during connection discovery so tables appear immediately in the catalog.
+pub async fn infer_collection_schema(
+    params: &MongoConnParams,
+    collection_name: &str,
+    sample_size: usize,
+) -> Result<RecordBatch, String> {
+    let start = std::time::Instant::now();
+    let client = params.build_client().await?;
+    let db = client.database(&params.database);
+    let collection = db.collection::<Document>(collection_name);
+
+    // Sample a small number of documents for schema inference
+    use futures::TryStreamExt;
+    use mongodb::options::FindOptions;
+    let opts = FindOptions::builder().limit(Some(sample_size as i64)).build();
+    let mut cursor = collection
+        .find(None, Some(opts))
+        .await
+        .map_err(|e| format!("Failed to sample collection '{}': {}", collection_name, e))?;
+
+    let mut docs: Vec<Document> = Vec::new();
+    while let Some(doc) = cursor
+        .try_next()
+        .await
+        .map_err(|e| format!("Failed to read sample doc: {}", e))?
+    {
+        docs.push(doc);
+    }
+
+    let elapsed_ms = start.elapsed().as_millis();
+    tracing::debug!(
+        collection = %collection_name, sampled = docs.len(),
+        elapsed_ms = elapsed_ms, "Schema inferred from sample"
+    );
+
+    if docs.is_empty() {
+        let schema = Schema::new(vec![Field::new("_id", DataType::Utf8, false)]);
+        return Ok(RecordBatch::new_empty(Arc::new(schema)));
+    }
+
+    // Discover schema from sampled documents (union of keys)
+    let mut field_types: Vec<(String, DataType)> = Vec::new();
+    let mut seen_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for doc in &docs {
+        for (key, value) in doc {
+            if key == "_id" { continue; }
+            if !seen_keys.contains(key) {
+                seen_keys.insert(key.clone());
+                field_types.push((key.clone(), bson_to_arrow_type(value)));
+            }
+        }
+    }
+
+    // Sort fields alphabetically for deterministic schema
+    field_types.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let fields: Vec<Field> = field_types.iter()
+        .map(|(name, dtype)| Field::new(name, dtype.clone(), true))
+        .collect();
+    let schema = Arc::new(Schema::new(fields));
+
+    // Return empty batch with correct schema — data fetched on demand via query
+    Ok(RecordBatch::new_empty(schema))
+}
+
 /// Fetch all documents from a MongoDB collection and convert to an Arrow RecordBatch.
 ///
 /// Schema is inferred by sampling the first batch of documents. Fields are discovered
@@ -265,6 +335,7 @@ pub async fn fetch_collection_as_arrow(
     params: &MongoConnParams,
     collection_name: &str,
 ) -> Result<RecordBatch, String> {
+    let start = std::time::Instant::now();
     let client = params.build_client().await?;
 
     let db = client.database(&params.database);
@@ -288,6 +359,12 @@ pub async fn fetch_collection_as_arrow(
             break;
         }
     }
+
+    let elapsed_ms = start.elapsed().as_millis();
+    tracing::info!(
+        collection = %collection_name, docs = docs.len(),
+        elapsed_ms = elapsed_ms, "Full collection fetch complete"
+    );
 
     if docs.is_empty() {
         let schema = Schema::new(vec![Field::new("_id", DataType::Utf8, false)]);

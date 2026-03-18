@@ -26,6 +26,7 @@ import {
   ChevronDown, ChevronRight, GitBranch, Radio, Workflow, Database, Plug, Search, Columns3, MousePointerClick, HardDrive, Trash2, RefreshCw, Layers, Square, Wifi, PanelRightClose, PanelRightOpen,
   Clipboard, Download, Braces, Eye, Activity, Command,
 } from 'lucide-react'
+import toast from 'react-hot-toast'
 
 const chartOptions: Array<{ type: ChartType; icon: React.ReactNode; label: string }> = [
   { type: 'bar', icon: <BarChart3 className="w-3.5 h-3.5" />, label: 'Bar' },
@@ -1078,17 +1079,36 @@ export function SqlEditorPage() {
           {/* Catalog tab */}
           {sidebarTab === 'catalog' && (
             <div className="flex-1 overflow-y-auto">
-              {/* Search filter */}
+              {/* Search filter + global refresh */}
               <div className="px-2 py-2 border-b border-white/[0.03]">
-                <div className="relative">
-                  <Search className="absolute left-2 top-1/2 -translate-y-1/2 w-3 h-3 text-zinc-600" />
-                  <input
-                    type="text"
-                    value={catalogFilter}
-                    onChange={e => setCatalogFilter(e.target.value)}
-                    placeholder="Filter tables..."
-                    className="w-full bg-white/[0.03] border border-white/[0.04] rounded-md pl-7 pr-2 py-1.5 text-2xs text-zinc-300 placeholder:text-zinc-600 focus:outline-none focus:border-amber-400/30"
-                  />
+                <div className="flex items-center gap-1.5">
+                  <div className="relative flex-1">
+                    <Search className="absolute left-2 top-1/2 -translate-y-1/2 w-3 h-3 text-zinc-600" />
+                    <input
+                      type="text"
+                      value={catalogFilter}
+                      onChange={e => setCatalogFilter(e.target.value)}
+                      placeholder="Filter tables..."
+                      className="w-full bg-white/[0.03] border border-white/[0.04] rounded-md pl-7 pr-2 py-1.5 text-2xs text-zinc-300 placeholder:text-zinc-600 focus:outline-none focus:border-amber-400/30"
+                    />
+                  </div>
+                  <Tooltip content="Refresh all connections" position="left">
+                    <button
+                      onClick={() => {
+                        getConnections().then(r => setConnections(r.connections || [])).catch(() => {})
+                        getS3Configs().then(r => setS3Configs(r.configs || [])).catch(() => {})
+                        getTables().then(async r => {
+                          const raw = r.tables || []
+                          const names: string[] = raw.map((t: string | { name: string }) => typeof t === 'string' ? t : t.name)
+                          setTables(names)
+                        }).catch(() => {})
+                        toast.success('Refreshing catalog...')
+                      }}
+                      className="p-1.5 rounded-md hover:bg-white/[0.04] text-zinc-600 hover:text-zinc-300 transition-colors flex-shrink-0"
+                    >
+                      <RefreshCw className="w-3.5 h-3.5" />
+                    </button>
+                  </Tooltip>
                 </div>
               </div>
 
@@ -1263,6 +1283,29 @@ export function SqlEditorPage() {
                     </button>
                     {isExpanded && (
                       <div className="border-l-2 border-l-amber-400/20 ml-4">
+                        {/* Refresh bar */}
+                        <div className="flex items-center gap-2 px-4 py-1 border-b border-white/[0.03]">
+                          <button
+                            onClick={(e) => {
+                              e.stopPropagation()
+                              // Re-fetch connections to get latest tables
+                              getConnections().then(r => setConnections(r.connections || [])).catch(() => {})
+                              getTables().then(async r => {
+                                const raw = r.tables || []
+                                const names: string[] = raw.map((t: string | { name: string }) => typeof t === 'string' ? t : t.name)
+                                setTables(names)
+                              }).catch(() => {})
+                              toast.success(`Refreshing ${conn.name}...`)
+                            }}
+                            className="text-2xs text-zinc-500 hover:text-zinc-300 flex items-center gap-1 transition-colors"
+                          >
+                            <RefreshCw className="w-3 h-3" />
+                            Refresh
+                          </button>
+                          <span className="text-2xs text-zinc-600 ml-auto">
+                            {connTables.length} table{connTables.length !== 1 ? 's' : ''}
+                          </span>
+                        </div>
                         {connTables.length === 0 && (
                           <p className="px-4 py-1.5 text-2xs text-zinc-600 italic">No tables</p>
                         )}

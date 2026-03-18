@@ -101,6 +101,24 @@ impl StateDb {
                 events_processed BIGINT DEFAULT 0,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
+
+            -- Scheduled jobs
+            CREATE TABLE IF NOT EXISTS scheduled_jobs (
+                id TEXT PRIMARY KEY,
+                data TEXT NOT NULL DEFAULT '{}'
+            );
+
+            -- User transforms
+            CREATE TABLE IF NOT EXISTS user_transforms (
+                id TEXT PRIMARY KEY,
+                data TEXT NOT NULL DEFAULT '{}'
+            );
+
+            -- Migration metadata — tracks which JSONL files have been imported
+            CREATE TABLE IF NOT EXISTS _migrations (
+                key TEXT PRIMARY KEY,
+                migrated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
             "
         ).map_err(|e| format!("StateDb schema init: {}", e))?;
         Ok(())
@@ -363,6 +381,86 @@ impl StateDb {
             count("SELECT COUNT(*) FROM s3_configs"),
             count("SELECT COUNT(*) FROM pipelines"),
         )
+    }
+
+    // ── JSONL Migration ─────────────────────────────────────────────
+
+    /// Check if a particular JSONL migration has been completed.
+    pub fn is_migrated(&self, key: &str) -> bool {
+        let db = match self.db.lock() {
+            Ok(db) => db,
+            Err(_) => return false,
+        };
+        db.query_row(
+            "SELECT COUNT(*) FROM _migrations WHERE key = ?",
+            duckdb::params![key],
+            |row| row.get::<_, i64>(0),
+        ).unwrap_or(0) > 0
+    }
+
+    /// Mark a JSONL migration as completed.
+    pub fn mark_migrated(&self, key: &str) -> Result<(), String> {
+        let db = self.db.lock().map_err(|e| e.to_string())?;
+        db.execute(
+            "INSERT OR REPLACE INTO _migrations (key) VALUES (?)",
+            duckdb::params![key],
+        ).map_err(|e| format!("Mark migration '{}': {}", key, e))?;
+        Ok(())
+    }
+
+    /// Migrate scheduled jobs from Vec into DuckDB (stores as JSON blobs).
+    pub fn migrate_jobs(&self, jobs: &[super::state::ScheduledJob]) -> Result<usize, String> {
+        if self.is_migrated("scheduled_jobs") { return Ok(0); }
+        let db = self.db.lock().map_err(|e| e.to_string())?;
+        let mut count = 0;
+        let mut stmt = db.prepare("INSERT OR REPLACE INTO scheduled_jobs (id, data) VALUES (?, ?)")
+            .map_err(|e| e.to_string())?;
+        for job in jobs {
+            let json = serde_json::to_string(job).unwrap_or_default();
+            stmt.execute(duckdb::params![job.id, json]).map_err(|e| e.to_string())?;
+            count += 1;
+        }
+        drop(stmt);
+        drop(db);
+        self.mark_migrated("scheduled_jobs")?;
+        tracing::info!(count, "Migrated scheduled_jobs from JSONL → DuckDB");
+        Ok(count)
+    }
+
+    /// Migrate user transforms from Vec into DuckDB (stores as JSON blobs).
+    pub fn migrate_transforms(&self, transforms: &[super::state::UserTransform]) -> Result<usize, String> {
+        if self.is_migrated("user_transforms") { return Ok(0); }
+        let db = self.db.lock().map_err(|e| e.to_string())?;
+        let mut count = 0;
+        let mut stmt = db.prepare("INSERT OR REPLACE INTO user_transforms (id, data) VALUES (?, ?)")
+            .map_err(|e| e.to_string())?;
+        for t in transforms {
+            let json = serde_json::to_string(t).unwrap_or_default();
+            let id = t.name.clone();
+            stmt.execute(duckdb::params![id, json]).map_err(|e| e.to_string())?;
+            count += 1;
+        }
+        drop(stmt);
+        drop(db);
+        self.mark_migrated("user_transforms")?;
+        tracing::info!(count, "Migrated user_transforms from JSONL → DuckDB");
+        Ok(count)
+    }
+
+    /// Migrate connections from Vec into DuckDB.
+    pub fn migrate_connections(&self, connections: &[super::state::ConnectionEntry]) -> Result<usize, String> {
+        if self.is_migrated("connections") { return Ok(0); }
+        let mut count = 0;
+        for conn in connections {
+            self.upsert_connection(conn)?;
+            if !conn.tables.is_empty() {
+                self.cache_tables(&conn.id, &conn.tables)?;
+            }
+            count += 1;
+        }
+        self.mark_migrated("connections")?;
+        tracing::info!(count, "Migrated connections from JSONL → DuckDB");
+        Ok(count)
     }
 }
 

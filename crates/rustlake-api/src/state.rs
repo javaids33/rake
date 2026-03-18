@@ -733,7 +733,7 @@ impl AppState {
             benchmark_results: RwLock::new(Vec::new()),
             #[cfg(feature = "duckdb")]
             trino_cache: {
-                match crate::trino_client::TrinoCache::new("trino_cache.duckdb") {
+                match crate::trino_client::TrinoCache::new("rustlake_state.duckdb") {
                     Ok(c) => { tracing::info!("Trino DuckDB cache initialized"); Some(std::sync::Arc::new(c)) }
                     Err(e) => { tracing::warn!("Trino cache init failed: {}", e); None }
                 }
@@ -797,7 +797,7 @@ impl AppState {
             benchmark_results: RwLock::new(Vec::new()),
             #[cfg(feature = "duckdb")]
             trino_cache: {
-                match crate::trino_client::TrinoCache::new("trino_cache.duckdb") {
+                match crate::trino_client::TrinoCache::new("rustlake_state.duckdb") {
                     Ok(c) => Some(std::sync::Arc::new(c)),
                     Err(e) => { tracing::warn!("Trino cache init failed: {}", e); None }
                 }

@@ -3169,7 +3169,9 @@ async fn add_connection(
     let bg_id = id.clone();
     let bg_req = req.clone();
     tokio::spawn(async move {
+        let discovery_start = Instant::now();
         let result = discover_and_register_tables(&bg_state, &bg_id, &bg_req).await;
+        let discovery_ms = discovery_start.elapsed().as_millis();
         match result {
             Ok(tables) => {
                 bg_state.update_connection_entry(&bg_id, |entry| {
@@ -3180,9 +3182,11 @@ async fn add_connection(
                 tracing::info!(
                     id = %bg_id,
                     name = %bg_req.name,
+                    conn_type = %bg_req.conn_type,
                     tables = tables.len(),
-                    "Background sync complete: {} tables registered",
-                    tables.len()
+                    elapsed_ms = discovery_ms,
+                    "Background sync complete: {} tables in {}ms",
+                    tables.len(), discovery_ms
                 );
             }
             Err(e) => {
@@ -3209,6 +3213,12 @@ async fn discover_and_register_tables(
     id: &str,
     req: &AddConnectionRequest,
 ) -> std::result::Result<Vec<String>, String> {
+    let _phase_start = std::time::Instant::now();
+    tracing::info!(
+        conn_id = %id, name = %req.name, conn_type = %req.conn_type,
+        host = %req.host, database = %req.database,
+        "Discovery starting"
+    );
     let prefix = match req.conn_type.as_str() {
         "postgres" | "postgresql" => "pg",
         "mysql" | "mariadb" => "mysql",
@@ -3265,7 +3275,7 @@ async fn discover_and_register_tables(
             let mongo_schema = crate::providers::ensure_schema(ctx.datafusion_ctx(), "mongo")
                 .map_err(|e| e.to_string())?;
 
-            // Fetch collections in parallel (up to 4 concurrent to avoid overwhelming large DBs)
+            // Schema-only inference: sample 20 docs per collection (fast — no full data download)
             let total = collections.len();
             let fetch_start = Instant::now();
             let results: Vec<Option<(String, arrow::record_batch::RecordBatch)>> = stream::iter(collections.iter().cloned().enumerate())
@@ -3276,17 +3286,14 @@ async fn discover_and_register_tables(
                         tracing::info!(
                             collection = %coll_name,
                             progress = format!("{}/{}", i + 1, total),
-                            "MongoDB discovery: fetching collection"
+                            "MongoDB discovery: inferring schema (sample 20 docs)"
                         );
-                        let start = Instant::now();
-                        match crate::mongodb_conn::fetch_collection_as_arrow(&params, &coll_name).await {
+                        match crate::mongodb_conn::infer_collection_schema(&params, &coll_name, 20).await {
                             Ok(batch) => {
                                 tracing::info!(
                                     collection = %coll_name,
-                                    rows = batch.num_rows(),
                                     columns = batch.num_columns(),
-                                    elapsed_ms = start.elapsed().as_millis(),
-                                    "MongoDB discovery: collection fetched OK"
+                                    "MongoDB discovery: schema inferred OK"
                                 );
                                 Some((coll_name, batch))
                             }
@@ -3294,15 +3301,14 @@ async fn discover_and_register_tables(
                                 tracing::warn!(
                                     collection = %coll_name,
                                     error = %e,
-                                    elapsed_ms = start.elapsed().as_millis(),
-                                    "MongoDB discovery: collection fetch FAILED — skipping"
+                                    "MongoDB discovery: schema inference FAILED — skipping"
                                 );
                                 None
                             }
                         }
                     }
                 })
-                .buffer_unordered(4)
+                .buffer_unordered(8) // Safe to use 8 concurrent since we're only reading 20 docs each
                 .collect()
                 .await;
 
@@ -3311,7 +3317,7 @@ async fn discover_and_register_tables(
             tracing::info!(
                 fetched = fetched_count, skipped = total - fetched_count,
                 elapsed_ms = fetch_ms,
-                "MongoDB discovery: fetch phase complete"
+                "MongoDB discovery: schema inference complete (data fetched on-demand via queries)"
             );
 
             let mut mongo_registered = Vec::new();
@@ -3604,12 +3610,12 @@ pub(crate) async fn reconnect_saved_connections(state: Arc<AppState>) {
                             tracing::debug!(
                                 collection = %coll_name,
                                 progress = format!("{}/{}", i + 1, collections.len()),
-                                "MongoDB reconnect: fetching collection"
+                                "MongoDB reconnect: inferring schema"
                             );
-                            match crate::mongodb_conn::fetch_collection_as_arrow(&mongo_params, coll_name).await {
+                            match crate::mongodb_conn::infer_collection_schema(&mongo_params, coll_name, 20).await {
                                 Ok(batch) => {
                                     let schema = batch.schema();
-                                    if let Ok(mem_table) = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]) {
+                                    if let Ok(mem_table) = datafusion::datasource::MemTable::try_new(schema, vec![vec![]]) {
                                         let df_name = format!("mongo.{}", coll_name);
                                         if mongo_schema.register_table(coll_name.clone(), std::sync::Arc::new(mem_table)).is_ok() {
                                             mongo_registered.push(df_name);
@@ -3619,7 +3625,7 @@ pub(crate) async fn reconnect_saved_connections(state: Arc<AppState>) {
                                 Err(e) => {
                                     tracing::warn!(
                                         collection = %coll_name, error = %e,
-                                        "MongoDB reconnect: collection fetch failed, skipping"
+                                        "MongoDB reconnect: schema inference failed, skipping"
                                     );
                                     mongo_errors += 1;
                                 }
