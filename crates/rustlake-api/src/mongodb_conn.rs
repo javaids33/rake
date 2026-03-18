@@ -261,6 +261,7 @@ pub async fn connect_and_discover(params: &MongoConnParams) -> Result<Vec<String
 /// Returns an empty RecordBatch with the inferred schema. This is fast —
 /// only reads `sample_size` documents (default 20) to discover all fields.
 /// Used during connection discovery so tables appear immediately in the catalog.
+#[allow(dead_code)]
 pub async fn infer_collection_schema(
     params: &MongoConnParams,
     collection_name: &str,
@@ -331,6 +332,122 @@ pub async fn infer_collection_schema(
 /// Schema is inferred by sampling the first batch of documents. Fields are discovered
 /// from all sampled documents (union of all keys). MongoDB's flexible schema means
 /// some documents may not have all fields — those are represented as nulls.
+/// Fetch documents from a MongoDB collection with a cap on the number of documents.
+///
+/// Faster than `fetch_collection_as_arrow` for large collections — stops after `max_docs`.
+/// Used during discovery to make tables queryable immediately without downloading everything.
+pub async fn fetch_collection_capped(
+    params: &MongoConnParams,
+    collection_name: &str,
+    max_docs: usize,
+) -> Result<RecordBatch, String> {
+    let start = std::time::Instant::now();
+    let client = params.build_client().await?;
+    let db = client.database(&params.database);
+    let collection = db.collection::<Document>(collection_name);
+
+    use futures::TryStreamExt;
+    use mongodb::options::FindOptions;
+    let opts = FindOptions::builder().limit(Some(max_docs as i64)).build();
+    let mut cursor = collection
+        .find(None, Some(opts))
+        .await
+        .map_err(|e| format!("Failed to query collection '{}': {}", collection_name, e))?;
+
+    let mut docs: Vec<Document> = Vec::new();
+    while let Some(doc) = cursor
+        .try_next()
+        .await
+        .map_err(|e| format!("Failed to read document: {}", e))?
+    {
+        docs.push(doc);
+    }
+
+    let elapsed_ms = start.elapsed().as_millis();
+    tracing::debug!(
+        collection = %collection_name, docs = docs.len(),
+        elapsed_ms = elapsed_ms, cap = max_docs,
+        "Capped collection fetch"
+    );
+
+    if docs.is_empty() {
+        let schema = Schema::new(vec![Field::new("_id", DataType::Utf8, false)]);
+        return Ok(RecordBatch::new_empty(Arc::new(schema)));
+    }
+
+    // Discover schema from documents
+    let mut field_types: Vec<(String, DataType)> = Vec::new();
+    let mut seen_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for doc in &docs {
+        for (key, value) in doc {
+            if key == "_id" { continue; }
+            if !seen_keys.contains(key) {
+                seen_keys.insert(key.clone());
+                field_types.push((key.clone(), bson_to_arrow_type(value)));
+            }
+        }
+    }
+    field_types.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let fields: Vec<Field> = field_types.iter()
+        .map(|(name, dtype)| Field::new(name, dtype.clone(), true))
+        .collect();
+    let schema = Arc::new(Schema::new(fields));
+
+    // Build Arrow arrays from documents
+    let mut arrays: Vec<ArrayRef> = Vec::with_capacity(field_types.len());
+    for (field_name, arrow_type) in &field_types {
+        let array: ArrayRef = match arrow_type {
+            DataType::Boolean => {
+                let values: Vec<Option<bool>> = docs.iter()
+                    .map(|d| d.get(field_name).and_then(bson_to_bool))
+                    .collect();
+                Arc::new(BooleanArray::from(values))
+            }
+            DataType::Int64 => {
+                let values: Vec<Option<i64>> = docs.iter()
+                    .map(|d| d.get(field_name).and_then(bson_to_i64))
+                    .collect();
+                Arc::new(Int64Array::from(values))
+            }
+            DataType::Float64 => {
+                let mut builder = Float64Array::builder(docs.len());
+                for doc in &docs {
+                    match doc.get(field_name).and_then(bson_to_f64) {
+                        Some(v) => builder.append_value(v),
+                        None => builder.append_null(),
+                    }
+                }
+                Arc::new(builder.finish())
+            }
+            DataType::Timestamp(TimeUnit::Microsecond, None) => {
+                let mut builder = TimestampMicrosecondArray::builder(docs.len());
+                for doc in &docs {
+                    match doc.get(field_name) {
+                        Some(Bson::DateTime(dt)) => builder.append_value(dt.timestamp_millis() * 1000),
+                        _ => builder.append_null(),
+                    }
+                }
+                Arc::new(builder.finish())
+            }
+            _ => {
+                let mut builder = StringBuilder::new();
+                for doc in &docs {
+                    match doc.get(field_name) {
+                        Some(v) => builder.append_value(bson_to_string(v)),
+                        None => builder.append_null(),
+                    }
+                }
+                Arc::new(builder.finish())
+            }
+        };
+        arrays.push(array);
+    }
+
+    RecordBatch::try_new(schema, arrays)
+        .map_err(|e| format!("Failed to create RecordBatch: {}", e))
+}
+
 pub async fn fetch_collection_as_arrow(
     params: &MongoConnParams,
     collection_name: &str,

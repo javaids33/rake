@@ -55,7 +55,7 @@ export function SqlEditorPage() {
   const [estimating, setEstimating] = useState(false)
   const [workflowOpen, setWorkflowOpen] = useState(false)
   const [demoOpen, setDemoOpen] = useState(false)
-  const [sidebarTab, setSidebarTab] = useState<'catalog' | 'saved'>('catalog')
+  const [sidebarTab, setSidebarTab] = useState<'catalog' | 'saved' | 'toolkit'>('catalog')
   const [catalogWidth, setCatalogWidth] = useState(() => {
     const saved = localStorage.getItem('sql_catalog_width')
     return saved ? parseInt(saved, 10) : 256
@@ -1034,6 +1034,13 @@ export function SqlEditorPage() {
               >
                 <BookOpen className="w-3.5 h-3.5" />
               </button>
+              <button
+                onClick={() => { setCatalogCollapsed(false); localStorage.setItem('sql_catalog_collapsed', 'false'); setSidebarTab('toolkit') }}
+                className={cn('p-1.5 rounded-md transition-colors', sidebarTab === 'toolkit' ? 'text-amber-400 bg-white/[0.04]' : 'text-zinc-600 hover:text-zinc-400')}
+                title="SQL Toolkit"
+              >
+                <Zap className="w-3.5 h-3.5" />
+              </button>
             </div>
           ) : (
           <>
@@ -1068,6 +1075,18 @@ export function SqlEditorPage() {
               )}
             </button>
             <button
+              onClick={() => setSidebarTab('toolkit')}
+              className={cn(
+                'flex-1 flex items-center justify-center gap-1.5 px-3 py-2 text-2xs font-semibold uppercase tracking-wider transition-colors',
+                sidebarTab === 'toolkit'
+                  ? 'text-amber-400 border-b-2 border-amber-400/60 bg-white/[0.02]'
+                  : 'text-zinc-500 hover:text-zinc-400'
+              )}
+            >
+              <Zap className="w-3 h-3" />
+              Toolkit
+            </button>
+            <button
               onClick={toggleCatalogCollapse}
               className="px-2 py-2 text-zinc-600 hover:text-zinc-400 transition-colors"
               title="Collapse sidebar"
@@ -1075,6 +1094,95 @@ export function SqlEditorPage() {
               <PanelRightClose className="w-3.5 h-3.5" />
             </button>
           </div>
+
+          {/* Toolkit tab — quick SQL templates */}
+          {sidebarTab === 'toolkit' && (
+            <div className="flex-1 overflow-y-auto p-2 space-y-3">
+              {[
+                {
+                  category: 'Table Operations',
+                  color: 'text-amber-400',
+                  templates: [
+                    { label: 'Create Table (CTAS)', sql: 'CREATE TABLE my_table AS\nSELECT * FROM source_table\nWHERE condition = true;' },
+                    { label: 'Create View', sql: 'CREATE VIEW my_view AS\nSELECT col1, col2, SUM(amount) as total\nFROM my_table\nGROUP BY col1, col2;' },
+                    { label: 'Insert Into', sql: 'INSERT INTO target_table\nSELECT * FROM source_table\nWHERE updated_at > NOW() - INTERVAL \'1 hour\';' },
+                    { label: 'Drop Table', sql: 'DROP TABLE IF EXISTS my_table;' },
+                  ]
+                },
+                {
+                  category: 'Data Exploration',
+                  color: 'text-cyan-400',
+                  templates: [
+                    { label: 'Preview (100 rows)', sql: 'SELECT *\nFROM my_table\nLIMIT 100;' },
+                    { label: 'Row Count', sql: 'SELECT COUNT(*) as total_rows\nFROM my_table;' },
+                    { label: 'Column Stats', sql: 'SELECT\n  COUNT(*) as rows,\n  COUNT(DISTINCT col) as unique_vals,\n  MIN(col) as min_val,\n  MAX(col) as max_val,\n  AVG(col) as avg_val\nFROM my_table;' },
+                    { label: 'Null Analysis', sql: 'SELECT\n  COUNT(*) as total,\n  COUNT(col) as non_null,\n  COUNT(*) - COUNT(col) as nulls,\n  ROUND(100.0 * (COUNT(*) - COUNT(col)) / COUNT(*), 2) as null_pct\nFROM my_table;' },
+                    { label: 'Top N Values', sql: 'SELECT col, COUNT(*) as cnt\nFROM my_table\nGROUP BY col\nORDER BY cnt DESC\nLIMIT 20;' },
+                    { label: 'Schema / Describe', sql: 'DESCRIBE my_table;' },
+                  ]
+                },
+                {
+                  category: 'Cross-Source Queries',
+                  color: 'text-emerald-400',
+                  templates: [
+                    { label: 'Postgres → Query', sql: 'SELECT * FROM pg.my_table\nLIMIT 100;' },
+                    { label: 'MySQL → Query', sql: 'SELECT * FROM mysql.my_table\nLIMIT 100;' },
+                    { label: 'MongoDB → Query', sql: 'SELECT * FROM mongo.my_collection\nLIMIT 100;' },
+                    { label: 'Cross-Source JOIN', sql: '-- Join data across Postgres and MongoDB\nSELECT\n  p.id, p.name, m.metadata\nFROM pg.users p\nJOIN mongo.user_profiles m\n  ON p.id = CAST(m.user_id AS INT)\nLIMIT 100;' },
+                  ]
+                },
+                {
+                  category: 'Iceberg / Lakehouse',
+                  color: 'text-violet-400',
+                  templates: [
+                    { label: 'Create Iceberg Table', sql: 'CREATE TABLE iceberg.warehouse.events AS\nSELECT * FROM pg.events;' },
+                    { label: 'Materialized View', sql: 'CREATE TABLE iceberg.analytics.daily_revenue AS\nSELECT\n  DATE_TRUNC(\'day\', order_date) as day,\n  SUM(total) as revenue,\n  COUNT(*) as orders\nFROM pg.orders\nGROUP BY 1\nORDER BY 1;' },
+                    { label: 'Incremental Load', sql: 'INSERT INTO iceberg.warehouse.orders\nSELECT * FROM pg.orders\nWHERE updated_at > (\n  SELECT COALESCE(MAX(updated_at), \'1970-01-01\')\n  FROM iceberg.warehouse.orders\n);' },
+                    { label: 'Snapshot Export', sql: '-- Export current state to S3\nCREATE TABLE iceberg.backups.orders_snapshot AS\nSELECT *, NOW() as snapshot_at\nFROM iceberg.warehouse.orders;' },
+                  ]
+                },
+                {
+                  category: 'ETL Patterns',
+                  color: 'text-rose-400',
+                  templates: [
+                    { label: 'Full Sync (Replace)', sql: '-- Drop and recreate\nDROP TABLE IF EXISTS target_table;\nCREATE TABLE target_table AS\nSELECT * FROM source_table;' },
+                    { label: 'SCD Type 1 (Upsert)', sql: '-- Merge new data (DataFusion supports MERGE coming soon)\nCREATE TABLE target_table_new AS\nSELECT * FROM source_table\nUNION ALL\nSELECT t.* FROM target_table t\nWHERE t.id NOT IN (SELECT id FROM source_table);' },
+                    { label: 'Deduplication', sql: 'SELECT DISTINCT ON (id) *\nFROM my_table\nORDER BY id, updated_at DESC;' },
+                    { label: 'Pivot / Aggregate', sql: 'SELECT\n  category,\n  SUM(CASE WHEN status = \'active\' THEN 1 ELSE 0 END) as active,\n  SUM(CASE WHEN status = \'inactive\' THEN 1 ELSE 0 END) as inactive\nFROM my_table\nGROUP BY category;' },
+                  ]
+                },
+                {
+                  category: 'System / Debug',
+                  color: 'text-zinc-400',
+                  templates: [
+                    { label: 'List All Tables', sql: 'SHOW TABLES;' },
+                    { label: 'Explain Query Plan', sql: 'EXPLAIN\nSELECT * FROM my_table\nWHERE id > 100;' },
+                    { label: 'Explain Verbose', sql: 'EXPLAIN VERBOSE\nSELECT * FROM my_table\nWHERE id > 100;' },
+                    { label: 'Show Table Schema', sql: 'SHOW COLUMNS FROM my_table;' },
+                    { label: 'System Info', sql: 'SELECT 1 + 1 as health_check;' },
+                  ]
+                },
+              ].map(group => (
+                <div key={group.category}>
+                  <h4 className={cn('text-2xs font-semibold uppercase tracking-wider px-2 py-1', group.color)}>
+                    {group.category}
+                  </h4>
+                  <div className="space-y-0.5">
+                    {group.templates.map(t => (
+                      <button
+                        key={t.label}
+                        onClick={() => insertAtCursor(t.sql)}
+                        className="w-full text-left px-3 py-1.5 text-2xs text-zinc-400 hover:text-zinc-200 hover:bg-white/[0.02] rounded transition-colors font-mono truncate"
+                        title={t.sql}
+                      >
+                        {t.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
 
           {/* Catalog tab */}
           {sidebarTab === 'catalog' && (

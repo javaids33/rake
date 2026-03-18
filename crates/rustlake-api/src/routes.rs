@@ -3275,25 +3275,33 @@ async fn discover_and_register_tables(
             let mongo_schema = crate::providers::ensure_schema(ctx.datafusion_ctx(), "mongo")
                 .map_err(|e| e.to_string())?;
 
-            // Schema-only inference: sample 20 docs per collection (fast — no full data download)
+            // Two-phase discovery:
+            // Phase 1 (fast): Fetch data with limit of 10K docs per collection for immediate queryability
+            // This balances speed vs usability — tables are queryable immediately with sample data
             let total = collections.len();
             let fetch_start = Instant::now();
+            let sample_limit = 10_000usize; // Cap per collection for discovery speed
             let results: Vec<Option<(String, arrow::record_batch::RecordBatch)>> = stream::iter(collections.iter().cloned().enumerate())
                 .map(|(i, coll_name)| {
                     let params = mongo_params.clone();
                     let total = total;
+                    let limit = sample_limit;
                     async move {
                         tracing::info!(
                             collection = %coll_name,
                             progress = format!("{}/{}", i + 1, total),
-                            "MongoDB discovery: inferring schema (sample 20 docs)"
+                            limit = limit,
+                            "MongoDB discovery: fetching collection (capped)"
                         );
-                        match crate::mongodb_conn::infer_collection_schema(&params, &coll_name, 20).await {
+                        let start = Instant::now();
+                        match crate::mongodb_conn::fetch_collection_capped(&params, &coll_name, limit).await {
                             Ok(batch) => {
                                 tracing::info!(
                                     collection = %coll_name,
+                                    rows = batch.num_rows(),
                                     columns = batch.num_columns(),
-                                    "MongoDB discovery: schema inferred OK"
+                                    elapsed_ms = start.elapsed().as_millis(),
+                                    "MongoDB discovery: collection ready"
                                 );
                                 Some((coll_name, batch))
                             }
@@ -3301,14 +3309,15 @@ async fn discover_and_register_tables(
                                 tracing::warn!(
                                     collection = %coll_name,
                                     error = %e,
-                                    "MongoDB discovery: schema inference FAILED — skipping"
+                                    elapsed_ms = start.elapsed().as_millis(),
+                                    "MongoDB discovery: FAILED — skipping"
                                 );
                                 None
                             }
                         }
                     }
                 })
-                .buffer_unordered(8) // Safe to use 8 concurrent since we're only reading 20 docs each
+                .buffer_unordered(4)
                 .collect()
                 .await;
 
@@ -3317,13 +3326,14 @@ async fn discover_and_register_tables(
             tracing::info!(
                 fetched = fetched_count, skipped = total - fetched_count,
                 elapsed_ms = fetch_ms,
-                "MongoDB discovery: schema inference complete (data fetched on-demand via queries)"
+                "MongoDB discovery: complete"
             );
 
             let mut mongo_registered = Vec::new();
             for (coll_name, batch) in results.into_iter().flatten() {
                 let schema = batch.schema();
-                if let Ok(mem_table) = datafusion::datasource::MemTable::try_new(schema, vec![vec![batch]]) {
+                let batches = if batch.num_rows() > 0 { vec![vec![batch]] } else { vec![vec![]] };
+                if let Ok(mem_table) = datafusion::datasource::MemTable::try_new(schema, batches) {
                     let df_name = format!("mongo.{}", coll_name);
                     if mongo_schema.register_table(coll_name.clone(), std::sync::Arc::new(mem_table)).is_ok() {
                         mongo_registered.push(df_name);
@@ -3610,12 +3620,13 @@ pub(crate) async fn reconnect_saved_connections(state: Arc<AppState>) {
                             tracing::debug!(
                                 collection = %coll_name,
                                 progress = format!("{}/{}", i + 1, collections.len()),
-                                "MongoDB reconnect: inferring schema"
+                                "MongoDB reconnect: fetching (cap 10K)"
                             );
-                            match crate::mongodb_conn::infer_collection_schema(&mongo_params, coll_name, 20).await {
+                            match crate::mongodb_conn::fetch_collection_capped(&mongo_params, coll_name, 10_000).await {
                                 Ok(batch) => {
                                     let schema = batch.schema();
-                                    if let Ok(mem_table) = datafusion::datasource::MemTable::try_new(schema, vec![vec![]]) {
+                                    let batches = if batch.num_rows() > 0 { vec![vec![batch]] } else { vec![vec![]] };
+                                    if let Ok(mem_table) = datafusion::datasource::MemTable::try_new(schema, batches) {
                                         let df_name = format!("mongo.{}", coll_name);
                                         if mongo_schema.register_table(coll_name.clone(), std::sync::Arc::new(mem_table)).is_ok() {
                                             mongo_registered.push(df_name);
@@ -3625,7 +3636,7 @@ pub(crate) async fn reconnect_saved_connections(state: Arc<AppState>) {
                                 Err(e) => {
                                     tracing::warn!(
                                         collection = %coll_name, error = %e,
-                                        "MongoDB reconnect: schema inference failed, skipping"
+                                        "MongoDB reconnect: fetch failed, skipping"
                                     );
                                     mongo_errors += 1;
                                 }
