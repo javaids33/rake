@@ -408,6 +408,38 @@ impl StateDb {
         Ok(())
     }
 
+    /// Load scheduled jobs from DuckDB.
+    pub fn load_jobs(&self) -> Vec<super::state::ScheduledJob> {
+        let db = match self.db.lock() { Ok(db) => db, Err(_) => return vec![] };
+        let mut stmt = match db.prepare("SELECT data FROM scheduled_jobs") { Ok(s) => s, Err(_) => return vec![] };
+        let rows = stmt.query_map([], |row| {
+            let json: String = row.get(0)?;
+            Ok(json)
+        });
+        match rows {
+            Ok(r) => r.filter_map(|r| r.ok())
+                .filter_map(|json| serde_json::from_str(&json).ok())
+                .collect(),
+            Err(_) => vec![],
+        }
+    }
+
+    /// Load user transforms from DuckDB.
+    pub fn load_transforms(&self) -> Vec<super::state::UserTransform> {
+        let db = match self.db.lock() { Ok(db) => db, Err(_) => return vec![] };
+        let mut stmt = match db.prepare("SELECT data FROM user_transforms") { Ok(s) => s, Err(_) => return vec![] };
+        let rows = stmt.query_map([], |row| {
+            let json: String = row.get(0)?;
+            Ok(json)
+        });
+        match rows {
+            Ok(r) => r.filter_map(|r| r.ok())
+                .filter_map(|json| serde_json::from_str(&json).ok())
+                .collect(),
+            Err(_) => vec![],
+        }
+    }
+
     /// Migrate scheduled jobs from Vec into DuckDB (stores as JSON blobs).
     pub fn migrate_jobs(&self, jobs: &[super::state::ScheduledJob]) -> Result<usize, String> {
         if self.is_migrated("scheduled_jobs") { return Ok(0); }

@@ -739,20 +739,73 @@ async fn main() -> anyhow::Result<()> {
 
     let transforms = load_user_transforms_from_file();
     if !transforms.is_empty() {
-        tracing::info!(count = transforms.len(), "Loaded persisted user transforms from user_transforms.jsonl");
+        tracing::info!(count = transforms.len(), "Loaded user transforms from JSONL");
         *state.user_transforms.get_mut() = transforms;
+    } else {
+        #[cfg(feature = "duckdb")]
+        if let Some(ref db) = state.state_db {
+            let cached = db.load_transforms();
+            if !cached.is_empty() {
+                tracing::info!(count = cached.len(), "Restored user transforms from DuckDB");
+                *state.user_transforms.get_mut() = cached;
+            }
+        }
     }
 
     let jobs = load_scheduled_jobs_from_file();
     if !jobs.is_empty() {
-        tracing::info!(count = jobs.len(), "Loaded persisted scheduled jobs from scheduled_jobs.jsonl");
+        tracing::info!(count = jobs.len(), "Loaded scheduled jobs from JSONL");
         *state.scheduled_jobs.get_mut() = jobs;
+    } else {
+        #[cfg(feature = "duckdb")]
+        if let Some(ref db) = state.state_db {
+            let cached = db.load_jobs();
+            if !cached.is_empty() {
+                tracing::info!(count = cached.len(), "Restored scheduled jobs from DuckDB");
+                *state.scheduled_jobs.get_mut() = cached;
+            }
+        }
     }
 
     let connections = state::load_connections_from_file();
     if !connections.is_empty() {
         tracing::info!(count = connections.len(), "Loaded persisted connections from connections.jsonl");
         *state.connections.get_mut() = connections;
+    } else {
+        // No JSONL — try restoring from DuckDB state store
+        #[cfg(feature = "duckdb")]
+        if let Some(ref db) = state.state_db {
+            let cached = db.load_connections();
+            if !cached.is_empty() {
+                let mut restored: Vec<state::ConnectionEntry> = Vec::new();
+                for c in &cached {
+                    let tables = db.load_tables(&c.id);
+                    restored.push(state::ConnectionEntry {
+                        id: c.id.clone(),
+                        name: c.name.clone(),
+                        conn_type: c.conn_type.clone(),
+                        host: c.host.clone(),
+                        port: c.port,
+                        database: c.database.clone(),
+                        username: c.username.clone(),
+                        status: "cached".to_string(),
+                        tables,
+                        created_at: chrono::Utc::now(),
+                        source: c.source.clone(),
+                        sync_status: "cached".to_string(),
+                        sync_error: None,
+                        sync_progress: None,
+                        auth_method: c.auth_method.clone(),
+                        connection_string: c.connection_string.clone(),
+                        aws_access_key: None,
+                        aws_secret_key: None,
+                        aws_session_token: None,
+                    });
+                }
+                tracing::info!(count = restored.len(), "Restored connections from DuckDB state store");
+                *state.connections.get_mut() = restored;
+            }
+        }
     }
 
     // Load encrypted credentials and restore passwords
@@ -827,27 +880,47 @@ async fn main() -> anyhow::Result<()> {
             }
         }
 
-        // ── Migrate JSONL → DuckDB (one-time) ──
+        // ── Migrate JSONL → DuckDB (one-time) then delete JSONL files ──
         if let Some(ref db) = state.state_db {
+            let mut migrated_any = false;
+
             // Migrate connections
             let connections = state.connections.get_mut();
             if !connections.is_empty() {
-                if let Err(e) = db.migrate_connections(connections) {
-                    tracing::warn!(error = %e, "JSONL → DuckDB migration failed for connections");
+                match db.migrate_connections(connections) {
+                    Ok(n) if n > 0 => migrated_any = true,
+                    Err(e) => tracing::warn!(error = %e, "JSONL → DuckDB migration failed for connections"),
+                    _ => {}
                 }
             }
             // Migrate jobs
             let jobs = state.scheduled_jobs.get_mut();
             if !jobs.is_empty() {
-                if let Err(e) = db.migrate_jobs(jobs) {
-                    tracing::warn!(error = %e, "JSONL → DuckDB migration failed for scheduled_jobs");
+                match db.migrate_jobs(jobs) {
+                    Ok(n) if n > 0 => migrated_any = true,
+                    Err(e) => tracing::warn!(error = %e, "JSONL → DuckDB migration failed for scheduled_jobs"),
+                    _ => {}
                 }
             }
             // Migrate transforms
             let transforms = state.user_transforms.get_mut();
             if !transforms.is_empty() {
-                if let Err(e) = db.migrate_transforms(transforms) {
-                    tracing::warn!(error = %e, "JSONL → DuckDB migration failed for user_transforms");
+                match db.migrate_transforms(transforms) {
+                    Ok(n) if n > 0 => migrated_any = true,
+                    Err(e) => tracing::warn!(error = %e, "JSONL → DuckDB migration failed for user_transforms"),
+                    _ => {}
+                }
+            }
+
+            // Delete JSONL source files after successful migration
+            if migrated_any {
+                for path in &["connections.jsonl", "scheduled_jobs.jsonl", "user_transforms.jsonl"] {
+                    if std::path::Path::new(path).exists() {
+                        match std::fs::remove_file(path) {
+                            Ok(()) => tracing::info!(file = %path, "Deleted JSONL file after DuckDB migration"),
+                            Err(e) => tracing::warn!(file = %path, error = %e, "Failed to delete JSONL file"),
+                        }
+                    }
                 }
             }
         }

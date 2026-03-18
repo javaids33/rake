@@ -851,22 +851,34 @@ impl AppState {
         }
     }
 
-    /// Add a user transform and persist to disk.
+    /// Whether DuckDB state store is available (skip JSONL writes when true).
+    #[cfg(feature = "duckdb")]
+    fn has_state_db(&self) -> bool {
+        self.state_db.is_some()
+    }
+    #[cfg(not(feature = "duckdb"))]
+    fn has_state_db(&self) -> bool {
+        false
+    }
+
     /// Add a connection and persist to disk.
     pub async fn add_connection_entry(&self, entry: ConnectionEntry) {
-        if let Err(e) = append_json_line(CONNECTIONS_PATH, &entry) {
-            tracing::error!(error = %e, "Failed to persist connection to disk");
-        }
         #[cfg(feature = "duckdb")]
         if let Some(ref db) = self.state_db {
             if let Err(e) = db.upsert_connection(&entry) {
                 tracing::warn!(error = %e, "StateDb: failed to upsert connection");
             }
         }
+        // JSONL fallback only when DuckDB is unavailable
+        if !self.has_state_db() {
+            if let Err(e) = append_json_line(CONNECTIONS_PATH, &entry) {
+                tracing::error!(error = %e, "Failed to persist connection to disk");
+            }
+        }
         self.connections.write().await.push(entry);
     }
 
-    /// Update a connection entry in place and rewrite persistence file.
+    /// Update a connection entry in place and persist.
     pub async fn update_connection_entry(&self, id: &str, f: impl FnOnce(&mut ConnectionEntry)) {
         let mut connections = self.connections.write().await;
         if let Some(entry) = connections.iter_mut().find(|c| c.id == id) {
@@ -876,29 +888,33 @@ impl AppState {
                 if let Err(e) = db.upsert_connection(entry) {
                     tracing::warn!(error = %e, "StateDb: failed to update connection");
                 }
-                // Also cache table list if it changed
                 if !entry.tables.is_empty() {
                     let _ = db.cache_tables(&entry.id, &entry.tables);
                 }
             }
         }
-        if let Err(e) = rewrite_json_lines(CONNECTIONS_PATH, &*connections) {
-            tracing::error!(error = %e, "Failed to rewrite connections file");
+        // JSONL fallback only when DuckDB is unavailable
+        if !self.has_state_db() {
+            if let Err(e) = rewrite_json_lines(CONNECTIONS_PATH, &*connections) {
+                tracing::error!(error = %e, "Failed to rewrite connections file");
+            }
         }
     }
 
-    /// Remove a connection and rewrite the persistence file.
+    /// Remove a connection and persist.
     pub async fn remove_connection_entry(&self, id: &str) -> bool {
         let mut connections = self.connections.write().await;
         let before = connections.len();
         connections.retain(|c| c.id != id);
         if connections.len() < before {
-            if let Err(e) = rewrite_json_lines(CONNECTIONS_PATH, &*connections) {
-                tracing::error!(error = %e, "Failed to rewrite connections file");
-            }
             #[cfg(feature = "duckdb")]
             if let Some(ref db) = self.state_db {
                 let _ = db.delete_connection(id);
+            }
+            if !self.has_state_db() {
+                if let Err(e) = rewrite_json_lines(CONNECTIONS_PATH, &*connections) {
+                    tracing::error!(error = %e, "Failed to rewrite connections file");
+                }
             }
             true
         } else {
@@ -915,13 +931,15 @@ impl AppState {
     }
 
     pub async fn add_user_transform(&self, ut: UserTransform) {
-        if let Err(e) = append_json_line(TRANSFORMS_PATH, &ut) {
-            tracing::error!(error = %e, "Failed to persist user transform to disk");
+        if !self.has_state_db() {
+            if let Err(e) = append_json_line(TRANSFORMS_PATH, &ut) {
+                tracing::error!(error = %e, "Failed to persist user transform to disk");
+            }
         }
         self.user_transforms.write().await.push(ut);
     }
 
-    /// Remove a user transform and rewrite the persistence file.
+    /// Remove a user transform and persist.
     pub async fn remove_user_transform(&self, name: &str) -> bool {
         let mut transforms = self.user_transforms.write().await;
         let before = transforms.len();
@@ -929,21 +947,25 @@ impl AppState {
         if transforms.len() == before {
             return false;
         }
-        if let Err(e) = rewrite_json_lines(TRANSFORMS_PATH, &*transforms) {
-            tracing::error!(error = %e, "Failed to rewrite transforms file");
+        if !self.has_state_db() {
+            if let Err(e) = rewrite_json_lines(TRANSFORMS_PATH, &*transforms) {
+                tracing::error!(error = %e, "Failed to rewrite transforms file");
+            }
         }
         true
     }
 
-    /// Add a scheduled job and persist to disk.
+    /// Add a scheduled job and persist.
     pub async fn add_scheduled_job(&self, job: ScheduledJob) {
-        if let Err(e) = append_json_line(JOBS_PATH, &job) {
-            tracing::error!(error = %e, "Failed to persist scheduled job to disk");
+        if !self.has_state_db() {
+            if let Err(e) = append_json_line(JOBS_PATH, &job) {
+                tracing::error!(error = %e, "Failed to persist scheduled job to disk");
+            }
         }
         self.scheduled_jobs.write().await.push(job);
     }
 
-    /// Remove a scheduled job and rewrite the persistence file.
+    /// Remove a scheduled job and persist.
     pub async fn remove_scheduled_job(&self, id: &str) -> bool {
         let mut jobs = self.scheduled_jobs.write().await;
         let before = jobs.len();
@@ -951,17 +973,21 @@ impl AppState {
         if jobs.len() == before {
             return false;
         }
-        if let Err(e) = rewrite_json_lines(JOBS_PATH, &*jobs) {
-            tracing::error!(error = %e, "Failed to rewrite jobs file");
+        if !self.has_state_db() {
+            if let Err(e) = rewrite_json_lines(JOBS_PATH, &*jobs) {
+                tracing::error!(error = %e, "Failed to rewrite jobs file");
+            }
         }
         true
     }
 
-    /// Update a scheduled job's state and rewrite the persistence file.
+    /// Update a scheduled job's state and persist.
     pub async fn persist_jobs(&self) {
-        let jobs = self.scheduled_jobs.read().await;
-        if let Err(e) = rewrite_json_lines(JOBS_PATH, &*jobs) {
-            tracing::error!(error = %e, "Failed to persist jobs to disk");
+        if !self.has_state_db() {
+            let jobs = self.scheduled_jobs.read().await;
+            if let Err(e) = rewrite_json_lines(JOBS_PATH, &*jobs) {
+                tracing::error!(error = %e, "Failed to persist jobs to disk");
+            }
         }
     }
 
