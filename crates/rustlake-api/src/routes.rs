@@ -5973,6 +5973,22 @@ async fn add_s3_config(
                     cfg.scan_progress = Some("complete".to_string());
                     cfg.scan_detail = None;
                 }
+                // Cache S3 tables in DuckDB state store
+                #[cfg(feature = "duckdb")]
+                if let Some(ref db) = bg_state.state_db {
+                    let s3_table_tuples: Vec<(String, String, String)> = configs.iter()
+                        .find(|c| c.name == bg_name)
+                        .map(|cfg| {
+                            cfg.tables.iter().map(|t| {
+                                let fmt = cfg.table_formats.get(t).cloned().unwrap_or_default();
+                                (t.clone(), fmt, String::new())
+                            }).collect()
+                        })
+                        .unwrap_or_default();
+                    let _ = db.cache_s3_tables(&bg_name, &s3_table_tuples);
+                }
+                drop(configs);
+
                 tracing::info!(
                     name = %bg_name,
                     tables = count,

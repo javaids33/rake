@@ -150,6 +150,7 @@ impl StateDb {
     }
 
     /// Save column schema for a table.
+    #[allow(dead_code)]
     pub fn cache_columns(&self, conn_id: &str, table_name: &str, columns: &[(String, String, bool)]) -> Result<(), String> {
         let db = self.db.lock().map_err(|e| e.to_string())?;
         db.execute(
@@ -167,6 +168,7 @@ impl StateDb {
     }
 
     /// Load all connections from cache.
+    #[allow(dead_code)]
     pub fn load_connections(&self) -> Vec<CachedConnection> {
         let db = match self.db.lock() {
             Ok(db) => db,
@@ -216,6 +218,7 @@ impl StateDb {
     }
 
     /// Load cached columns for a table.
+    #[allow(dead_code)]
     pub fn load_columns(&self, conn_id: &str, table_name: &str) -> Vec<(String, String, bool)> {
         let db = match self.db.lock() {
             Ok(db) => db,
@@ -263,6 +266,7 @@ impl StateDb {
     }
 
     /// Load S3 table names for a config.
+    #[allow(dead_code)]
     pub fn load_s3_tables(&self, config_name: &str) -> Vec<(String, String, String)> {
         let db = match self.db.lock() {
             Ok(db) => db,
