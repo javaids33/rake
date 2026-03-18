@@ -121,6 +121,11 @@ impl MongoConnParams {
                     self.host, self.port,
                     self.database, auth_source
                 );
+                tracing::info!(
+                    host = %self.host, port = %self.port,
+                    database = %self.database, user = %self.username,
+                    "SCRAM MongoDB URI built (directConnection=true)"
+                );
                 ClientOptions::parse(&uri)
                     .await
                     .map_err(|e| format!("Failed to parse SCRAM connection string: {}", e))?
@@ -364,9 +369,10 @@ pub async fn fetch_collection_capped(
     }
 
     let elapsed_ms = start.elapsed().as_millis();
-    tracing::debug!(
+    tracing::info!(
         collection = %collection_name, docs = docs.len(),
         elapsed_ms = elapsed_ms, cap = max_docs,
+        database = %params.database, host = %params.host,
         "Capped collection fetch"
     );
 
