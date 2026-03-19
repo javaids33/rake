@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
-import { useNavigate } from 'react-router-dom'
+import { useNavigate, useLocation } from 'react-router-dom'
 import { useEditorStore } from '../stores/editor'
 import { SqlEditorComponent } from '../components/editor/SqlEditor'
 import { DataTable } from '../components/ui/DataTable'
@@ -39,7 +39,18 @@ const chartOptions: Array<{ type: ChartType; icon: React.ReactNode; label: strin
 export function SqlEditorPage() {
   const store = useEditorStore()
   const navigate = useNavigate()
+  const location = useLocation()
   const activeTab = store.tabs.find(t => t.id === store.activeTabId) || store.tabs[0]
+
+  // Handle SQL injection from other pages (Query Sink, CDC pipeline, etc.)
+  useEffect(() => {
+    const state = location.state as { sql?: string } | null
+    if (state?.sql) {
+      store.updateTabSql(store.activeTabId, state.sql)
+      // Clear state so refreshing doesn't re-inject
+      window.history.replaceState({}, '')
+    }
+  }, [location.state])
   const result = store.results[store.activeTabId]
   const error = store.errors[store.activeTabId]
   const loading = store.loading[store.activeTabId]

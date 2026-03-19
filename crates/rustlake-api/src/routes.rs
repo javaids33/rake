@@ -5871,11 +5871,7 @@ async fn start_pipeline(
                 tracing::info!(
                     pipeline_id = %id,
                     sink = %pipeline.sink_table,
-                    "[CDC:5/5] Pipeline RUNNING — events will be counted and broadcast via SSE"
-                );
-                tracing::info!(
-                    pipeline_id = %id,
-                    "NOTE: Events are captured in Arrow RecordBatch format. Sink write to S3/Iceberg is not yet implemented — events are counted but not persisted to the sink path. Use the CDC event data for monitoring. Full sink write requires Parquet writer + Iceberg metadata commit."
+                    "[CDC:5/5] Pipeline RUNNING — CDC events → Arrow RecordBatch → Parquet → S3 sink"
                 );
 
                 // Build S3 Parquet sink if the sink_table is an S3 path
