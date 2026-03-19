@@ -139,12 +139,16 @@ export function Streaming() {
 
   // Real-time pipeline event updates via SSE
   const { onPipelineEvent } = useServerEvents()
+  const [pipelinePhases, setPipelinePhases] = useState<Record<string, string>>({})
   useEffect(() => {
     const unsub = onPipelineEvent((event) => {
       setPipelines(prev => prev.map(p => {
         if (p.id !== event.pipeline_id) return p
         return { ...p, events_processed: event.events_processed, status: event.status }
       }))
+      if (event.phase) {
+        setPipelinePhases(prev => ({ ...prev, [event.pipeline_id]: event.phase! }))
+      }
     })
     return unsub
   }, [onPipelineEvent])
@@ -404,6 +408,12 @@ export function Streaming() {
                           <ArrowRight className="w-3 h-3 text-zinc-600" />
                           <Badge className="bg-amber-400/10 text-amber-400 border-amber-400/20">{p.sink_table}</Badge>
                           <span className="text-2xs font-mono text-zinc-600">{formatNumber(p.events_processed)} events</span>
+                          {pipelinePhases[p.id] === 'snapshot' && (
+                            <Badge className="bg-violet-400/10 text-violet-400 border-violet-400/20 text-2xs">Snapshotting</Badge>
+                          )}
+                          {pipelinePhases[p.id] === 'streaming' && p.status === 'running' && (
+                            <Badge className="bg-emerald-400/10 text-emerald-400 border-emerald-400/20 text-2xs">Live CDC</Badge>
+                          )}
                         </div>
                       </div>
                       <div className="flex items-center gap-1 flex-shrink-0" onClick={e => e.stopPropagation()}>

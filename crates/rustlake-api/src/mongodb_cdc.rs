@@ -37,6 +37,9 @@ pub struct CdcSourceConfig {
     /// Optional aggregation pipeline filters for the change stream.
     #[serde(default)]
     pub pipeline: Vec<Document>,
+    /// Whether to perform an initial snapshot of existing data before starting CDC.
+    #[serde(default)]
+    pub initial_snapshot: bool,
 }
 
 fn default_collection() -> String {
@@ -202,6 +205,7 @@ impl MongoDbCdcSource {
         let last_resume_token = Arc::new(RwLock::new(resume_token.clone()));
 
         let schema = cdc_event_schema();
+        let do_snapshot = config.initial_snapshot;
         let database = config.database.clone();
         let collection = config.collection.clone();
         let full_document_mode = config.full_document.clone();
@@ -211,21 +215,45 @@ impl MongoDbCdcSource {
         let tx_clone = tx.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = run_change_stream(
-                client,
-                &database,
-                &collection,
-                &full_document_mode,
-                pipeline,
-                resume_token,
-                schema,
-                running_clone,
-                token_clone,
-                tx_clone,
-            )
-            .await
-            {
-                tracing::error!(error = %e, "MongoDB CDC source failed");
+            // Phase 1: Initial snapshot (if requested)
+            if do_snapshot && collection != "*" {
+                tracing::info!(
+                    database = %database, collection = %collection,
+                    "[SNAPSHOT] Phase 1: Running initial snapshot before CDC"
+                );
+                match run_snapshot(&client, &database, &collection, &schema, &running_clone, &tx_clone).await {
+                    Ok(count) => {
+                        tracing::info!(
+                            docs = count,
+                            "[SNAPSHOT] Phase 1 complete — switching to CDC change stream"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "[SNAPSHOT] Phase 1 FAILED — starting CDC anyway");
+                    }
+                }
+            } else if do_snapshot && collection == "*" {
+                tracing::warn!("[SNAPSHOT] initial_snapshot not supported with collection='*' — skipping");
+            }
+
+            // Phase 2: CDC change stream
+            if running_clone.load(Ordering::SeqCst) {
+                if let Err(e) = run_change_stream(
+                    client,
+                    &database,
+                    &collection,
+                    &full_document_mode,
+                    pipeline,
+                    resume_token,
+                    schema,
+                    running_clone,
+                    token_clone,
+                    tx_clone,
+                )
+                .await
+                {
+                    tracing::error!(error = %e, "MongoDB CDC source failed");
+                }
             }
         });
 
@@ -253,6 +281,155 @@ impl MongoDbCdcSource {
     pub async fn last_resume_token(&self) -> Option<ResumeToken> {
         self.last_resume_token.read().await.clone()
     }
+}
+
+/// Snapshot schema for initial snapshot batches.
+/// Uses the same 7-column CDC schema but with operation_type = "snapshot".
+fn snapshot_to_cdc_batch(
+    schema: &SchemaRef,
+    docs: &[Document],
+    database: &str,
+    collection: &str,
+) -> Result<RecordBatch, String> {
+    let n = docs.len();
+    let mut id_builder = StringBuilder::with_capacity(n, n * 64);
+    let mut op_builder = StringBuilder::with_capacity(n, n * 16);
+    let mut ts_builder = TimestampMicrosecondArray::builder(n);
+    let mut ns_db_builder = StringBuilder::with_capacity(n, n * 32);
+    let mut ns_coll_builder = StringBuilder::with_capacity(n, n * 32);
+    let mut doc_builder = StringBuilder::with_capacity(n, n * 512);
+    let mut update_builder = StringBuilder::with_capacity(n, n * 16);
+
+    let now_micros = chrono::Utc::now().timestamp_micros();
+
+    for doc in docs {
+        let id = doc.get("_id")
+            .map(|v| serde_json::to_string(v).unwrap_or_default())
+            .unwrap_or_default();
+        id_builder.append_value(&id);
+        op_builder.append_value("snapshot");
+        ts_builder.append_value(now_micros);
+        ns_db_builder.append_value(database);
+        ns_coll_builder.append_value(collection);
+        doc_builder.append_value(serde_json::to_string(doc).unwrap_or_default());
+        update_builder.append_null();
+    }
+
+    RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            std::sync::Arc::new(id_builder.finish()),
+            std::sync::Arc::new(op_builder.finish()),
+            std::sync::Arc::new(ts_builder.finish().with_timezone("UTC")),
+            std::sync::Arc::new(ns_db_builder.finish()),
+            std::sync::Arc::new(ns_coll_builder.finish()),
+            std::sync::Arc::new(doc_builder.finish()),
+            std::sync::Arc::new(update_builder.finish()),
+        ],
+    )
+    .map_err(|e| format!("Snapshot RecordBatch: {}", e))
+}
+
+/// Run an initial snapshot: read all existing documents from the collection
+/// and send them through the CDC channel as "snapshot" operation_type events.
+///
+/// Uses cursor-based pagination with batches of 1000 documents.
+/// Returns the total number of documents snapshotted.
+async fn run_snapshot(
+    client: &Client,
+    database: &str,
+    collection: &str,
+    schema: &SchemaRef,
+    running: &std::sync::Arc<AtomicBool>,
+    tx: &mpsc::Sender<Result<RecordBatch, String>>,
+) -> Result<u64, String> {
+    use futures::TryStreamExt;
+    use mongodb::options::FindOptions;
+
+    let db = client.database(database);
+
+    // Get total count for progress reporting
+    let coll = db.collection::<Document>(collection);
+    let total_count = coll.count_documents(None, None).await
+        .map_err(|e| format!("Snapshot count failed: {}", e))?;
+
+    tracing::info!(
+        database = %database, collection = %collection,
+        total_docs = total_count,
+        "[SNAPSHOT] Starting initial snapshot"
+    );
+
+    if total_count == 0 {
+        tracing::info!("[SNAPSHOT] Collection empty — skipping");
+        return Ok(0);
+    }
+
+    let batch_size = 1000i64;
+    let opts = FindOptions::builder()
+        .batch_size(Some(batch_size as u32))
+        .build();
+
+    let mut cursor = coll.find(None, Some(opts)).await
+        .map_err(|e| format!("Snapshot cursor failed: {}", e))?;
+
+    let mut docs_batch: Vec<Document> = Vec::with_capacity(batch_size as usize);
+    let mut total_snapshotted: u64 = 0;
+    let start = std::time::Instant::now();
+    let mut last_log = std::time::Instant::now();
+
+    while let Some(doc) = cursor.try_next().await
+        .map_err(|e| format!("Snapshot read: {}", e))?
+    {
+        if !running.load(Ordering::SeqCst) {
+            tracing::warn!("[SNAPSHOT] Stopped by user during snapshot");
+            break;
+        }
+
+        docs_batch.push(doc);
+
+        if docs_batch.len() >= batch_size as usize {
+            let batch = snapshot_to_cdc_batch(schema, &docs_batch, database, collection)?;
+            total_snapshotted += docs_batch.len() as u64;
+            docs_batch.clear();
+
+            if tx.send(Ok(batch)).await.is_err() {
+                tracing::warn!("[SNAPSHOT] Channel closed — stopping snapshot");
+                break;
+            }
+
+            // Log progress every 5 seconds
+            if last_log.elapsed().as_secs() >= 5 {
+                let pct = if total_count > 0 { (total_snapshotted as f64 / total_count as f64 * 100.0) } else { 0.0 };
+                let elapsed = start.elapsed().as_secs();
+                let rate = if elapsed > 0 { total_snapshotted / elapsed } else { 0 };
+                tracing::info!(
+                    snapshotted = total_snapshotted, total = total_count,
+                    pct = format!("{:.1}%", pct),
+                    rate_per_sec = rate,
+                    elapsed_secs = elapsed,
+                    "[SNAPSHOT] Progress"
+                );
+                last_log = std::time::Instant::now();
+            }
+        }
+    }
+
+    // Flush remaining docs
+    if !docs_batch.is_empty() {
+        let batch = snapshot_to_cdc_batch(schema, &docs_batch, database, collection)?;
+        total_snapshotted += docs_batch.len() as u64;
+        let _ = tx.send(Ok(batch)).await;
+    }
+
+    let elapsed = start.elapsed();
+    tracing::info!(
+        total_docs = total_snapshotted,
+        elapsed_ms = elapsed.as_millis(),
+        docs_per_sec = if elapsed.as_secs() > 0 { total_snapshotted / elapsed.as_secs() } else { total_snapshotted },
+        "[SNAPSHOT] Complete"
+    );
+
+    Ok(total_snapshotted)
 }
 
 /// Internal: run the change stream loop.

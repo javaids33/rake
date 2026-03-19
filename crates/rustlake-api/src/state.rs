@@ -670,6 +670,9 @@ pub struct PipelineEvent {
     pub batch_rows: u64,
     pub source_type: String,
     pub sink_table: String,
+    /// Phase: "snapshot", "streaming", or "stopped"
+    #[serde(default)]
+    pub phase: String,
 }
 
 impl AppState {

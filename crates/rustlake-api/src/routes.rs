@@ -5949,6 +5949,15 @@ async fn start_pipeline(
                                 let rows = batch.num_rows() as u64;
                                 total_events += rows;
 
+                                // Detect phase BEFORE batch is moved to sink
+                                let phase: String = if batch.num_columns() > 1 {
+                                    batch.column(1).as_any()
+                                        .downcast_ref::<arrow::array::StringArray>()
+                                        .and_then(|col| if col.len() > 0 { Some(col.value(0).to_string()) } else { None })
+                                        .map(|op| if op == "snapshot" { "snapshot".to_string() } else { "streaming".to_string() })
+                                        .unwrap_or_else(|| "streaming".to_string())
+                                } else { "streaming".to_string() };
+
                                 // Log periodically
                                 let should_log = total_events <= 500 || last_log_time.elapsed().as_secs() >= 30;
                                 if should_log {
@@ -5995,6 +6004,7 @@ async fn start_pipeline(
                                         batch_rows: rows,
                                         source_type: pipeline_source.clone(),
                                         sink_table: pipeline_sink.clone(),
+                                        phase,
                                     }
                                 );
                             }
@@ -6974,7 +6984,7 @@ async fn browse_s3(
         if let Some(slash) = relative.find('/') {
             let dir = &relative[..slash];
             if dirs.insert(dir.to_string()) {
-                let dir_prefix = if prefix.is_empty() {
+                let _dir_prefix = if prefix.is_empty() {
                     format!("{}/", dir)
                 } else {
                     format!("{}{}/", prefix.trim_end_matches('/'), if prefix.ends_with('/') { "" } else { "/" }).replacen("//", "/", 1)

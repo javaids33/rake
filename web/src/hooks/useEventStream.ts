@@ -52,6 +52,7 @@ export interface PipelineEventData {
   batch_rows: number
   source_type: string
   sink_table: string
+  phase?: string // "snapshot" | "streaming"
 }
 
 type SyncListener = (event: ConnectionSyncEvent) => void
