@@ -672,6 +672,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         )
         .route("/api/v1/storage/s3/{id}", put(update_s3_config).delete(delete_s3_config))
         .route("/api/v1/storage/s3/{id}/browse", get(browse_s3))
+        .route("/api/v1/tables/register-s3", post(register_s3_table))
         .route("/api/v1/storage/s3/{id}/keys", post(update_s3_keys))
         // Quality checks
         .route("/api/v1/quality/checks", get(quality_checks))
@@ -6085,29 +6086,12 @@ async fn start_pipeline(
                                     last_log_time = Instant::now();
                                 }
 
-                                // When transitioning snapshot → streaming, register the table
+                                // When transitioning snapshot → streaming, the table should already be registered
                                 if phase == "streaming" && last_phase == "snapshot" {
                                     tracing::info!(
                                         pipeline_id = %pipeline_id,
-                                        "Snapshot → CDC transition: registering sink table for queries"
+                                        "Snapshot → CDC transition complete"
                                     );
-                                    if let Some(ref s) = sink {
-                                        let s3_uri = format!("s3://{}/{}/", sink_bucket, sink_prefix);
-                                        let ctx = state_clone.ctx.read().await;
-                                        let df_ctx = ctx.datafusion_ctx();
-                                        let url = url::Url::parse(&format!("s3://{}", sink_bucket)).ok();
-                                        if let Some(ref u) = url {
-                                            df_ctx.runtime_env().register_object_store(u, s.object_store());
-                                        }
-                                        let table_name = pipeline_name.replace('-', "_").replace(' ', "_");
-                                        match register_cdc_listing_table(df_ctx, &table_name, &s3_uri, s.object_store(), &sink_bucket).await {
-                                            Ok(()) => tracing::info!(
-                                                table = %table_name,
-                                                "Snapshot table registered — queryable via: SELECT * FROM {}", table_name
-                                            ),
-                                            Err(e) => tracing::warn!(error = %e, "Failed to register snapshot table"),
-                                        }
-                                    }
                                 }
                                 last_phase = phase.clone();
 
@@ -6124,6 +6108,28 @@ async fn start_pipeline(
                                     if phase == "snapshot" {
                                         if let Err(e) = s.flush().await {
                                             tracing::error!(error = %e, "Snapshot flush failed");
+                                        } else if s.files_written() == 1 {
+                                            // First snapshot file written — register via API (runs in main context)
+                                            let table_name = pipeline_name.replace('-', "_").replace(' ', "_");
+                                            let s3_uri = format!("s3://{}/{}/", sink_bucket, sink_prefix);
+                                            tracing::info!(table = %table_name, s3 = %s3_uri, "Registering snapshot table via API");
+                                            let client = reqwest::Client::new();
+                                            let _ = client.post("http://127.0.0.1:3000/api/v1/tables/register-s3")
+                                                .json(&serde_json::json!({
+                                                    "table_name": table_name,
+                                                    "s3_uri": s3_uri,
+                                                    "s3_config_name": "",
+                                                }))
+                                                .send()
+                                                .await
+                                                .map(|r| {
+                                                    if r.status().is_success() {
+                                                        tracing::info!(table = %table_name, "Snapshot table registered — queryable");
+                                                    } else {
+                                                        tracing::warn!(status = %r.status(), "Snapshot table registration returned non-200");
+                                                    }
+                                                })
+                                                .map_err(|e| tracing::warn!(error = %e, "Failed to call register-s3 API"));
                                         }
                                     }
                                 }
@@ -6185,35 +6191,26 @@ async fn start_pipeline(
                                 "Parquet sink: final flush complete"
                             );
 
-                            // Register the S3 path as a queryable ListingTable in DataFusion
-                            let s3_uri = format!("s3://{}/{}/", sink_bucket, sink_prefix);
-                            tracing::info!(
-                                s3_uri = %s3_uri,
-                                "Registering CDC sink as queryable table"
-                            );
-
-                            // Register the object store and listing table
-                            let ctx = state_clone.ctx.read().await;
-                            let df_ctx = ctx.datafusion_ctx();
-
-                            // Register S3 object store with DataFusion
-                            let url = url::Url::parse(&format!("s3://{}", sink_bucket)).ok();
-                            if let Some(ref u) = url {
-                                df_ctx.runtime_env().register_object_store(u, s.object_store());
-                            }
-
-                            // Create a ListingTable over the sink prefix
+                            // Register via API (runs in main DataFusion context)
                             let table_name = pipeline_name.replace('-', "_").replace(' ', "_");
-                            match register_cdc_listing_table(df_ctx, &table_name, &s3_uri, s.object_store(), &sink_bucket).await {
-                                Ok(()) => tracing::info!(
-                                    table = %table_name, s3 = %s3_uri,
-                                    "CDC sink table registered — queryable via: SELECT * FROM {}", table_name
-                                ),
-                                Err(e) => tracing::warn!(
-                                    error = %e,
-                                    "Failed to register CDC sink as ListingTable"
-                                ),
-                            }
+                            let s3_uri = format!("s3://{}/{}/", sink_bucket, sink_prefix);
+                            let client = reqwest::Client::new();
+                            let _ = client.post("http://127.0.0.1:3000/api/v1/tables/register-s3")
+                                .json(&serde_json::json!({
+                                    "table_name": table_name,
+                                    "s3_uri": s3_uri,
+                                    "s3_config_name": "",
+                                }))
+                                .send()
+                                .await
+                                .map(|r| {
+                                    if r.status().is_success() {
+                                        tracing::info!(table = %table_name, "CDC sink table registered on pipeline stop");
+                                    } else {
+                                        tracing::warn!(status = %r.status(), "CDC sink table registration failed on stop");
+                                    }
+                                })
+                                .map_err(|e| tracing::warn!(error = %e, "Failed to call register-s3 API on stop"));
                         }
                     }
 
@@ -6794,6 +6791,59 @@ fn iceberg_type_to_arrow(iceberg_type: &str) -> arrow::datatypes::DataType {
 ///
 /// Creates a DataFusion ListingTable that reads .parquet files from the S3 path.
 /// Schema is inferred from the Parquet file headers (fast — only reads footer metadata).
+/// POST /api/v1/tables/register-s3 — register an S3 parquet path as a queryable table.
+/// Called by the CDC consumer after writing parquet files to S3.
+async fn register_s3_table(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<serde_json::Value>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let table_name = req.get("table_name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let s3_uri = req.get("s3_uri").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let s3_config_name = req.get("s3_config_name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+    if table_name.is_empty() || s3_uri.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, Json(ErrorResponse {
+            error: "table_name and s3_uri are required".into(),
+        })));
+    }
+
+    // Find S3 config for credentials
+    let configs = state.s3_configs.read().await;
+    let cfg = configs.iter().find(|c| {
+        c.name == s3_config_name || s3_uri.contains(&c.bucket)
+    }).cloned();
+    drop(configs);
+
+    let cfg = cfg.ok_or_else(|| (StatusCode::BAD_REQUEST, Json(ErrorResponse {
+        error: format!("No S3 config found for '{}'", s3_config_name),
+    })))?;
+
+    // Build object store with correct credentials
+    let store = crate::iceberg_s3::build_s3_store(
+        &cfg.bucket, &cfg.access_key, &cfg.secret_key, &cfg.region,
+        if cfg.endpoint.is_empty() { None } else { Some(&cfg.endpoint) },
+    ).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e })))?;
+
+    // Register in main DataFusion context
+    let ctx = state.ctx.read().await;
+    let df_ctx = ctx.datafusion_ctx();
+
+    match register_cdc_listing_table(df_ctx, &table_name, &s3_uri, store, &cfg.bucket).await {
+        Ok(()) => {
+            tracing::info!(table = %table_name, s3 = %s3_uri, "S3 table registered via API");
+            Ok(Json(serde_json::json!({
+                "status": "registered",
+                "table_name": table_name,
+                "s3_uri": s3_uri,
+            })))
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, table = %table_name, "S3 table registration failed");
+            Err((StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e })))
+        }
+    }
+}
+
 /// Register a CDC sink S3 path as a queryable ListingTable in the default schema.
 /// Also registers the S3 object store if not already present.
 async fn register_cdc_listing_table(

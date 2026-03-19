@@ -198,6 +198,7 @@ impl ParquetSink {
     }
 
     /// Get a clone of the underlying ObjectStore for DataFusion registration.
+    #[allow(dead_code)]
     pub fn object_store(&self) -> Arc<dyn ObjectStore> {
         self.store.clone()
     }
