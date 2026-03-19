@@ -27,6 +27,7 @@ mod state;
 mod trino_client;
 mod trino_provider;
 mod credential_store;
+mod parquet_sink;
 mod state_db;
 mod ws;
 

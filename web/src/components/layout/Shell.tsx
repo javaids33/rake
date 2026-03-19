@@ -2,6 +2,7 @@ import { createContext, useContext, useEffect, useMemo } from 'react'
 import { Outlet } from 'react-router-dom'
 import { Sidebar } from './Sidebar'
 import { Header } from './Header'
+import { FloatingSqlEditor } from '../editor/FloatingSqlEditor'
 import { useAppStore } from '../../stores/app'
 import { cn } from '../../lib/utils'
 import { useEventStream } from '../../hooks/useEventStream'
@@ -63,6 +64,7 @@ export function Shell() {
             <Outlet />
           </main>
         </div>
+        <FloatingSqlEditor />
       </div>
     </EventStreamContext.Provider>
   )

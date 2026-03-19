@@ -5877,23 +5877,83 @@ async fn start_pipeline(
                     "NOTE: Events are captured in Arrow RecordBatch format. Sink write to S3/Iceberg is not yet implemented — events are counted but not persisted to the sink path. Use the CDC event data for monitoring. Full sink write requires Parquet writer + Iceberg metadata commit."
                 );
 
+                // Build S3 Parquet sink if the sink_table is an S3 path
+                let parquet_sink = if pipeline.sink_table.starts_with("s3://") || pipeline.sink_table.starts_with("s3a://") {
+                    // Find matching S3 config for credentials
+                    let s3_configs = state.s3_configs.read().await;
+                    let matching_config = s3_configs.iter().find(|c| {
+                        pipeline.sink_table.contains(&c.bucket)
+                    }).cloned();
+                    drop(s3_configs);
+
+                    match matching_config {
+                        Some(cfg) => {
+                            let sink_config = crate::parquet_sink::ParquetSinkConfig::from_s3_uri(
+                                &pipeline.sink_table,
+                                Some(cfg.endpoint.clone()),
+                                cfg.access_key.clone(),
+                                cfg.secret_key.clone(),
+                                cfg.region.clone(),
+                            );
+                            match sink_config {
+                                Ok(sc) => match crate::parquet_sink::ParquetSink::new(&sc, 500) {
+                                    Ok(sink) => {
+                                        tracing::info!(
+                                            pipeline_id = %id, sink = %pipeline.sink_table,
+                                            "S3 Parquet sink ENABLED — batches will be written to S3"
+                                        );
+                                        Some(sink)
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(error = %e, "Failed to create Parquet sink — events will be counted only");
+                                        None
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "Failed to parse sink URI — events will be counted only");
+                                    None
+                                }
+                            }
+                        }
+                        None => {
+                            tracing::warn!(
+                                sink = %pipeline.sink_table,
+                                "No matching S3 config found for sink — events will be counted only. Add the S3 bucket in Data Sources first."
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+
                 // Spawn background task to consume CDC events
                 let state_clone = state.clone();
                 let pipeline_id = id.clone();
                 let pipeline_name = pipeline.name.clone();
                 let pipeline_sink = pipeline.sink_table.clone();
                 let pipeline_source = pipeline.source_type.clone();
+                // Extract bucket and prefix for post-flush table registration
+                let (sink_bucket, sink_prefix) = {
+                    let stripped = pipeline.sink_table.strip_prefix("s3://")
+                        .or_else(|| pipeline.sink_table.strip_prefix("s3a://"))
+                        .unwrap_or(&pipeline.sink_table);
+                    let slash = stripped.find('/').unwrap_or(stripped.len());
+                    (stripped[..slash].to_string(), if slash < stripped.len() { stripped[slash+1..].trim_end_matches('/').to_string() } else { String::new() })
+                };
                 tokio::spawn(async move {
                     let mut total_events: u64 = 0;
                     let mut last_log_time = Instant::now();
+                    let mut sink = parquet_sink;
+
                     while let Some(result) = rx.recv().await {
                         match result {
                             Ok(batch) => {
                                 let rows = batch.num_rows() as u64;
                                 total_events += rows;
 
-                                // Log every batch for the first 10, then every 30 seconds
-                                let should_log = total_events <= 10 * rows || last_log_time.elapsed().as_secs() >= 30;
+                                // Log periodically
+                                let should_log = total_events <= 500 || last_log_time.elapsed().as_secs() >= 30;
                                 if should_log {
                                     tracing::info!(
                                         pipeline_id = %pipeline_id,
@@ -5901,19 +5961,23 @@ async fn start_pipeline(
                                         batch_rows = rows,
                                         total_events = total_events,
                                         sink = %pipeline_sink,
-                                        columns = ?batch.schema().fields().iter().map(|f| f.name().as_str()).collect::<Vec<_>>(),
+                                        sink_enabled = sink.is_some(),
                                         "CDC batch received"
                                     );
                                     last_log_time = Instant::now();
                                 }
 
-                                // Legacy log line for grep compatibility
-                                tracing::debug!(
-                                    pipeline_id = %pipeline_id,
-                                    batch_rows = rows,
-                                    total_events = total_events,
-                                    "CDC batch received"
-                                );
+                                // Write batch to S3 Parquet sink (if configured)
+                                if let Some(ref mut s) = sink {
+                                    if let Err(e) = s.write_batch(batch).await {
+                                        tracing::error!(
+                                            pipeline_id = %pipeline_id,
+                                            error = %e,
+                                            "Parquet sink write failed"
+                                        );
+                                    }
+                                }
+
                                 // Update events_processed counter
                                 let mut pipelines =
                                     state_clone.streaming_pipelines.write().await;
@@ -5947,6 +6011,51 @@ async fn start_pipeline(
                             }
                         }
                     }
+
+                    // Flush remaining buffered events to S3
+                    if let Some(ref mut s) = sink {
+                        if let Err(e) = s.flush().await {
+                            tracing::error!(pipeline_id = %pipeline_id, error = %e, "Final flush failed");
+                        } else if s.files_written() > 0 {
+                            tracing::info!(
+                                pipeline_id = %pipeline_id,
+                                files_written = s.files_written(),
+                                total_rows = s.total_rows_written(),
+                                "Parquet sink: final flush complete"
+                            );
+
+                            // Register the S3 path as a queryable ListingTable in DataFusion
+                            let s3_uri = format!("s3://{}/{}/", sink_bucket, sink_prefix);
+                            tracing::info!(
+                                s3_uri = %s3_uri,
+                                "Registering CDC sink as queryable table"
+                            );
+
+                            // Register the object store and listing table
+                            let ctx = state_clone.ctx.read().await;
+                            let df_ctx = ctx.datafusion_ctx();
+
+                            // Register S3 object store with DataFusion
+                            let url = url::Url::parse(&format!("s3://{}", sink_bucket)).ok();
+                            if let Some(ref u) = url {
+                                df_ctx.runtime_env().register_object_store(u, s.object_store());
+                            }
+
+                            // Create a ListingTable over the sink prefix
+                            let table_name = pipeline_name.replace('-', "_").replace(' ', "_");
+                            match register_cdc_listing_table(df_ctx, &table_name, &s3_uri, s.object_store(), &sink_bucket).await {
+                                Ok(()) => tracing::info!(
+                                    table = %table_name, s3 = %s3_uri,
+                                    "CDC sink table registered — queryable via: SELECT * FROM {}", table_name
+                                ),
+                                Err(e) => tracing::warn!(
+                                    error = %e,
+                                    "Failed to register CDC sink as ListingTable"
+                                ),
+                            }
+                        }
+                    }
+
                     // Pipeline ended — update status
                     let mut pipelines = state_clone.streaming_pipelines.write().await;
                     if let Some(p) = pipelines.iter_mut().find(|p| p.id == pipeline_id) {
@@ -6520,6 +6629,45 @@ fn iceberg_type_to_arrow(iceberg_type: &str) -> arrow::datatypes::DataType {
 ///
 /// Creates a DataFusion ListingTable that reads .parquet files from the S3 path.
 /// Schema is inferred from the Parquet file headers (fast — only reads footer metadata).
+/// Register a CDC sink S3 path as a queryable ListingTable in the default schema.
+/// Also registers the S3 object store if not already present.
+async fn register_cdc_listing_table(
+    df_ctx: &datafusion::prelude::SessionContext,
+    table_name: &str,
+    s3_data_path: &str,
+    store: Arc<dyn object_store::ObjectStore>,
+    bucket: &str,
+) -> Result<(), String> {
+    use datafusion::datasource::listing::{ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl};
+    use datafusion::datasource::file_format::parquet::ParquetFormat;
+
+    // Register the object store with DataFusion's runtime so it can read S3 files
+    let url = url::Url::parse(&format!("s3://{}", bucket))
+        .map_err(|e| format!("URL parse for bucket '{}': {}", bucket, e))?;
+    df_ctx.runtime_env().register_object_store(&url, store);
+
+    let table_url = ListingTableUrl::parse(s3_data_path)
+        .map_err(|e| format!("ListingTableUrl '{}': {}", s3_data_path, e))?;
+
+    let parquet_format = ParquetFormat::default();
+    let listing_options = ListingOptions::new(Arc::new(parquet_format))
+        .with_file_extension(".parquet");
+
+    let config = ListingTableConfig::new(table_url)
+        .with_listing_options(listing_options)
+        .infer_schema(&df_ctx.state())
+        .await
+        .map_err(|e| format!("Schema infer at '{}': {}", s3_data_path, e))?;
+
+    let listing_table = ListingTable::try_new(config)
+        .map_err(|e| format!("ListingTable '{}': {}", table_name, e))?;
+
+    df_ctx.register_table(table_name, Arc::new(listing_table))
+        .map_err(|e| format!("Register '{}': {}", table_name, e))?;
+
+    Ok(())
+}
+
 async fn try_register_listing_table(
     df_ctx: &datafusion::prelude::SessionContext,
     table_name: &str,
