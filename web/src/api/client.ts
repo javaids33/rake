@@ -137,6 +137,10 @@ export const updateS3Config = (name: string, c: Partial<S3Config> & { secret_key
   request<{ status: string; sync_status: string }>(`/api/v1/storage/s3/${name}`, { method: 'PUT', body: JSON.stringify(c) })
 export const deleteS3Config = (name: string) =>
   request<{ status: string }>(`/api/v1/storage/s3/${name}`, { method: 'DELETE' })
+export const browseS3 = (name: string, prefix = '') =>
+  request<{ bucket: string; prefix: string; entries: Array<{ name: string; type: string; key: string; size: number; last_modified?: string; extension?: string }>; count: number }>(
+    `/api/v1/storage/s3/${name}/browse${prefix ? `?prefix=${encodeURIComponent(prefix)}` : ''}`
+  )
 
 // EXPLAIN
 export const explainSql = (sql: string) =>

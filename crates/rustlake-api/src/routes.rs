@@ -670,6 +670,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
             get(list_s3_configs).post(add_s3_config),
         )
         .route("/api/v1/storage/s3/{id}", put(update_s3_config).delete(delete_s3_config))
+        .route("/api/v1/storage/s3/{id}/browse", get(browse_s3))
         // Quality checks
         .route("/api/v1/quality/checks", get(quality_checks))
         .route(
@@ -6923,6 +6924,110 @@ async fn discover_s3_tables(
         table_formats,
         format_counts: scan_result.format_counts,
     })
+}
+
+/// GET /api/v1/storage/s3/{name}/browse?prefix=path/ — list objects in an S3 bucket.
+async fn browse_s3(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let prefix = params.get("prefix").cloned().unwrap_or_default();
+
+    let configs = state.s3_configs.read().await;
+    let cfg = configs.iter().find(|c| c.name == name).cloned();
+    drop(configs);
+
+    let cfg = cfg.ok_or_else(|| (StatusCode::NOT_FOUND, Json(ErrorResponse {
+        error: format!("S3 config '{}' not found", name),
+    })))?;
+
+    // Build S3 store
+    let store = crate::iceberg_s3::build_s3_store(
+        &cfg.bucket, &cfg.access_key, &cfg.secret_key, &cfg.region,
+        if cfg.endpoint.is_empty() { None } else { Some(&cfg.endpoint) },
+    ).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e })))?;
+
+    // List objects with the given prefix
+    use futures::TryStreamExt;
+    let list_prefix = if prefix.is_empty() {
+        None
+    } else {
+        Some(object_store::path::Path::from(prefix.as_str()))
+    };
+
+    let mut entries: Vec<serde_json::Value> = Vec::new();
+    let mut dirs: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    let stream = store.list(list_prefix.as_ref());
+    let objects: Vec<_> = stream.try_collect().await.map_err(|e| {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse {
+            error: format!("S3 list failed: {}", e),
+        }))
+    })?;
+
+    for meta in &objects {
+        let key = meta.location.to_string();
+        let relative = if prefix.is_empty() {
+            key.clone()
+        } else {
+            key.strip_prefix(&prefix).unwrap_or(&key).trim_start_matches('/').to_string()
+        };
+
+        // If the relative path has a /, it's in a subdirectory — collect the dir name
+        if let Some(slash) = relative.find('/') {
+            let dir = &relative[..slash];
+            if dirs.insert(dir.to_string()) {
+                let dir_prefix = if prefix.is_empty() {
+                    format!("{}/", dir)
+                } else {
+                    format!("{}{}/", prefix.trim_end_matches('/'), if prefix.ends_with('/') { "" } else { "/" }).replacen("//", "/", 1)
+                        + dir + "/"
+                };
+                // Simplified: just use the directory name with prefix
+                let full_dir = format!("{}{}/", if prefix.is_empty() { "" } else { &prefix }, dir);
+                entries.push(serde_json::json!({
+                    "name": dir,
+                    "type": "directory",
+                    "key": full_dir,
+                    "size": 0,
+                }));
+            }
+        } else if !relative.is_empty() {
+            // It's a file at this level
+            let ext = relative.rsplit('.').next().unwrap_or("");
+            entries.push(serde_json::json!({
+                "name": relative,
+                "type": "file",
+                "key": key,
+                "size": meta.size,
+                "last_modified": meta.last_modified.to_rfc3339(),
+                "extension": ext,
+            }));
+        }
+    }
+
+    // Sort: directories first, then files
+    entries.sort_by(|a, b| {
+        let a_dir = a.get("type").and_then(|v| v.as_str()) == Some("directory");
+        let b_dir = b.get("type").and_then(|v| v.as_str()) == Some("directory");
+        match (a_dir, b_dir) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => {
+                let a_name = a.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                let b_name = b.get("name").and_then(|v| v.as_str()).unwrap_or("");
+                a_name.cmp(b_name)
+            }
+        }
+    });
+
+    Ok(Json(serde_json::json!({
+        "bucket": cfg.bucket,
+        "prefix": prefix,
+        "entries": entries,
+        "count": entries.len(),
+    })))
 }
 
 async fn list_s3_configs(
