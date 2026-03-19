@@ -6053,6 +6053,7 @@ async fn start_pipeline(
                     let mut total_events: u64 = 0;
                     let mut last_log_time = Instant::now();
                     let mut sink = parquet_sink;
+                    let mut last_phase = String::new();
 
                     while let Some(result) = rx.recv().await {
                         match result {
@@ -6084,6 +6085,32 @@ async fn start_pipeline(
                                     last_log_time = Instant::now();
                                 }
 
+                                // When transitioning snapshot → streaming, register the table
+                                if phase == "streaming" && last_phase == "snapshot" {
+                                    tracing::info!(
+                                        pipeline_id = %pipeline_id,
+                                        "Snapshot → CDC transition: registering sink table for queries"
+                                    );
+                                    if let Some(ref s) = sink {
+                                        let s3_uri = format!("s3://{}/{}/", sink_bucket, sink_prefix);
+                                        let ctx = state_clone.ctx.read().await;
+                                        let df_ctx = ctx.datafusion_ctx();
+                                        let url = url::Url::parse(&format!("s3://{}", sink_bucket)).ok();
+                                        if let Some(ref u) = url {
+                                            df_ctx.runtime_env().register_object_store(u, s.object_store());
+                                        }
+                                        let table_name = pipeline_name.replace('-', "_").replace(' ', "_");
+                                        match register_cdc_listing_table(df_ctx, &table_name, &s3_uri, s.object_store(), &sink_bucket).await {
+                                            Ok(()) => tracing::info!(
+                                                table = %table_name,
+                                                "Snapshot table registered — queryable via: SELECT * FROM {}", table_name
+                                            ),
+                                            Err(e) => tracing::warn!(error = %e, "Failed to register snapshot table"),
+                                        }
+                                    }
+                                }
+                                last_phase = phase.clone();
+
                                 // Write batch to S3 Parquet sink (if configured)
                                 if let Some(ref mut s) = sink {
                                     if let Err(e) = s.write_batch(batch).await {
@@ -6092,6 +6119,12 @@ async fn start_pipeline(
                                             error = %e,
                                             "Parquet sink write failed"
                                         );
+                                    }
+                                    // Force flush snapshot data immediately (don't wait for threshold)
+                                    if phase == "snapshot" {
+                                        if let Err(e) = s.flush().await {
+                                            tracing::error!(error = %e, "Snapshot flush failed");
+                                        }
                                     }
                                 }
 
