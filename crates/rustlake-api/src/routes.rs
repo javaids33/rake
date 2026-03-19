@@ -6097,10 +6097,24 @@ async fn add_s3_config(
         format_counts: std::collections::HashMap::new(),
     };
 
+    // Persist S3 config to DuckDB
     #[cfg(feature = "duckdb")]
     if let Some(ref db) = state.state_db {
         let _ = db.upsert_s3_config(&req.name, &req.endpoint, &req.bucket, &req.region);
     }
+
+    // Persist S3 credentials to encrypted store
+    let s3_creds = crate::state::S3BucketCreds {
+        account_id: String::new(),
+        access_key: req.access_key.clone(),
+        secret_key: req.secret_key.clone(),
+        session_token: None,
+        region: req.region.clone(),
+    };
+    if let Err(e) = state.credential_store.store_s3_creds(&req.bucket, &s3_creds) {
+        tracing::warn!(error = %e, bucket = %req.bucket, "Failed to persist S3 credentials");
+    }
+
     let mut configs = state.s3_configs.write().await;
     configs.push(config);
     drop(configs);
@@ -6108,7 +6122,7 @@ async fn add_s3_config(
     tracing::info!(
         name = %req.name,
         bucket = %req.bucket,
-        "S3 config saved — starting background Iceberg table discovery"
+        "S3 config saved (DuckDB + credentials.enc) — starting background Iceberg table discovery"
     );
 
     // Spawn background task to discover Iceberg tables on S3

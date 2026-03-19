@@ -823,6 +823,60 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Restore S3 configs from DuckDB + credentials
+    #[cfg(feature = "duckdb")]
+    {
+        if let Some(ref db) = state.state_db {
+            let s3_meta = db.load_s3_configs();
+            if !s3_meta.is_empty() {
+                let s3_creds = state.credential_store.load_all_s3_creds();
+                let mut restored_configs: Vec<state::S3Config> = Vec::new();
+                for (name, endpoint, bucket, region) in &s3_meta {
+                    let creds = s3_creds.get(bucket.as_str());
+                    let (access_key, secret_key) = match creds {
+                        Some(c) => (c.access_key.clone(), c.secret_key.clone()),
+                        None => (String::new(), String::new()),
+                    };
+                    let cached_tables = db.load_s3_tables(name);
+                    let table_names: Vec<String> = cached_tables.iter().map(|(t, _, _)| t.clone()).collect();
+                    let table_formats: std::collections::HashMap<String, String> = cached_tables.iter()
+                        .map(|(t, f, _)| (t.clone(), f.clone()))
+                        .collect();
+                    restored_configs.push(state::S3Config {
+                        name: name.clone(),
+                        endpoint: endpoint.clone(),
+                        access_key,
+                        secret_key,
+                        bucket: bucket.clone(),
+                        region: region.clone(),
+                        status: if table_names.is_empty() { "configured".to_string() } else { "ready".to_string() },
+                        created_at: chrono::Utc::now(),
+                        tables: table_names,
+                        table_types: std::collections::HashMap::new(),
+                        table_formats,
+                        sync_status: "cached".to_string(),
+                        sync_error: None,
+                        scan_progress: None,
+                        scan_detail: None,
+                        scan_scanned: 0,
+                        scan_total: 0,
+                        scan_found: 0,
+                        scan_elapsed_ms: 0,
+                        format_counts: std::collections::HashMap::new(),
+                    });
+                }
+                if !restored_configs.is_empty() {
+                    tracing::info!(
+                        count = restored_configs.len(),
+                        total_tables = restored_configs.iter().map(|c| c.tables.len()).sum::<usize>(),
+                        "Restored S3 configs from DuckDB state store"
+                    );
+                    *state.s3_configs.get_mut() = restored_configs;
+                }
+            }
+        }
+    }
+
     // Fetch S3 credentials from external API if configured
     if let Ok(creds_url) = std::env::var("RUSTLAKE_S3_CREDENTIALS_URL") {
         if !creds_url.is_empty() {

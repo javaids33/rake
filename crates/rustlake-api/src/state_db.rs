@@ -258,6 +258,20 @@ impl StateDb {
 
     // ── S3 Config CRUD ──────────────────────────────────────────────
 
+    /// Load all S3 configs from DuckDB.
+    pub fn load_s3_configs(&self) -> Vec<(String, String, String, String)> {
+        let db = match self.db.lock() { Ok(db) => db, Err(_) => return vec![] };
+        let mut stmt = match db.prepare("SELECT name, endpoint, bucket, region FROM s3_configs ORDER BY name") {
+            Ok(s) => s, Err(_) => return vec![],
+        };
+        match stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?))
+        }) {
+            Ok(rows) => rows.filter_map(|r| r.ok()).collect(),
+            Err(_) => vec![],
+        }
+    }
+
     /// Save or update an S3 config.
     pub fn upsert_s3_config(&self, name: &str, endpoint: &str, bucket: &str, region: &str) -> Result<(), String> {
         let db = self.db.lock().map_err(|e| e.to_string())?;
