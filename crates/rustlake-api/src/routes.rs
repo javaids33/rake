@@ -628,6 +628,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         )
         .route("/api/v1/connections/{id}", delete(delete_connection).put(update_connection))
         .route("/api/v1/connections/{id}/status", get(connection_sync_status))
+        .route("/api/v1/connections/{id}/reauth", post(reauth_connection))
         .route(
             "/api/v1/connections/{id}/register/{table}",
             post(register_external_table),
@@ -671,6 +672,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         )
         .route("/api/v1/storage/s3/{id}", put(update_s3_config).delete(delete_s3_config))
         .route("/api/v1/storage/s3/{id}/browse", get(browse_s3))
+        .route("/api/v1/storage/s3/{id}/keys", post(update_s3_keys))
         // Quality checks
         .route("/api/v1/quality/checks", get(quality_checks))
         .route(
@@ -3886,6 +3888,107 @@ async fn list_connections(
     }))
 }
 
+/// POST /api/v1/connections/{id}/reauth — quick re-authentication with just a password.
+/// For cached connections that need credentials re-entered after engine restart.
+async fn reauth_connection(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(req): Json<serde_json::Value>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let password = req.get("password").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let aws_access_key = req.get("aws_access_key").and_then(|v| v.as_str()).map(String::from);
+    let aws_secret_key = req.get("aws_secret_key").and_then(|v| v.as_str()).map(String::from);
+    let aws_session_token = req.get("aws_session_token").and_then(|v| v.as_str()).map(String::from);
+
+    // Find the connection
+    let conn = {
+        let connections = state.connections.read().await;
+        connections.iter().find(|c| c.id == id).cloned()
+    };
+    let conn = conn.ok_or_else(|| (StatusCode::NOT_FOUND, Json(ErrorResponse {
+        error: format!("Connection '{}' not found", id),
+    })))?;
+
+    // Store the password
+    if !password.is_empty() {
+        state.store_password(id.clone(), password.clone()).await;
+    }
+
+    // Update AWS keys if provided
+    if aws_access_key.is_some() || aws_secret_key.is_some() {
+        state.update_connection_entry(&id, |c| {
+            if let Some(ref k) = aws_access_key { c.aws_access_key = Some(k.clone()); }
+            if let Some(ref k) = aws_secret_key { c.aws_secret_key = Some(k.clone()); }
+            if let Some(ref k) = aws_session_token { c.aws_session_token = Some(k.clone()); }
+            c.sync_status = "syncing".to_string();
+            c.status = "connecting".to_string();
+        }).await;
+    } else {
+        state.update_connection_entry(&id, |c| {
+            c.sync_status = "syncing".to_string();
+            c.status = "connecting".to_string();
+        }).await;
+    }
+
+    tracing::info!(
+        conn_id = %id, name = %conn.name, conn_type = %conn.conn_type,
+        "Re-authenticating connection"
+    );
+
+    // Build the full request for background re-discovery
+    let bg_req = AddConnectionRequest {
+        name: conn.name.clone(),
+        conn_type: conn.conn_type.clone(),
+        host: conn.host.clone(),
+        port: conn.port,
+        database: conn.database.clone(),
+        username: conn.username.clone(),
+        password,
+        auth_method: conn.auth_method.clone(),
+        connection_string: conn.connection_string.clone().unwrap_or_default(),
+        aws_access_key: aws_access_key.unwrap_or_else(|| conn.aws_access_key.clone().unwrap_or_default()),
+        aws_secret_key: aws_secret_key.unwrap_or_else(|| conn.aws_secret_key.clone().unwrap_or_default()),
+        aws_session_token: aws_session_token.unwrap_or_else(|| conn.aws_session_token.clone().unwrap_or_default()),
+        aws_region: String::new(),
+    };
+
+    // Spawn background re-discovery
+    let bg_state = state.clone();
+    let bg_id = id.clone();
+    tokio::spawn(async move {
+        let discovery_start = Instant::now();
+        match discover_and_register_tables(&bg_state, &bg_id, &bg_req).await {
+            Ok(tables) => {
+                bg_state.update_connection_entry(&bg_id, |entry| {
+                    entry.tables = tables.clone();
+                    entry.sync_status = "ready".to_string();
+                    entry.status = "connected".to_string();
+                    entry.sync_error = None;
+                }).await;
+                tracing::info!(
+                    conn_id = %bg_id, tables = tables.len(),
+                    elapsed_ms = discovery_start.elapsed().as_millis(),
+                    "Re-auth complete"
+                );
+            }
+            Err(e) => {
+                bg_state.update_connection_entry(&bg_id, |entry| {
+                    entry.sync_status = "error".to_string();
+                    entry.status = "error".to_string();
+                    entry.sync_error = Some(e.clone());
+                }).await;
+                tracing::error!(conn_id = %bg_id, error = %e, "Re-auth failed");
+            }
+        }
+    });
+
+    Ok(Json(serde_json::json!({
+        "status": "syncing",
+        "id": id,
+        "name": conn.name,
+    })))
+}
+
 /// DELETE /api/v1/connections/:id — remove a connection.
 async fn delete_connection(
     State(state): State<Arc<AppState>>,
@@ -7034,6 +7137,57 @@ async fn browse_s3(
         "entries": entries,
         "count": entries.len(),
     })))
+}
+
+/// POST /api/v1/storage/s3/{name}/keys — quick update just the access key + secret key.
+/// For fast re-authentication after key rotation or engine restart with different RUSTLAKE_SECRET_KEY.
+async fn update_s3_keys(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(req): Json<serde_json::Value>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let access_key = req.get("access_key").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let secret_key = req.get("secret_key").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+    if access_key.is_empty() || secret_key.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, Json(ErrorResponse {
+            error: "access_key and secret_key are required".into(),
+        })));
+    }
+
+    let mut configs = state.s3_configs.write().await;
+    let cfg = configs.iter_mut().find(|c| c.name == name);
+    match cfg {
+        Some(c) => {
+            c.access_key = access_key.clone();
+            c.secret_key = secret_key.clone();
+            c.sync_status = "ready".to_string();
+            let bucket = c.bucket.clone();
+            let region = c.region.clone();
+            drop(configs);
+
+            // Persist credentials
+            let s3_creds = crate::state::S3BucketCreds {
+                account_id: String::new(),
+                access_key,
+                secret_key,
+                session_token: None,
+                region,
+            };
+            if let Err(e) = state.credential_store.store_s3_creds(&bucket, &s3_creds) {
+                tracing::warn!(error = %e, "Failed to persist S3 keys");
+            }
+
+            tracing::info!(name = %name, bucket = %bucket, "S3 keys updated");
+            Ok(Json(serde_json::json!({ "status": "updated", "name": name })))
+        }
+        None => {
+            drop(configs);
+            Err((StatusCode::NOT_FOUND, Json(ErrorResponse {
+                error: format!("S3 config '{}' not found", name),
+            })))
+        }
+    }
 }
 
 async fn list_s3_configs(

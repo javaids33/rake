@@ -346,6 +346,12 @@ async fn run_snapshot(
     use futures::TryStreamExt;
     use mongodb::options::FindOptions;
 
+    // Strip schema prefixes (e.g., "mongo.dbx_resume_token_etl" → "dbx_resume_token_etl")
+    let collection = collection
+        .strip_prefix("mongo.")
+        .or_else(|| collection.strip_prefix("mongodb."))
+        .unwrap_or(collection);
+
     let db = client.database(database);
 
     // Get total count for progress reporting
@@ -399,7 +405,7 @@ async fn run_snapshot(
 
             // Log progress every 5 seconds
             if last_log.elapsed().as_secs() >= 5 {
-                let pct = if total_count > 0 { (total_snapshotted as f64 / total_count as f64 * 100.0) } else { 0.0 };
+                let pct = if total_count > 0 { total_snapshotted as f64 / total_count as f64 * 100.0 } else { 0.0 };
                 let elapsed = start.elapsed().as_secs();
                 let rate = if elapsed > 0 { total_snapshotted / elapsed } else { 0 };
                 tracing::info!(
@@ -446,6 +452,12 @@ async fn run_change_stream(
     tx: mpsc::Sender<Result<RecordBatch, String>>,
 ) -> Result<(), String> {
     use mongodb::options::FullDocumentType;
+
+    // Strip schema prefixes from collection name (e.g., "mongo.orders" → "orders")
+    let collection = collection
+        .strip_prefix("mongo.")
+        .or_else(|| collection.strip_prefix("mongodb."))
+        .unwrap_or(collection);
 
     // Build change stream options
     let fd_type = match full_document_mode {
