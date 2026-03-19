@@ -188,7 +188,14 @@ impl MongoDbCdcSource {
         config: &CdcSourceConfig,
         resume_token: Option<ResumeToken>,
     ) -> Result<(Self, mpsc::Receiver<Result<RecordBatch, String>>), String> {
+        tracing::info!(
+            host = %params.host, database = %config.database,
+            collection = %config.collection, full_document = %config.full_document,
+            has_resume_token = resume_token.is_some(),
+            "CDC source: building MongoDB client"
+        );
         let client = params.build_client().await?;
+        tracing::info!("CDC source: MongoDB client connected, opening change stream channel (capacity=64)");
         let (tx, rx) = mpsc::channel::<Result<RecordBatch, String>>(64);
 
         let running = Arc::new(AtomicBool::new(true));
@@ -279,11 +286,20 @@ async fn run_change_stream(
     // Open change stream at collection or database level
     if collection == "*" {
         // Database-level watch — all collections
+        tracing::info!(
+            database = %database,
+            full_document = %full_document_mode,
+            "CDC: Opening DATABASE-level change stream (watching all collections)"
+        );
         let db = client.database(database);
         let mut stream = db
             .watch(pipeline, options)
             .await
-            .map_err(|e| format!("Failed to open database change stream: {}", e))?;
+            .map_err(|e| {
+                tracing::error!(error = %e, database = %database, "CDC: FAILED to open database change stream");
+                format!("Failed to open database change stream: {}", e)
+            })?;
+        tracing::info!(database = %database, "CDC: Change stream OPEN — waiting for events (batch_size=100, flush=500ms)");
 
         let mut batch_buffer: Vec<ChangeStreamEvent<Document>> = Vec::new();
         let batch_size = 100;
@@ -340,12 +356,21 @@ async fn run_change_stream(
         }
     } else {
         // Collection-level watch
+        tracing::info!(
+            database = %database, collection = %collection,
+            full_document = %full_document_mode,
+            "CDC: Opening COLLECTION-level change stream"
+        );
         let db = client.database(database);
         let coll = db.collection::<Document>(collection);
         let mut stream = coll
             .watch(pipeline, options)
             .await
-            .map_err(|e| format!("Failed to open collection change stream: {}", e))?;
+            .map_err(|e| {
+                tracing::error!(error = %e, collection = %collection, "CDC: FAILED to open collection change stream");
+                format!("Failed to open collection change stream: {}", e)
+            })?;
+        tracing::info!(collection = %collection, "CDC: Change stream OPEN — waiting for events");
 
         let mut batch_buffer: Vec<ChangeStreamEvent<Document>> = Vec::new();
         let batch_size = 100;

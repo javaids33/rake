@@ -1095,71 +1095,66 @@ export function SqlEditorPage() {
             </button>
           </div>
 
-          {/* Toolkit tab — quick SQL templates */}
+          {/* Toolkit tab — verified SQL templates that work in DataFusion */}
           {sidebarTab === 'toolkit' && (
             <div className="flex-1 overflow-y-auto p-2 space-y-3">
               {[
                 {
-                  category: 'Table Operations',
-                  color: 'text-amber-400',
-                  templates: [
-                    { label: 'Create Table (CTAS)', sql: 'CREATE TABLE my_table AS\nSELECT * FROM source_table\nWHERE condition = true;' },
-                    { label: 'Create View', sql: 'CREATE VIEW my_view AS\nSELECT col1, col2, SUM(amount) as total\nFROM my_table\nGROUP BY col1, col2;' },
-                    { label: 'Insert Into', sql: 'INSERT INTO target_table\nSELECT * FROM source_table\nWHERE updated_at > NOW() - INTERVAL \'1 hour\';' },
-                    { label: 'Drop Table', sql: 'DROP TABLE IF EXISTS my_table;' },
-                  ]
-                },
-                {
-                  category: 'Data Exploration',
+                  category: 'Explore Data',
                   color: 'text-cyan-400',
                   templates: [
-                    { label: 'Preview (100 rows)', sql: 'SELECT *\nFROM my_table\nLIMIT 100;' },
-                    { label: 'Row Count', sql: 'SELECT COUNT(*) as total_rows\nFROM my_table;' },
-                    { label: 'Column Stats', sql: 'SELECT\n  COUNT(*) as rows,\n  COUNT(DISTINCT col) as unique_vals,\n  MIN(col) as min_val,\n  MAX(col) as max_val,\n  AVG(col) as avg_val\nFROM my_table;' },
-                    { label: 'Null Analysis', sql: 'SELECT\n  COUNT(*) as total,\n  COUNT(col) as non_null,\n  COUNT(*) - COUNT(col) as nulls,\n  ROUND(100.0 * (COUNT(*) - COUNT(col)) / COUNT(*), 2) as null_pct\nFROM my_table;' },
-                    { label: 'Top N Values', sql: 'SELECT col, COUNT(*) as cnt\nFROM my_table\nGROUP BY col\nORDER BY cnt DESC\nLIMIT 20;' },
-                    { label: 'Schema / Describe', sql: 'DESCRIBE my_table;' },
+                    { label: 'Preview Table', sql: 'SELECT * FROM my_table LIMIT 100;' },
+                    { label: 'Row Count', sql: 'SELECT COUNT(*) as total_rows FROM my_table;' },
+                    { label: 'Describe Schema', sql: 'DESCRIBE my_table;' },
+                    { label: 'Show Columns', sql: 'SHOW COLUMNS FROM my_table;' },
+                    { label: 'Column Stats (numeric)', sql: 'SELECT\n  COUNT(*) as rows,\n  COUNT(DISTINCT my_col) as distinct_vals,\n  MIN(my_col) as min_val,\n  MAX(my_col) as max_val,\n  AVG(my_col) as avg_val\nFROM my_table;' },
+                    { label: 'Null % per Column', sql: 'SELECT\n  COUNT(*) as total,\n  COUNT(my_col) as non_null,\n  COUNT(*) - COUNT(my_col) as nulls,\n  ROUND(100.0 * (COUNT(*) - COUNT(my_col)) / COUNT(*), 2) as null_pct\nFROM my_table;' },
+                    { label: 'Value Distribution', sql: 'SELECT my_col, COUNT(*) as cnt\nFROM my_table\nGROUP BY my_col\nORDER BY cnt DESC\nLIMIT 20;' },
                   ]
                 },
                 {
-                  category: 'Cross-Source Queries',
+                  category: 'Cross-Source',
                   color: 'text-emerald-400',
                   templates: [
-                    { label: 'Postgres → Query', sql: 'SELECT * FROM pg.my_table\nLIMIT 100;' },
-                    { label: 'MySQL → Query', sql: 'SELECT * FROM mysql.my_table\nLIMIT 100;' },
-                    { label: 'MongoDB → Query', sql: 'SELECT * FROM mongo.my_collection\nLIMIT 100;' },
-                    { label: 'Cross-Source JOIN', sql: '-- Join data across Postgres and MongoDB\nSELECT\n  p.id, p.name, m.metadata\nFROM pg.users p\nJOIN mongo.user_profiles m\n  ON p.id = CAST(m.user_id AS INT)\nLIMIT 100;' },
+                    { label: 'Postgres Table', sql: 'SELECT * FROM pg.my_table LIMIT 100;' },
+                    { label: 'MySQL Table', sql: 'SELECT * FROM mysql.my_table LIMIT 100;' },
+                    { label: 'MongoDB Collection', sql: 'SELECT * FROM mongo.my_collection LIMIT 100;' },
+                    { label: 'Postgres ↔ MongoDB JOIN', sql: 'SELECT p.*, m.*\nFROM pg.orders p\nJOIN mongo.customers m\n  ON CAST(p.customer_id AS VARCHAR) = m.customer_id\nLIMIT 100;' },
+                    { label: 'Postgres ↔ MySQL JOIN', sql: 'SELECT p.*, m.*\nFROM pg.orders p\nJOIN mysql.products m\n  ON p.product_id = m.id\nLIMIT 100;' },
                   ]
                 },
                 {
-                  category: 'Iceberg / Lakehouse',
-                  color: 'text-violet-400',
+                  category: 'Create & Transform',
+                  color: 'text-amber-400',
                   templates: [
-                    { label: 'Create Iceberg Table', sql: 'CREATE TABLE iceberg.warehouse.events AS\nSELECT * FROM pg.events;' },
-                    { label: 'Materialized View', sql: 'CREATE TABLE iceberg.analytics.daily_revenue AS\nSELECT\n  DATE_TRUNC(\'day\', order_date) as day,\n  SUM(total) as revenue,\n  COUNT(*) as orders\nFROM pg.orders\nGROUP BY 1\nORDER BY 1;' },
-                    { label: 'Incremental Load', sql: 'INSERT INTO iceberg.warehouse.orders\nSELECT * FROM pg.orders\nWHERE updated_at > (\n  SELECT COALESCE(MAX(updated_at), \'1970-01-01\')\n  FROM iceberg.warehouse.orders\n);' },
-                    { label: 'Snapshot Export', sql: '-- Export current state to S3\nCREATE TABLE iceberg.backups.orders_snapshot AS\nSELECT *, NOW() as snapshot_at\nFROM iceberg.warehouse.orders;' },
+                    { label: 'Create Table (CTAS)', sql: 'CREATE TABLE my_snapshot AS\nSELECT * FROM pg.my_table;' },
+                    { label: 'Create View', sql: 'CREATE VIEW my_summary AS\nSELECT\n  category,\n  COUNT(*) as cnt,\n  SUM(amount) as total\nFROM my_table\nGROUP BY category;' },
+                    { label: 'Insert Into Existing', sql: 'INSERT INTO my_table\nSELECT * FROM pg.source_table\nWHERE created_at > \'2024-01-01\';' },
+                    { label: 'Drop Table', sql: 'DROP TABLE IF EXISTS my_table;' },
+                    { label: 'Drop View', sql: 'DROP VIEW IF EXISTS my_view;' },
                   ]
                 },
                 {
                   category: 'ETL Patterns',
-                  color: 'text-rose-400',
+                  color: 'text-violet-400',
                   templates: [
-                    { label: 'Full Sync (Replace)', sql: '-- Drop and recreate\nDROP TABLE IF EXISTS target_table;\nCREATE TABLE target_table AS\nSELECT * FROM source_table;' },
-                    { label: 'SCD Type 1 (Upsert)', sql: '-- Merge new data (DataFusion supports MERGE coming soon)\nCREATE TABLE target_table_new AS\nSELECT * FROM source_table\nUNION ALL\nSELECT t.* FROM target_table t\nWHERE t.id NOT IN (SELECT id FROM source_table);' },
-                    { label: 'Deduplication', sql: 'SELECT DISTINCT ON (id) *\nFROM my_table\nORDER BY id, updated_at DESC;' },
+                    { label: 'Full Sync (replace)', sql: 'DROP TABLE IF EXISTS target;\nCREATE TABLE target AS\nSELECT * FROM pg.source_table;' },
+                    { label: 'Append New Rows', sql: 'INSERT INTO target\nSELECT * FROM pg.source_table s\nWHERE s.id NOT IN (\n  SELECT id FROM target\n);' },
+                    { label: 'Deduplicate', sql: 'CREATE TABLE deduped AS\nSELECT DISTINCT ON (id) *\nFROM my_table\nORDER BY id, updated_at DESC;' },
                     { label: 'Pivot / Aggregate', sql: 'SELECT\n  category,\n  SUM(CASE WHEN status = \'active\' THEN 1 ELSE 0 END) as active,\n  SUM(CASE WHEN status = \'inactive\' THEN 1 ELSE 0 END) as inactive\nFROM my_table\nGROUP BY category;' },
+                    { label: 'Materialized Summary', sql: 'DROP TABLE IF EXISTS daily_summary;\nCREATE TABLE daily_summary AS\nSELECT\n  DATE_TRUNC(\'day\', created_at) as day,\n  COUNT(*) as events,\n  SUM(amount) as total\nFROM my_table\nGROUP BY 1\nORDER BY 1;' },
                   ]
                 },
                 {
-                  category: 'System / Debug',
+                  category: 'Debug & System',
                   color: 'text-zinc-400',
                   templates: [
                     { label: 'List All Tables', sql: 'SHOW TABLES;' },
-                    { label: 'Explain Query Plan', sql: 'EXPLAIN\nSELECT * FROM my_table\nWHERE id > 100;' },
-                    { label: 'Explain Verbose', sql: 'EXPLAIN VERBOSE\nSELECT * FROM my_table\nWHERE id > 100;' },
-                    { label: 'Show Table Schema', sql: 'SHOW COLUMNS FROM my_table;' },
-                    { label: 'System Info', sql: 'SELECT 1 + 1 as health_check;' },
+                    { label: 'Explain Plan', sql: 'EXPLAIN SELECT * FROM my_table WHERE id > 100;' },
+                    { label: 'Explain Verbose', sql: 'EXPLAIN VERBOSE SELECT * FROM my_table;' },
+                    { label: 'Health Check', sql: 'SELECT 1 + 1 as ok;' },
+                    { label: 'Current Time', sql: 'SELECT NOW() as current_timestamp;' },
+                    { label: 'Table Row Counts', sql: '-- Run for each table you care about\nSELECT \'pg.orders\' as tbl, COUNT(*) as rows FROM pg.orders\nUNION ALL\nSELECT \'pg.customers\', COUNT(*) FROM pg.customers;' },
                   ]
                 },
               ].map(group => (

@@ -1098,7 +1098,58 @@ pub(crate) async fn execute_via_duckdb(
     #[cfg(feature = "duckdb")]
     {
         if let Some(ref engine) = state.duckdb_engine {
-            return engine.sql(sql).await.map_err(|e| e.to_string());
+            // Sync referenced tables from DataFusion → DuckDB before executing
+            let sync_start = std::time::Instant::now();
+            let ctx = state.ctx.read().await;
+            let df_ctx = ctx.datafusion_ctx();
+
+            // Extract table names from the SQL (simple heuristic: find FROM/JOIN tokens)
+            let sql_upper = sql.to_uppercase();
+            let table_names = ctx.list_tables().await.unwrap_or_default();
+            let mut tables_to_sync: Vec<(String, Vec<RecordBatch>)> = Vec::new();
+
+            for table_name in &table_names {
+                // Check if this table is referenced in the SQL
+                let check_name = table_name.replace('.', "_").to_uppercase();
+                let dotted_name = table_name.to_uppercase();
+                if sql_upper.contains(&check_name) || sql_upper.contains(&dotted_name) {
+                    // Fetch data from DataFusion
+                    let fetch_sql = format!("SELECT * FROM {}", table_name);
+                    match df_ctx.sql(&fetch_sql).await {
+                        Ok(df) => match df.collect().await {
+                            Ok(batches) if !batches.is_empty() && batches.iter().any(|b| b.num_rows() > 0) => {
+                                let flat_name = table_name.replace('.', "_");
+                                tables_to_sync.push((flat_name, batches));
+                            }
+                            _ => {}
+                        }
+                        Err(_) => {}
+                    }
+                }
+            }
+            drop(ctx);
+
+            if !tables_to_sync.is_empty() {
+                let sync_count = tables_to_sync.len();
+                let synced = engine.sync_tables(tables_to_sync).await.unwrap_or(0);
+                tracing::info!(
+                    tables_synced = synced, tables_attempted = sync_count,
+                    elapsed_ms = sync_start.elapsed().as_millis(),
+                    "DuckDB: synced tables from DataFusion for query"
+                );
+            }
+
+            // Now execute the SQL — rewrite table names from schema.table to schema_table
+            let rewritten_sql = table_names.iter().fold(sql.to_string(), |s, name| {
+                if name.contains('.') {
+                    let flat = name.replace('.', "_");
+                    s.replace(name, &flat)
+                } else {
+                    s
+                }
+            });
+
+            return engine.sql(&rewritten_sql).await.map_err(|e| e.to_string());
         }
     }
     Err("DuckDB engine not available".to_string())
@@ -1112,7 +1163,40 @@ pub(crate) async fn execute_via_polars(
     #[cfg(feature = "polars")]
     {
         if let Some(ref engine) = state.polars_engine {
-            return engine.sql(sql).await.map_err(|e| e.to_string());
+            // Sync referenced tables from DataFusion → Polars before executing
+            let ctx = state.ctx.read().await;
+            let df_ctx = ctx.datafusion_ctx();
+            let sql_upper = sql.to_uppercase();
+            let table_names = ctx.list_tables().await.unwrap_or_default();
+            let mut tables_to_sync: Vec<(String, Vec<RecordBatch>)> = Vec::new();
+
+            for table_name in &table_names {
+                let check_name = table_name.replace('.', "_").to_uppercase();
+                let dotted_name = table_name.to_uppercase();
+                if sql_upper.contains(&check_name) || sql_upper.contains(&dotted_name) {
+                    let fetch_sql = format!("SELECT * FROM {}", table_name);
+                    if let Ok(df) = df_ctx.sql(&fetch_sql).await {
+                        if let Ok(batches) = df.collect().await {
+                            if !batches.is_empty() && batches.iter().any(|b| b.num_rows() > 0) {
+                                let flat_name = table_name.replace('.', "_");
+                                tables_to_sync.push((flat_name, batches));
+                            }
+                        }
+                    }
+                }
+            }
+            drop(ctx);
+
+            if !tables_to_sync.is_empty() {
+                let synced = engine.sync_tables(tables_to_sync).await.unwrap_or(0);
+                tracing::info!(tables_synced = synced, "Polars: synced tables from DataFusion");
+            }
+
+            let rewritten_sql = table_names.iter().fold(sql.to_string(), |s, name| {
+                if name.contains('.') { s.replace(name, &name.replace('.', "_")) } else { s }
+            });
+
+            return engine.sql(&rewritten_sql).await.map_err(|e| e.to_string());
         }
     }
     Err("Polars engine not available".to_string())
@@ -5681,9 +5765,16 @@ async fn start_pipeline(
     })?;
 
     if pipeline.source_type == "mongodb-cdc" {
+        tracing::info!(
+            pipeline_id = %id, pipeline_name = %pipeline.name,
+            sink = %pipeline.sink_table,
+            "[CDC:1/5] Parsing source config"
+        );
+
         // Parse CDC config from source_config
         let cdc_config: crate::mongodb_cdc::CdcSourceConfig =
             serde_json::from_value(pipeline.source_config.clone()).map_err(|e| {
+                tracing::error!(error = %e, "[CDC:1/5] FAILED — invalid source_config JSON");
                 (
                     StatusCode::BAD_REQUEST,
                     Json(ErrorResponse {
@@ -5691,6 +5782,14 @@ async fn start_pipeline(
                     }),
                 )
             })?;
+
+        tracing::info!(
+            connection_id = %cdc_config.connection_id,
+            database = %cdc_config.database,
+            collection = %cdc_config.collection,
+            full_document = %cdc_config.full_document,
+            "[CDC:2/5] Resolving MongoDB connection"
+        );
 
         // Find the MongoDB connection to get params
         let mongo_params = if !cdc_config.connection_id.is_empty() {
@@ -5704,10 +5803,22 @@ async fn start_pipeline(
                 Some(c) => {
                     let passwords = state.connection_passwords.read().await;
                     let password = passwords.get(&c.id).cloned().unwrap_or_default();
+                    let has_password = !password.is_empty();
                     drop(passwords);
+                    tracing::info!(
+                        conn_name = %c.name, host = %c.host, port = %c.port,
+                        database = %c.database, auth_method = %c.auth_method,
+                        has_password = has_password,
+                        has_aws_key = c.aws_access_key.is_some(),
+                        "[CDC:2/5] Connection resolved — building MongoDB client params"
+                    );
                     build_mongo_params_from_entry(&c, &password)
                 }
                 None => {
+                    tracing::error!(
+                        connection_id = %cdc_config.connection_id,
+                        "[CDC:2/5] FAILED — connection not found in state"
+                    );
                     return Err((
                         StatusCode::NOT_FOUND,
                         Json(ErrorResponse {
@@ -5720,24 +5831,33 @@ async fn start_pipeline(
                 }
             }
         } else {
-            // Use database field directly with default local connection
+            tracing::info!(
+                database = %cdc_config.database,
+                "[CDC:2/5] No connection_id — using default local MongoDB params"
+            );
             crate::mongodb_conn::MongoConnParams {
                 database: cdc_config.database.clone(),
                 ..Default::default()
             }
         };
 
+        tracing::info!(
+            host = %mongo_params.host, port = %mongo_params.port,
+            database = %mongo_params.database,
+            collection = %cdc_config.collection,
+            "[CDC:3/5] Starting Change Stream consumer"
+        );
+
         // Start the CDC source
         match crate::mongodb_cdc::MongoDbCdcSource::start(&mongo_params, &cdc_config, None).await {
             Ok((source, mut rx)) => {
-                let source = std::sync::Arc::new(source);
+                tracing::info!(
+                    pipeline_id = %id,
+                    "[CDC:4/5] Change Stream started — consumer active, waiting for events"
+                );
 
-                // Store the source handle
-                state
-                    .cdc_sources
-                    .write()
-                    .await
-                    .insert(id.clone(), source.clone());
+                let source = std::sync::Arc::new(source);
+                state.cdc_sources.write().await.insert(id.clone(), source.clone());
 
                 // Update pipeline status
                 {
@@ -5747,6 +5867,16 @@ async fn start_pipeline(
                     }
                 }
 
+                tracing::info!(
+                    pipeline_id = %id,
+                    sink = %pipeline.sink_table,
+                    "[CDC:5/5] Pipeline RUNNING — events will be counted and broadcast via SSE"
+                );
+                tracing::info!(
+                    pipeline_id = %id,
+                    "NOTE: Events are captured in Arrow RecordBatch format. Sink write to S3/Iceberg is not yet implemented — events are counted but not persisted to the sink path. Use the CDC event data for monitoring. Full sink write requires Parquet writer + Iceberg metadata commit."
+                );
+
                 // Spawn background task to consume CDC events
                 let state_clone = state.clone();
                 let pipeline_id = id.clone();
@@ -5755,12 +5885,30 @@ async fn start_pipeline(
                 let pipeline_source = pipeline.source_type.clone();
                 tokio::spawn(async move {
                     let mut total_events: u64 = 0;
+                    let mut last_log_time = Instant::now();
                     while let Some(result) = rx.recv().await {
                         match result {
                             Ok(batch) => {
                                 let rows = batch.num_rows() as u64;
                                 total_events += rows;
-                                tracing::info!(
+
+                                // Log every batch for the first 10, then every 30 seconds
+                                let should_log = total_events <= 10 * rows || last_log_time.elapsed().as_secs() >= 30;
+                                if should_log {
+                                    tracing::info!(
+                                        pipeline_id = %pipeline_id,
+                                        pipeline_name = %pipeline_name,
+                                        batch_rows = rows,
+                                        total_events = total_events,
+                                        sink = %pipeline_sink,
+                                        columns = ?batch.schema().fields().iter().map(|f| f.name().as_str()).collect::<Vec<_>>(),
+                                        "CDC batch received"
+                                    );
+                                    last_log_time = Instant::now();
+                                }
+
+                                // Legacy log line for grep compatibility
+                                tracing::debug!(
                                     pipeline_id = %pipeline_id,
                                     batch_rows = rows,
                                     total_events = total_events,
