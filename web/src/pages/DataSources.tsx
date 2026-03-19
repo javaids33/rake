@@ -655,13 +655,14 @@ export function DataSources() {
               {connections.map(c => {
                 const isSyncing = c.sync_status === 'syncing'
                 const isSyncError = c.sync_status === 'error'
+                const isCached = c.sync_status === 'cached'
                 return (
                 <Card key={c.id} className={cn("flex items-center gap-4", isSyncing && "border-amber-400/20")}>
                   <div className="w-10 h-10 rounded-lg bg-cyan-400/[0.06] border border-cyan-400/10 flex items-center justify-center relative">
                     <Server className="w-5 h-5 text-cyan-400" />
                     <span style={{
                       position: 'absolute', top: -2, right: -2, width: 10, height: 10, borderRadius: '50%',
-                      background: isSyncing ? '#f59e0b' : isSyncError ? '#ef4444' : '#22c55e',
+                      background: isSyncing ? '#f59e0b' : isSyncError ? '#ef4444' : isCached ? '#64748b' : '#22c55e',
                       border: '2px solid rgba(2,6,23,0.8)',
                       boxShadow: `0 0 6px ${isSyncing ? 'rgba(245,158,11,0.4)' : isSyncError ? 'rgba(239,68,68,0.4)' : 'rgba(34,197,94,0.4)'}`,
                       animation: isSyncing ? 'pulse 2s infinite' : undefined,
@@ -683,6 +684,10 @@ export function DataSources() {
                         </Badge>
                       ) : isSyncError ? (
                         <Badge className="bg-red-400/10 text-red-400 border-red-400/20 text-2xs">Sync Failed</Badge>
+                      ) : isCached ? (
+                        <Badge className="bg-zinc-400/10 text-zinc-400 border-zinc-400/20 text-2xs">
+                          Cached {c.tables.length > 0 && `(${c.tables.length} tables)`}
+                        </Badge>
                       ) : (
                         <Badge className="bg-emerald-400/8 text-emerald-400/80 border-emerald-400/10 text-2xs">
                           Connected {c.tables.length > 0 && `(${c.tables.length} tables)`}
@@ -690,6 +695,17 @@ export function DataSources() {
                       )}
                     </div>
                     <p className="text-2xs font-mono text-zinc-500 mt-0.5">{c.host}:{c.port}/{c.database}</p>
+                    {isCached && c.status === 'cached' && (
+                      <div className="flex items-center gap-2 mt-1">
+                        <span className="text-2xs text-zinc-500">Restored from cache — </span>
+                        <button
+                          onClick={() => handleEditConnection(c)}
+                          className="text-2xs text-amber-400 font-medium hover:text-amber-300 underline transition-colors"
+                        >
+                          Re-enter credentials to reconnect
+                        </button>
+                      </div>
+                    )}
                     {/* Discovery progress bar */}
                     {isSyncing && (
                       <div className="mt-2">
@@ -793,7 +809,9 @@ export function DataSources() {
                 const s3IsSyncing = s3SyncStatus === 'syncing'
                 const s3IsError = s3SyncStatus === 'error'
                 const s3IsReady = s3SyncStatus === 'ready'
-                const dotColor = s3IsError ? '#ef4444' : s3IsSyncing ? '#f59e0b' : '#22c55e'
+                const s3IsCached = s3SyncStatus === 'cached'
+                const s3NeedsCreds = s3IsCached && !c.access_key
+                const dotColor = s3IsError ? '#ef4444' : s3IsSyncing ? '#f59e0b' : s3NeedsCreds ? '#f59e0b' : '#22c55e'
                 const scanProg = s3ScanState[c.name]
                 const pct = scanProg && scanProg.total > 0 ? Math.round((scanProg.scanned / scanProg.total) * 100) : 0
                 // Format badges for ready state
@@ -829,6 +847,12 @@ export function DataSources() {
                         <Badge className="bg-emerald-400/8 text-emerald-400/80 border-emerald-400/10 text-2xs">
                           Ready {c.tables && c.tables.length > 0 && `(${c.tables.length} tables)`}
                         </Badge>
+                      ) : s3NeedsCreds ? (
+                        <Badge className="bg-amber-400/10 text-amber-400 border-amber-400/20 text-2xs">Credentials Required</Badge>
+                      ) : s3IsCached ? (
+                        <Badge className="bg-zinc-400/8 text-zinc-400/80 border-zinc-400/10 text-2xs">
+                          Cached {c.tables && c.tables.length > 0 && `(${c.tables.length} tables)`}
+                        </Badge>
                       ) : (
                         <Badge className="bg-emerald-400/8 text-emerald-400/80 border-emerald-400/10 text-2xs">Connected</Badge>
                       )}
@@ -839,7 +863,18 @@ export function DataSources() {
                         </Badge>
                       ))}
                     </div>
-                    <p className="text-2xs font-mono text-zinc-500 mt-0.5">{c.endpoint}</p>
+                    <p className="text-2xs font-mono text-zinc-500 mt-0.5">s3://{c.bucket} {c.endpoint ? `(${c.endpoint})` : ''}</p>
+                    {s3NeedsCreds && (
+                      <div className="flex items-center gap-2 mt-2">
+                        <span className="text-2xs text-amber-400/80">Credentials expired — re-enter to reconnect</span>
+                        <button
+                          onClick={() => handleEditS3(c)}
+                          className="text-2xs text-amber-400 font-medium hover:text-amber-300 underline transition-colors"
+                        >
+                          Update Credentials
+                        </button>
+                      </div>
+                    )}
                     {s3IsError && c.sync_error && (
                       <p className="text-2xs text-red-400/80 mt-1">{c.sync_error}</p>
                     )}

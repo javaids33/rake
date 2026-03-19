@@ -6863,10 +6863,26 @@ async fn update_s3_config(
     cfg.status = "configured".to_string();
     drop(configs);
 
+    // Persist updated config to DuckDB + credentials
+    #[cfg(feature = "duckdb")]
+    if let Some(ref db) = state.state_db {
+        let _ = db.upsert_s3_config(&req.name, &req.endpoint, &req.bucket, &req.region);
+    }
+    let s3_creds = crate::state::S3BucketCreds {
+        account_id: String::new(),
+        access_key: req.access_key.clone(),
+        secret_key: req.secret_key.clone(),
+        session_token: None,
+        region: req.region.clone(),
+    };
+    if let Err(e) = state.credential_store.store_s3_creds(&req.bucket, &s3_creds) {
+        tracing::warn!(error = %e, "Failed to persist updated S3 credentials");
+    }
+
     tracing::info!(
         name = %req.name,
         bucket = %req.bucket,
-        "S3 config updated — re-running Iceberg table discovery"
+        "S3 config updated (DuckDB + credentials.enc) — re-running Iceberg table discovery"
     );
 
     // Deregister old tables from DataFusion

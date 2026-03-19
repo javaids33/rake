@@ -236,7 +236,7 @@ export interface ConnectionEntry {
   tables: string[]
   created_at: string
   mode: 'federated' | 'snapshot'
-  sync_status?: 'syncing' | 'ready' | 'error'
+  sync_status?: 'syncing' | 'ready' | 'error' | 'cached'
   sync_error?: string
   auth_method?: 'scram' | 'aws_iam' | 'connection_string'
   connection_string?: string
@@ -261,7 +261,7 @@ export interface S3Config {
   region: string
   status: string
   created_at: string
-  sync_status?: 'syncing' | 'ready' | 'error' | 'configured'
+  sync_status?: 'syncing' | 'ready' | 'error' | 'configured' | 'cached'
   sync_error?: string
   tables?: string[]
   /** Table type info: table_name → type (e.g. "MATERIALIZED_VIEW", "VIEW") */
