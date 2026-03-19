@@ -261,6 +261,18 @@ pub struct StreamingPipeline {
     pub status: String,
     pub events_processed: u64,
     pub created_at: DateTime<Utc>,
+    /// Snapshot metadata — populated after snapshot phase completes
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_docs: Option<u64>,
+    /// When the snapshot completed
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_completed_at: Option<String>,
+    /// Number of Parquet files written to S3
+    #[serde(default)]
+    pub files_written: u64,
+    /// Current phase: "snapshot", "streaming", "stopped"
+    #[serde(default)]
+    pub phase: String,
 }
 
 /// A single job execution record.

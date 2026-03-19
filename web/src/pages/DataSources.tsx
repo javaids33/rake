@@ -10,7 +10,7 @@ import { EmptyState } from '../components/ui/EmptyState'
 import { StatusDot } from '../components/ui/StatusDot'
 import { useNavigate } from 'react-router-dom'
 import { cn } from '../lib/utils'
-import { getConnections, addConnection, updateConnection, deleteConnection, getS3Configs, addS3Config, updateS3Config, deleteS3Config, uploadFile, registerTable, testConnection, importConnections, exportConnections } from '../api/client'
+import { getConnections, addConnection, updateConnection, deleteConnection, getS3Configs, addS3Config, updateS3Config, deleteS3Config, uploadFile, registerTable, testConnection, importConnections, exportConnections, browseS3 } from '../api/client'
 import { useServerEvents } from '../components/layout/Shell'
 import type { TrinoScanEvent } from '../hooks/useEventStream'
 import { useAppStore } from '../stores/app'
@@ -334,6 +334,26 @@ export function DataSources() {
     phase: string; detail: string; scanned: number; total: number; found: number;
     elapsed_ms: number; formats: Record<string, number>
   }>>({})
+
+  // S3 file browser state
+  const [s3BrowseOpen, setS3BrowseOpen] = useState<string | null>(null) // config name
+  const [s3BrowsePrefix, setS3BrowsePrefix] = useState('')
+  const [s3BrowseEntries, setS3BrowseEntries] = useState<Array<{ name: string; type: string; key: string; size: number; last_modified?: string; extension?: string }>>([])
+  const [s3BrowseLoading, setS3BrowseLoading] = useState(false)
+
+  const handleBrowseS3 = async (configName: string, prefix = '') => {
+    setS3BrowseOpen(configName)
+    setS3BrowsePrefix(prefix)
+    setS3BrowseLoading(true)
+    try {
+      const result = await browseS3(configName, prefix)
+      setS3BrowseEntries(result.entries || [])
+    } catch {
+      setS3BrowseEntries([])
+    } finally {
+      setS3BrowseLoading(false)
+    }
+  }
 
   useEffect(() => {
     const unsub = onConnectionSync((event) => {
@@ -932,7 +952,10 @@ export function DataSources() {
                       </div>
                     )}
                   </div>
-                  <div className="flex items-center gap-1">
+                  <div className="flex items-center gap-1 flex-shrink-0">
+                    <Button variant="ghost" size="sm" onClick={() => handleBrowseS3(c.name)} title="Browse files">
+                      <FolderOpen className="w-3.5 h-3.5 text-amber-400" />
+                    </Button>
                     <Button variant="ghost" size="sm" onClick={() => handleEditS3(c)}>
                       <Pencil className="w-3.5 h-3.5 text-zinc-500" />
                     </Button>
@@ -940,6 +963,101 @@ export function DataSources() {
                       <Trash2 className="w-3.5 h-3.5 text-zinc-600" />
                     </Button>
                   </div>
+                  {/* S3 File Browser */}
+                  {s3BrowseOpen === c.name && (
+                    <div className="col-span-full mt-3 pt-3 border-t border-white/[0.04]">
+                      {/* Breadcrumb */}
+                      <div className="flex items-center gap-1 mb-2 text-2xs">
+                        <button
+                          onClick={() => handleBrowseS3(c.name, '')}
+                          className="text-amber-400 hover:text-amber-300 font-mono"
+                        >
+                          s3://{c.bucket}
+                        </button>
+                        {s3BrowsePrefix && s3BrowsePrefix.split('/').filter(Boolean).map((part, i, arr) => {
+                          const path = arr.slice(0, i + 1).join('/') + '/'
+                          return (
+                            <span key={path} className="flex items-center gap-1">
+                              <span className="text-zinc-600">/</span>
+                              <button
+                                onClick={() => handleBrowseS3(c.name, path)}
+                                className="text-amber-400/70 hover:text-amber-300 font-mono"
+                              >
+                                {part}
+                              </button>
+                            </span>
+                          )
+                        })}
+                        <button
+                          onClick={() => setS3BrowseOpen(null)}
+                          className="ml-auto text-zinc-600 hover:text-zinc-400"
+                        >
+                          Close
+                        </button>
+                      </div>
+                      {/* File list */}
+                      {s3BrowseLoading ? (
+                        <div className="text-2xs text-zinc-500 py-2">Loading...</div>
+                      ) : s3BrowseEntries.length === 0 ? (
+                        <div className="text-2xs text-zinc-600 py-2">Empty directory</div>
+                      ) : (
+                        <div className="max-h-[300px] overflow-y-auto rounded border border-white/[0.04]">
+                          <table className="w-full text-2xs">
+                            <thead>
+                              <tr className="border-b border-white/[0.04] bg-white/[0.02]">
+                                <th className="text-left px-2 py-1 text-zinc-500 font-semibold">Name</th>
+                                <th className="text-right px-2 py-1 text-zinc-500 font-semibold w-24">Size</th>
+                                <th className="text-right px-2 py-1 text-zinc-500 font-semibold w-36">Modified</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {s3BrowseEntries.map((entry, i) => (
+                                <tr key={i} className="border-b border-white/[0.02] hover:bg-white/[0.01]">
+                                  <td className="px-2 py-1.5">
+                                    {entry.type === 'directory' ? (
+                                      <button
+                                        onClick={() => handleBrowseS3(c.name, entry.key)}
+                                        className="flex items-center gap-1.5 text-amber-400/80 hover:text-amber-300 font-mono"
+                                      >
+                                        <FolderOpen className="w-3 h-3" />
+                                        {entry.name}/
+                                      </button>
+                                    ) : (
+                                      <span className="flex items-center gap-1.5 text-zinc-400 font-mono">
+                                        <Layers className="w-3 h-3 text-zinc-600" />
+                                        {entry.name}
+                                      </span>
+                                    )}
+                                  </td>
+                                  <td className="px-2 py-1.5 text-right text-zinc-500 font-mono">
+                                    {entry.size > 0 ? (
+                                      entry.size > 1048576 ? `${(entry.size / 1048576).toFixed(1)}MB` :
+                                      entry.size > 1024 ? `${(entry.size / 1024).toFixed(1)}KB` :
+                                      `${entry.size}B`
+                                    ) : ''}
+                                  </td>
+                                  <td className="px-2 py-1.5 text-right text-zinc-600 font-mono">
+                                    {entry.last_modified ? new Date(entry.last_modified).toLocaleDateString() + ' ' + new Date(entry.last_modified).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : ''}
+                                  </td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                          <div className="px-2 py-1.5 text-2xs text-zinc-600 border-t border-white/[0.04]">
+                            {s3BrowseEntries.filter(e => e.type === 'directory').length} folders, {s3BrowseEntries.filter(e => e.type === 'file').length} files
+                            {s3BrowseEntries.filter(e => e.type === 'file').length > 0 && (
+                              <span className="ml-2">
+                                ({(() => {
+                                  const total = s3BrowseEntries.filter(e => e.type === 'file').reduce((s, e) => s + e.size, 0)
+                                  return total > 1048576 ? `${(total / 1048576).toFixed(1)} MB` : total > 1024 ? `${(total / 1024).toFixed(1)} KB` : `${total} B`
+                                })()})
+                              </span>
+                            )}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </Card>
                 )
               })}

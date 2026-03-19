@@ -526,8 +526,18 @@ export function Streaming() {
                             <p className="text-2xs text-zinc-500 mb-1 font-semibold">Pipeline Status</p>
                             <div className="space-y-1.5 text-2xs">
                               <div className="flex justify-between"><span className="text-zinc-500">Status</span><StatusDot status={p.status === 'running' ? 'healthy' : 'idle'} label={p.status} /></div>
+                              <div className="flex justify-between"><span className="text-zinc-500">Phase</span><span className={cn('font-mono', (p as any).phase === 'snapshot' ? 'text-violet-400' : 'text-emerald-400')}>{(p as any).phase || 'idle'}</span></div>
                               <div className="flex justify-between"><span className="text-zinc-500">Events</span><span className="font-mono text-zinc-300">{formatNumber(p.events_processed)}</span></div>
-                              <div className="flex justify-between"><span className="text-zinc-500">Delivery</span><span className="text-emerald-400">Exactly Once</span></div>
+                              {(p as any).snapshot_docs != null && (
+                                <div className="flex justify-between"><span className="text-zinc-500">Snapshot</span><span className="font-mono text-violet-400">{formatNumber((p as any).snapshot_docs)} docs</span></div>
+                              )}
+                              {(p as any).snapshot_completed_at && (
+                                <div className="flex justify-between"><span className="text-zinc-500">Snapshot At</span><span className="text-zinc-400">{new Date((p as any).snapshot_completed_at).toLocaleString()}</span></div>
+                              )}
+                              {(p as any).files_written > 0 && (
+                                <div className="flex justify-between"><span className="text-zinc-500">S3 Files</span><span className="font-mono text-amber-400">{(p as any).files_written} parquet</span></div>
+                              )}
+                              <div className="flex justify-between"><span className="text-zinc-500">Sink</span><span className="font-mono text-zinc-400 truncate max-w-[200px]">{p.sink_table}</span></div>
                               <div className="flex justify-between"><span className="text-zinc-500">Created</span><span className="text-zinc-400">{p.created_at ? new Date(p.created_at).toLocaleDateString() : '-'}</span></div>
                             </div>
                           </div>

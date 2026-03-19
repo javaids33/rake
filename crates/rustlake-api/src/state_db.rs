@@ -368,7 +368,11 @@ impl StateDb {
                 sink_table: row.get(5)?,
                 status: row.get(6)?,
                 events_processed: row.get::<_, i64>(7)? as u64,
-                created_at: chrono::Utc::now(), // Use current time — DuckDB TIMESTAMP format varies
+                created_at: chrono::Utc::now(),
+                snapshot_docs: None,
+                snapshot_completed_at: None,
+                files_written: 0,
+                phase: String::new(),
             })
         });
         match rows {
@@ -741,6 +745,10 @@ mod tests {
             status: "created".into(),
             events_processed: 0,
             created_at: chrono::Utc::now(),
+            snapshot_docs: None,
+            snapshot_completed_at: None,
+            files_written: 0,
+            phase: String::new(),
         };
         db.upsert_pipeline(&pipeline).unwrap();
 

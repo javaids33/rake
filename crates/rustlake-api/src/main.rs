@@ -478,6 +478,10 @@ async fn bootstrap_demo_connections(state: Arc<AppState>) {
         status: "active".to_string(),
         events_processed: 0,
         created_at: chrono::Utc::now(),
+        snapshot_docs: None,
+        snapshot_completed_at: None,
+        files_written: 0,
+        phase: String::new(),
     };
 
     if state.seed_pipeline(demo_pipeline).await {

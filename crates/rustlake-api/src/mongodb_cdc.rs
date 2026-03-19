@@ -215,28 +215,72 @@ impl MongoDbCdcSource {
         let tx_clone = tx.clone();
 
         tokio::spawn(async move {
-            // Phase 1: Initial snapshot (if requested)
+            let mut cdc_resume_token: Option<ResumeToken> = resume_token;
+
+            // Phase 1: Capture resume token BEFORE snapshot (gap-free CDC)
             if do_snapshot && collection != "*" {
+                // Strip prefix for MongoDB operations
+                let clean_coll = collection.strip_prefix("mongo.")
+                    .or_else(|| collection.strip_prefix("mongodb."))
+                    .unwrap_or(&collection);
+
                 tracing::info!(
-                    database = %database, collection = %collection,
-                    "[SNAPSHOT] Phase 1: Running initial snapshot before CDC"
+                    database = %database, collection = %clean_coll,
+                    "[CDC:SNAPSHOT] Phase 1/3: Capturing resume token before snapshot"
+                );
+
+                // Open a temporary change stream just to get the current resume token
+                let db = client.database(&database);
+                let coll_handle = db.collection::<Document>(clean_coll);
+                let temp_opts = ChangeStreamOptions::builder().build();
+                match coll_handle.watch(Vec::<Document>::new(), temp_opts).await {
+                    Ok(stream) => {
+                        // The initial resume token from a fresh stream marks "now"
+                        let token = stream.resume_token().map(|t| t.clone());
+                        if let Some(ref t) = token {
+                            tracing::info!(
+                                "[CDC:SNAPSHOT] Resume token captured — snapshot will not miss events"
+                            );
+                            cdc_resume_token = Some(t.clone()) as Option<ResumeToken>;
+                            // Store it
+                            let mut stored = token_clone.write().await;
+                            *stored = Some(t.clone());
+                        } else {
+                            tracing::warn!("[CDC:SNAPSHOT] No resume token from initial stream — CDC will start from now");
+                        }
+                        // Drop the temporary stream
+                        drop(stream);
+                    }
+                    Err(e) => {
+                        tracing::error!(error = %e, "[CDC:SNAPSHOT] Failed to open temporary change stream for resume token");
+                    }
+                }
+
+                // Phase 2: Run snapshot of existing data
+                tracing::info!(
+                    database = %database, collection = %clean_coll,
+                    "[CDC:SNAPSHOT] Phase 2/3: Snapshotting existing documents"
                 );
                 match run_snapshot(&client, &database, &collection, &schema, &running_clone, &tx_clone).await {
                     Ok(count) => {
                         tracing::info!(
                             docs = count,
-                            "[SNAPSHOT] Phase 1 complete — switching to CDC change stream"
+                            "[CDC:SNAPSHOT] Phase 2/3 complete — {} documents snapshotted", count
                         );
                     }
                     Err(e) => {
-                        tracing::error!(error = %e, "[SNAPSHOT] Phase 1 FAILED — starting CDC anyway");
+                        tracing::error!(error = %e, "[CDC:SNAPSHOT] Snapshot FAILED — continuing to CDC");
                     }
                 }
+
+                tracing::info!(
+                    "[CDC:SNAPSHOT] Phase 3/3: Starting CDC from captured resume token"
+                );
             } else if do_snapshot && collection == "*" {
-                tracing::warn!("[SNAPSHOT] initial_snapshot not supported with collection='*' — skipping");
+                tracing::warn!("[CDC:SNAPSHOT] initial_snapshot not supported with collection='*' — skipping snapshot, starting CDC directly");
             }
 
-            // Phase 2: CDC change stream
+            // Phase 3 (or sole phase if no snapshot): CDC change stream
             if running_clone.load(Ordering::SeqCst) {
                 if let Err(e) = run_change_stream(
                     client,
@@ -244,7 +288,7 @@ impl MongoDbCdcSource {
                     &collection,
                     &full_document_mode,
                     pipeline,
-                    resume_token,
+                    cdc_resume_token, // Use the token captured BEFORE snapshot
                     schema,
                     running_clone,
                     token_clone,

@@ -4987,6 +4987,10 @@ async fn run_bootstrap(
         status: "active".to_string(),
         events_processed: 0,
         created_at: Utc::now(),
+        snapshot_docs: None,
+        snapshot_completed_at: None,
+        files_written: 0,
+        phase: String::new(),
     }).await;
     results.insert("demo_pipeline_seeded".to_string(), serde_json::json!(pipeline_seeded));
 
@@ -5790,6 +5794,10 @@ async fn create_pipeline(
         status: "created".to_string(),
         events_processed: 0,
         created_at: Utc::now(),
+        snapshot_docs: None,
+        snapshot_completed_at: None,
+        files_written: 0,
+        phase: String::new(),
     };
 
     #[cfg(feature = "duckdb")]
@@ -6087,13 +6095,23 @@ async fn start_pipeline(
                                     }
                                 }
 
-                                // Update events_processed counter
+                                // Update pipeline metadata
                                 let mut pipelines =
                                     state_clone.streaming_pipelines.write().await;
                                 if let Some(p) =
                                     pipelines.iter_mut().find(|p| p.id == pipeline_id)
                                 {
                                     p.events_processed = total_events;
+                                    p.phase = phase.clone();
+                                    // Track snapshot → streaming transition
+                                    if phase == "streaming" && p.snapshot_docs.is_none() && total_events > rows {
+                                        // First streaming batch after snapshot
+                                        p.snapshot_docs = Some(total_events - rows);
+                                        p.snapshot_completed_at = Some(chrono::Utc::now().to_rfc3339());
+                                    }
+                                    if let Some(ref s) = sink {
+                                        p.files_written = s.files_written();
+                                    }
                                 }
                                 drop(pipelines);
 
@@ -6256,6 +6274,10 @@ async fn import_pipelines(
             status: "created".to_string(),
             events_processed: 0,
             created_at: Utc::now(),
+            snapshot_docs: None,
+            snapshot_completed_at: None,
+            files_written: 0,
+            phase: String::new(),
         };
         #[cfg(feature = "duckdb")]
         if let Some(ref db) = state.state_db {
