@@ -185,8 +185,15 @@ export function Streaming() {
     if (form.sink_type === 'iceberg') return form.sink_table
     if (form.sink_type === 's3_existing') return form.s3_existing_table || form.sink_table
     if (form.sink_type === 's3_new') {
+      // Try to find the S3 config to build the full path
       const cfg = s3Configs.find(c => c.name === form.s3_config_name)
       if (cfg && form.s3_path) return `s3://${cfg.bucket}/${form.s3_path}`
+      // Fallback: if the config can't be found by name, try by bucket
+      const cfgByBucket = s3Configs.find(c => form.s3_config_name.includes(c.bucket) || c.bucket.includes(form.s3_config_name))
+      if (cfgByBucket && form.s3_path) return `s3://${cfgByBucket.bucket}/${form.s3_path}`
+      // Last resort: if s3_path looks like a full path already, use it
+      if (form.s3_path && form.s3_path.startsWith('s3://')) return form.s3_path
+      if (form.s3_path) return `s3://${form.s3_config_name}/${form.s3_path}`
       return form.sink_table
     }
     return form.sink_table
@@ -195,7 +202,10 @@ export function Streaming() {
   const handleCreate = async () => {
     if (!form.name.trim()) { toast.error('Pipeline name is required'); return }
     const sinkTable = resolveSinkTable()
-    if (!sinkTable.trim()) { toast.error('Sink target is required'); return }
+    if (!sinkTable.trim()) {
+      toast.error(`Sink target is required (type=${form.sink_type}, config=${form.s3_config_name}, path=${form.s3_path}, configs=${s3Configs.length})`)
+      return
+    }
     if (form.source_type === 'kafka') {
       if (!form.broker.trim()) { toast.error('Broker address is required for Kafka'); return }
       if (!form.topic.trim()) { toast.error('Topic is required'); return }
@@ -1017,7 +1027,7 @@ export function Streaming() {
                   {form.s3_config_name && form.s3_path && (
                     <div className="text-2xs font-mono text-zinc-400 p-2 bg-white/[0.02] rounded border border-white/[0.04]">
                       <span className="text-zinc-600">Sink:</span>{' '}
-                      s3://{s3Configs.find(c => c.name === form.s3_config_name)?.bucket}/{form.s3_path}
+                      {resolveSinkTable() || `s3://${form.s3_config_name}/${form.s3_path}`}
                     </div>
                   )}
                 </>
