@@ -17,31 +17,55 @@ Most data platforms require teams to stitch together JVM-based services — a cl
 
 ## What Makes RustLake Different
 
-### 1. Executable Lakehouse (Industry First)
+### 1. Data Models — Self-Maintaining Data Organisms
 
-Traditional Iceberg tables are passive — they store data and wait for external systems to update them. RustLake tables are **active** — they store the compiled binary that produces their data, alongside the data itself, on S3.
+Traditional Iceberg tables are passive — they store data and wait for external systems to update them. RustLake tables are **active** — they store the compiled transform binary alongside the data it produces, on S3. Each table is a versioned, diffable, auditable unit with quality gates, lineage tracking, and self-healing capabilities.
 
 ```
 s3://warehouse/daily_revenue/
-  data/2026-03-21.parquet           ← data files
+  data/2026-03-21.parquet           ← data files (Parquet, Snappy)
   metadata/v5.metadata.json         ← Iceberg v2 metadata + transform reference
-  functions/bin-abc123              ← 453KB compiled transform binary
-  functions/manifest-abc123.json    ← source code, schedule, quality gates
+  binary/bin-abc123                 ← ~470KB compiled transform binary
+  binary/manifest-abc123.json       ← source code hash, schedule, quality gates
 ```
 
 **What this enables:**
-- Tables refresh themselves on schedule without any cluster or server
-- The binary runs on Lambda ($0.0000002/execution), spot instances, edge nodes, or even a Raspberry Pi
-- Data and code are versioned together in Iceberg metadata — rollback both atomically
-- 453KB binary vs 500MB+ Docker image — deploys in milliseconds, not minutes
+- Tables refresh themselves on schedule — skip when upstream unchanged, incremental for small deltas, full rebuild for large changes
+- Quality gates (not-null, unique, range, row count) validate every execution — gate failure auto-rolls back to the last known-good version
+- Column-level lineage traces every output column back to its source columns and transform expressions
+- Data and code are versioned together in Iceberg metadata — rollback both atomically (git semantics: rollback = new version with old code)
+- Compliance audit assembles full provenance chain, gate history, SLA freshness, and quality score in seconds
 
-**Cost comparison for 100 hourly transforms:**
+**The Data Organism pattern:**
+```
+Raw Source
+  → Ingestion Table (self-refreshing, CDC-aware)
+    → Feature Table (compiled Rust, sub-ms execution)
+      → Aggregation Table (quality-gated, self-healing)
+        → Data Product (SLA-bound, certified, auditable)
+```
 
-| Platform | Monthly Cost | Cold Start | Cluster Required |
-|----------|-------------|------------|-----------------|
-| Databricks | $5,040 | 45 seconds | Yes |
-| Snowflake | $2,400 | 5 seconds | Yes |
-| **RustLake** | **$36** | **2 milliseconds** | **No** |
+Each node breathes (auto-refresh), heals (auto-rollback on gate failure), grows (version history), and reports (compliance audit).
+
+**Infrastructure requirements for full capability:**
+
+| Capability | What You Need | Without It |
+|---|---|---|
+| **SQL transforms** | RustLake only (DataFusion in-process) | N/A — always works |
+| **Rust compiled transforms** | `rustc` installed on the host | SQL-only transforms still work |
+| **S3/Iceberg persistence** | MinIO or S3-compatible storage | Data stays in-memory only |
+| **Self-healing auto-rollback** | Quality gates defined + scheduler running | Manual rollback via API |
+| **Cascade replay** | Multiple tables with `input_tables` DAG | Single-table execution only |
+| **Compliance audit** | Data product created with SLA config | Individual table provenance still works |
+
+**Future: serverless execution.** The compiled binary (~470KB) is self-contained and could run on AWS Lambda, Cloudflare Workers, or edge nodes. This would require a thin dispatcher service that:
+1. Watches Iceberg metadata for schedule triggers or upstream changes
+2. Pulls the binary from S3 (`binary/bin-{hash}`)
+3. Invokes Lambda with the binary as the payload
+4. Writes output Parquet + Iceberg metadata back to S3
+5. Validates quality gates and triggers auto-rollback if needed
+
+This dispatcher doesn't exist yet — today, RustLake's built-in scheduler handles execution. The binary format is Lambda-ready; the orchestration layer is the gap.
 
 ### 2. Four-Language Notebooks with Server-Side Compilation
 
@@ -231,7 +255,8 @@ RustLake ships with a 19-page React dashboard built on Vite, Tailwind CSS, and M
 | **Workflow Viz** | `/workflow` | Real-time memory distribution, query pipeline flow, active job monitor |
 | **Benchmarks** | `/benchmarks` | TPC-H benchmark runner with multi-engine comparison |
 | **Settings** | `/settings` | System info, query router config, WASM engines, data providers, Flight/cluster config |
-| **Executable Tables** | `/executable-tables` | Executable Lakehouse — cost calculator, self-maintaining table CRUD, Iceberg property viewer |
+| **Data Models** | `/data-models` | Versioned transforms — 6-tab detail view (Versions, Diff, History, Compare, Contracts, Lineage), quality gates, cascade replay |
+| **Data Products** | `/data-products` | Compliance audit dashboard — freshness SLA, quality score, provenance chain, certification status |
 | **About** | `/about` | Platform version, architecture, credits |
 
 ## WASM Engines (Browser-Side Compute)
@@ -271,16 +296,18 @@ Measured on Apple M2, 8 cores, 16GB RAM:
 
 Rust binary caching delivers **2ms execution** on re-runs — faster than most SQL queries. The binary persists to S3 for cross-node sharing.
 
-### Executable Lakehouse Cost Comparison
+### Executable Table Execution Model
 
-For 100 hourly transforms (453KB binary, 500ms execution each):
+RustLake compiles Rust transforms to ~470KB native binaries, cached by content hash (FNV-1a). SQL transforms execute through DataFusion in-process with no compilation step.
 
-| Platform | Cost/Run | Monthly | Cold Start | Cluster | Savings vs Databricks |
-|----------|----------|---------|------------|---------|----------------------|
-| **RustLake** | **$0.0005** | **$36** | **2ms** | **No** | **140x cheaper** |
-| AWS Lambda | $0.000001 | $0.07 | 100ms | No | 72,000x cheaper |
-| Databricks | $0.07 | $5,040 | 45,000ms | Yes | Baseline |
-| Snowflake | $0.03 | $2,400 | 5,000ms | Yes | 2x cheaper |
+| Metric | SQL Transform | Rust Transform (cold) | Rust Transform (cached) |
+|--------|--------------|----------------------|------------------------|
+| Execution time | 3-50ms | 300-600ms (includes compilation) | 2-7ms |
+| Binary size | N/A | ~470KB | ~470KB (from cache) |
+| Cold start | 0ms | ~300ms (rustc) | 0ms (binary loaded from disk/S3) |
+| Cluster required | No | No | No |
+
+The tradeoff: Rust transforms have a ~300ms first-compile penalty, offset by instant cache hits. SQL transforms have no compilation overhead. Both produce Iceberg v2 tables on S3.
 
 ### Multi-Engine Query Routing
 
@@ -416,6 +443,23 @@ Pre-commit validation on every Iceberg write:
 
 Failed quality gates prevent the Iceberg snapshot from committing — bad data never reaches the table.
 
+## Regulatory Compliance Automation
+
+7 composable features that together enable provenance-backed compliance auditing:
+
+| Feature | What It Does | API |
+|---------|-------------|-----|
+| **Cascade Replay** | Re-executes entire upstream DAG in topological order, validates gates at every node | `POST /api/v1/executable-tables/{name}/cascade-replay` |
+| **Column Lineage** | Parses SQL to trace output columns back to source columns + transform expressions | `GET /api/v1/executable-tables/{name}/column-lineage` |
+| **Materialized Views** | Auto-refresh on configurable interval with full version tracking | `auto_refresh` + `refresh_interval_seconds` fields |
+| **Executable Pipelines** | Named chain of tables — execution stops on gate/contract failure | `POST /api/v1/executable-pipelines/{id}/run` |
+| **Time-Travel Debug** | Compare bad vs good executions — code diff, data diff, upstream changes | `POST /api/v1/executable-tables/{name}/debug` |
+| **Cost-Aware Scheduling** | Skip unchanged, incremental for small deltas, full for large changes | Built into scheduler tick |
+| **Self-Healing** | Auto-rollback to last known-good version on quality gate failure | Built into scheduler tick |
+| **Data Products** | SLA-bound, certified datasets with provenance chain and compliance audit | `GET /api/v1/data-products/{name}/audit` |
+
+**The compliance audit demo:** A regulator asks "prove the risk score for customer X on March 15th was computed correctly." RustLake assembles: time-travel snapshot → code version → cascade replay → A/B verification → gate results → contract validation → full audit JSON. Seconds, not weeks.
+
 ## Competitive Positioning
 
 ### vs Databricks
@@ -425,10 +469,10 @@ Failed quality gates prevent the Iceberg snapshot from committing — bad data n
 | Cold start | 30-120s (cluster) | **100ms** (single binary) |
 | Languages | SQL, Python, Scala, R | **SQL, Rust, Python, Spark SQL** |
 | Notebook → ETL | Schedule notebook as job | **Same + DAG optimization + binary caching** |
-| Cost (hourly transform) | $0.07/run | **$0.0005/run (140x cheaper)** |
 | Offline capability | None | **Full WASM (Pyodide + DuckDB in browser)** |
 | Table format | Delta Lake | **Iceberg v2 (open standard)** |
-| Executable tables | No | **Yes (binaries on S3, self-maintaining)** |
+| Self-maintaining tables | No | **Yes (versioned, self-healing, auditable)** |
+| Compliance audit | Manual (weeks) | **Automated (seconds)** |
 | Graph databases | No | **Neo4j integration with visualization** |
 
 ### vs Snowflake
@@ -875,10 +919,19 @@ The **Workflow Viz** page (`/workflow`) shows real-time memory distribution acro
 | `GET` | `/api/v1/neo4j/schema` | Discover labels, relationship types |
 | `POST` | `/api/v1/sql/profile` | Cost-based multi-engine profiling (no execution) |
 | `POST` | `/api/v1/sql/estimate` | Query cost estimation |
-| `GET/POST` | `/api/v1/executable-tables` | List/create executable tables |
-| `POST` | `/api/v1/executable-tables/{name}/execute` | Run an executable table's transform |
-| `GET` | `/api/v1/executable-tables/{name}/cost` | Per-platform cost estimate |
-| `POST` | `/api/v1/executable-tables/cost-comparison` | Compare costs across platforms |
+| `GET/POST` | `/api/v1/executable-tables` | List/create data models (executable tables) |
+| `PUT` | `/api/v1/executable-tables/{name}` | Update transform code (creates new version) |
+| `POST` | `/api/v1/executable-tables/{name}/execute-version` | Execute a specific version |
+| `POST` | `/api/v1/executable-tables/{name}/rollback` | Rollback to a previous version |
+| `GET` | `/api/v1/executable-tables/{name}/versions` | Version history with diffs |
+| `GET` | `/api/v1/executable-tables/{name}/column-lineage` | Column-level lineage |
+| `POST` | `/api/v1/executable-tables/{name}/cascade-replay` | Re-execute entire upstream DAG |
+| `POST` | `/api/v1/executable-tables/{name}/debug` | Time-travel debug (bad vs good) |
+| `POST` | `/api/v1/executable-tables/{name}/ab-test` | Compare two versions side-by-side |
+| `GET/POST` | `/api/v1/executable-pipelines` | List/create executable pipelines |
+| `POST` | `/api/v1/executable-pipelines/{id}/run` | Run a pipeline (stops on failure) |
+| `GET/POST` | `/api/v1/data-products` | List/create data products |
+| `GET` | `/api/v1/data-products/{name}/audit` | Full compliance audit |
 | `POST` | `/api/v1/notebooks/execute` | Run all notebook cells server-side |
 | `POST` | `/api/v1/notebooks/plan` | Get DAG execution plan with optimizations |
 | `POST` | `/api/v1/notebooks/schedule` | Deploy notebook as scheduled ETL job |
