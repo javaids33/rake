@@ -57,6 +57,33 @@ pub struct QueryHistoryEntry {
     /// Which engine executed this query ("DataFusion" or "DuckDB").
     #[serde(default = "default_engine_name")]
     pub engine: String,
+    /// Bytes scanned from S3/storage.
+    #[serde(default)]
+    pub s3_bytes_scanned: u64,
+    /// Number of S3 requests made.
+    #[serde(default)]
+    pub s3_requests: u32,
+    /// Estimated cost in USD.
+    #[serde(default)]
+    pub estimated_cost_usd: f64,
+    /// Snapshot context for query replay: table_name → snapshot_id at query time.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub snapshot_context: std::collections::HashMap<String, i64>,
+}
+
+impl QueryHistoryEntry {
+    /// Create a new QueryHistoryEntry with default cost/replay fields.
+    pub fn new(
+        query_id: Uuid, sql: String, query_type: String, row_count: usize,
+        duration_ms: u128, status: String, error: Option<String>, engine: String,
+    ) -> Self {
+        Self {
+            query_id, sql, query_type, row_count, duration_ms,
+            timestamp: Utc::now(), status, error, engine,
+            s3_bytes_scanned: 0, s3_requests: 0, estimated_cost_usd: 0.0,
+            snapshot_context: std::collections::HashMap::new(),
+        }
+    }
 }
 
 #[allow(dead_code)] // Used by serde(default) on QueryHistoryEntry::engine
@@ -595,6 +622,9 @@ pub struct AppState {
     /// Optional DuckDB OLAP accelerator engine.
     #[cfg(feature = "duckdb")]
     pub duckdb_engine: Option<rustlake_engine::duckdb_engine::DuckDbEngine>,
+    /// Track which tables have been synced to DuckDB this session (skip redundant syncs).
+    #[cfg(feature = "duckdb")]
+    pub duckdb_synced_tables: RwLock<std::collections::HashSet<String>>,
     /// Optional Polars DataFrame engine.
     #[cfg(feature = "polars")]
     pub polars_engine: Option<rustlake_engine::polars_engine::PolarsEngine>,
@@ -670,6 +700,20 @@ pub struct AppState {
     /// DuckDB-backed persistent state store for connections, tables, and pipelines.
     #[cfg(feature = "duckdb")]
     pub state_db: Option<crate::state_db::StateDb>,
+    /// Adaptive query profiler for cost-based multi-engine routing.
+    pub query_profiler: rustlake_router::QueryProfiler,
+    /// Cost model for estimating per-engine execution time.
+    pub cost_model: rustlake_router::CostModel,
+    /// Executable tables — self-maintaining tables with compiled transforms.
+    pub executable_tables: RwLock<Vec<crate::executable_table::ExecutableTable>>,
+    /// Data contracts between executable tables.
+    pub data_contracts: RwLock<Vec<crate::executable_table::DataContract>>,
+    /// Transform marketplace packages.
+    pub marketplace_packages: RwLock<Vec<crate::executable_table::MarketplacePackage>>,
+    /// Executable pipelines (DAG of executable tables).
+    pub executable_pipelines: RwLock<Vec<crate::executable_table::ExecutablePipeline>>,
+    /// Data products with SLA and compliance tracking.
+    pub data_products: RwLock<Vec<crate::executable_table::DataProduct>>,
 }
 
 /// Real-time pipeline event pushed through SSE when CDC events arrive.
@@ -721,6 +765,8 @@ impl AppState {
             provider_registry: crate::providers::ProviderRegistry::new(),
             #[cfg(feature = "duckdb")]
             duckdb_engine: None,
+            #[cfg(feature = "duckdb")]
+            duckdb_synced_tables: RwLock::new(std::collections::HashSet::new()),
             #[cfg(feature = "polars")]
             polars_engine: None,
             flight_metrics: None,
@@ -773,6 +819,13 @@ impl AppState {
                     None
                 }
             },
+            query_profiler: rustlake_router::QueryProfiler::new(),
+            cost_model: rustlake_router::CostModel::new(),
+            executable_tables: RwLock::new(Vec::new()),
+            data_contracts: RwLock::new(Vec::new()),
+            marketplace_packages: RwLock::new(Vec::new()),
+            executable_pipelines: RwLock::new(Vec::new()),
+            data_products: RwLock::new(Vec::new()),
         }
     }
 
@@ -785,6 +838,8 @@ impl AppState {
             provider_registry: crate::providers::ProviderRegistry::new(),
             #[cfg(feature = "duckdb")]
             duckdb_engine: None,
+            #[cfg(feature = "duckdb")]
+            duckdb_synced_tables: RwLock::new(std::collections::HashSet::new()),
             #[cfg(feature = "polars")]
             polars_engine: None,
             flight_metrics: None,
@@ -837,6 +892,13 @@ impl AppState {
                     None
                 }
             },
+            query_profiler: rustlake_router::QueryProfiler::new(),
+            cost_model: rustlake_router::CostModel::new(),
+            executable_tables: RwLock::new(Vec::new()),
+            data_contracts: RwLock::new(Vec::new()),
+            marketplace_packages: RwLock::new(Vec::new()),
+            executable_pipelines: RwLock::new(Vec::new()),
+            data_products: RwLock::new(Vec::new()),
         }
     }
 
@@ -1061,6 +1123,16 @@ impl AppState {
         }
         drop(transforms);
         self.add_user_transform(ut).await;
+        true
+    }
+
+    /// Seed an executable table if one with the same name doesn't already exist.
+    pub async fn seed_executable_table(&self, table: crate::executable_table::ExecutableTable) -> bool {
+        let mut tables = self.executable_tables.write().await;
+        if tables.iter().any(|t| t.table_name == table.table_name) {
+            return false;
+        }
+        tables.push(table);
         true
     }
 

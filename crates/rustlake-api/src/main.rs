@@ -21,13 +21,24 @@ use rustlake_vector::search::VectorIndex;
 mod iceberg_s3;
 mod mongodb_cdc;
 mod mongodb_conn;
+mod neo4j_conn;
+mod notebook_runner;
 mod providers;
 mod routes;
 mod state;
 mod trino_client;
 mod trino_provider;
 mod credential_store;
+mod auth;
+mod iceberg_metadata;
+mod iceberg_maintenance;
+mod executable_table;
+mod iceberg_rest_catalog;
+mod iceberg_writer;
 mod parquet_sink;
+mod quality_gates;
+mod rust_executor;
+mod spark_compat;
 mod state_db;
 mod ws;
 
@@ -537,6 +548,284 @@ async fn bootstrap_demo_connections(state: Arc<AppState>) {
     tracing::info!("Bootstrap complete");
 }
 
+/// Seed demo executable tables — always runs (not gated by RUSTLAKE_AUTO_BOOTSTRAP).
+async fn seed_demo_executable_tables(state: &crate::state::AppState) {
+    use crate::executable_table::*;
+
+    let now = chrono::Utc::now();
+
+    // daily_revenue — SQL transform with 3 versions and execution history
+    let daily_revenue = ExecutableTable {
+            table_name: "daily_revenue".to_string(),
+            table_location: "s3://warehouse/daily_revenue".to_string(),
+            transform: TableTransform {
+                transform_type: "sql".to_string(),
+                source_code: "SELECT date, SUM(amount) as revenue, COUNT(*) as orders, AVG(amount) as avg_order\nFROM orders\nGROUP BY date\nORDER BY date DESC".to_string(),
+                source_hash: hash_source("SELECT date, SUM(amount) as revenue, COUNT(*) as orders, AVG(amount) as avg_order\nFROM orders\nGROUP BY date\nORDER BY date DESC"),
+                binary_path: None,
+                binary_size: None,
+                binary_cached: false,
+                compiler_version: None,
+                target_arch: None,
+            },
+            schedule: Some("0 * * * *".to_string()),
+            quality_gates: vec![
+                QualityGateRef {
+                    gate_type: "not_null".to_string(),
+                    column: Some("date".to_string()),
+                    threshold: None,
+                    description: "date must not be null".to_string(),
+                },
+                QualityGateRef {
+                    gate_type: "row_count".to_string(),
+                    column: None,
+                    threshold: Some(1.0),
+                    description: "Must produce at least 1 row".to_string(),
+                },
+            ],
+            input_tables: vec!["orders".to_string()],
+            status: ExecutableTableStatus {
+                state: "active".to_string(),
+                health: "healthy".to_string(),
+                last_error: None,
+                staleness_hours: 0.3,
+                data_freshness: "fresh".to_string(),
+            },
+            history: vec![
+                ExecutionRecord {
+                    execution_id: "exec-dr-001".to_string(),
+                    started_at: (now - chrono::Duration::hours(46)).to_rfc3339(),
+                    completed_at: Some((now - chrono::Duration::hours(46)).to_rfc3339()),
+                    duration_ms: 450,
+                    status: "success".to_string(),
+                    rows_produced: Some(365),
+                    bytes_written: Some(28400),
+                    cost_usd: 0.000450,
+                    binary_cached: false,
+                    compile_ms: 0,
+                    run_ms: 450,
+                    error: None,
+                    execution_location: "local".to_string(),
+                    version: 1,
+                },
+                ExecutionRecord {
+                    execution_id: "exec-dr-002".to_string(),
+                    started_at: (now - chrono::Duration::hours(36)).to_rfc3339(),
+                    completed_at: Some((now - chrono::Duration::hours(36)).to_rfc3339()),
+                    duration_ms: 380,
+                    status: "success".to_string(),
+                    rows_produced: Some(365),
+                    bytes_written: Some(28400),
+                    cost_usd: 0.000380,
+                    binary_cached: false,
+                    compile_ms: 0,
+                    run_ms: 380,
+                    error: None,
+                    execution_location: "local".to_string(),
+                    version: 1,
+                },
+                ExecutionRecord {
+                    execution_id: "exec-dr-003".to_string(),
+                    started_at: (now - chrono::Duration::hours(20)).to_rfc3339(),
+                    completed_at: Some((now - chrono::Duration::hours(20)).to_rfc3339()),
+                    duration_ms: 410,
+                    status: "success".to_string(),
+                    rows_produced: Some(366),
+                    bytes_written: Some(28500),
+                    cost_usd: 0.000410,
+                    binary_cached: false,
+                    compile_ms: 0,
+                    run_ms: 410,
+                    error: None,
+                    execution_location: "local".to_string(),
+                    version: 2,
+                },
+                ExecutionRecord {
+                    execution_id: "exec-dr-004".to_string(),
+                    started_at: (now - chrono::Duration::hours(12)).to_rfc3339(),
+                    completed_at: Some((now - chrono::Duration::hours(12)).to_rfc3339()),
+                    duration_ms: 395,
+                    status: "success".to_string(),
+                    rows_produced: Some(366),
+                    bytes_written: Some(28500),
+                    cost_usd: 0.000395,
+                    binary_cached: false,
+                    compile_ms: 0,
+                    run_ms: 395,
+                    error: None,
+                    execution_location: "local".to_string(),
+                    version: 2,
+                },
+                ExecutionRecord {
+                    execution_id: "exec-dr-005".to_string(),
+                    started_at: (now - chrono::Duration::hours(1)).to_rfc3339(),
+                    completed_at: Some((now - chrono::Duration::hours(1)).to_rfc3339()),
+                    duration_ms: 420,
+                    status: "success".to_string(),
+                    rows_produced: Some(366),
+                    bytes_written: Some(28500),
+                    cost_usd: 0.000420,
+                    binary_cached: false,
+                    compile_ms: 0,
+                    run_ms: 420,
+                    error: None,
+                    execution_location: "local".to_string(),
+                    version: 3,
+                },
+            ],
+            versions: vec![
+                TransformVersion {
+                    version: 1,
+                    source_code: "SELECT date, SUM(amount) as revenue\nFROM orders\nGROUP BY date".to_string(),
+                    source_hash: hash_source("SELECT date, SUM(amount) as revenue\nFROM orders\nGROUP BY date"),
+                    created_at: (now - chrono::Duration::hours(48)).to_rfc3339(),
+                    created_by: "user".to_string(),
+                    change_description: "Initial transform".to_string(),
+                    binary_size_bytes: None,
+                    snapshot_ids: vec![1, 2],
+                },
+                TransformVersion {
+                    version: 2,
+                    source_code: "SELECT date, SUM(amount) as revenue, COUNT(*) as orders\nFROM orders\nGROUP BY date".to_string(),
+                    source_hash: hash_source("SELECT date, SUM(amount) as revenue, COUNT(*) as orders\nFROM orders\nGROUP BY date"),
+                    created_at: (now - chrono::Duration::hours(24)).to_rfc3339(),
+                    created_by: "user".to_string(),
+                    change_description: "Added order count metric".to_string(),
+                    binary_size_bytes: None,
+                    snapshot_ids: vec![3, 4],
+                },
+                TransformVersion {
+                    version: 3,
+                    source_code: "SELECT date, SUM(amount) as revenue, COUNT(*) as orders, AVG(amount) as avg_order\nFROM orders\nGROUP BY date\nORDER BY date DESC".to_string(),
+                    source_hash: hash_source("SELECT date, SUM(amount) as revenue, COUNT(*) as orders, AVG(amount) as avg_order\nFROM orders\nGROUP BY date\nORDER BY date DESC"),
+                    created_at: (now - chrono::Duration::hours(6)).to_rfc3339(),
+                    created_by: "user".to_string(),
+                    change_description: "Added avg order value and sorting".to_string(),
+                    binary_size_bytes: None,
+                    snapshot_ids: vec![5],
+                },
+            ],
+            created_at: (now - chrono::Duration::hours(48)).to_rfc3339(),
+            last_refresh: Some((now - chrono::Duration::hours(1)).to_rfc3339()),
+            next_refresh: Some((now + chrono::Duration::minutes(40)).to_rfc3339()),
+            estimated_cost_usd: 0.000420,
+            total_executions: 5,
+            total_cost_usd: 0.002055,
+            incremental: false,
+            watermark_column: None,
+            last_watermark: None,
+            executions_skipped: 0,
+            cost_saved_usd: 0.0,
+            auto_refresh: false,
+            refresh_interval_seconds: 0,
+        };
+
+        // Fix version hashes to match actual source code
+        let mut dr = daily_revenue;
+        for v in &mut dr.versions {
+            v.source_hash = hash_source(&v.source_code);
+        }
+        dr.transform.source_hash = dr.versions.last().map(|v| v.source_hash.clone()).unwrap_or_default();
+        state.seed_executable_table(dr).await;
+
+        // customer_segments — Rust transform (compilable, produces CSV → Parquet)
+        let cs_v1_code = "fn main() {\n    let data = vec![\n        (\"C001\", \"Alice\", 2500.0, 12),\n        (\"C002\", \"Bob\", 450.0, 3),\n        (\"C003\", \"Charlie\", 8200.0, 45),\n    ];\n    println!(\"customer_id,name,lifetime_value,order_count\");\n    for (id, name, ltv, orders) in &data {\n        println!(\"{},{},{:.2},{}\", id, name, ltv, orders);\n    }\n}";
+        let cs_v2_code = "fn main() {\n    let data = vec![\n        (\"C001\", \"Alice\", 2500.0, 12, \"2026-03-15\"),\n        (\"C002\", \"Bob\", 450.0, 3, \"2026-02-10\"),\n        (\"C003\", \"Charlie\", 8200.0, 45, \"2026-03-20\"),\n        (\"C004\", \"Diana\", 120.0, 1, \"2026-01-05\"),\n    ];\n    println!(\"customer_id,name,lifetime_value,order_count,last_order\");\n    for (id, name, ltv, orders, last) in &data {\n        let segment = if *ltv > 5000.0 { \"high_value\" } else if *ltv > 500.0 { \"medium\" } else { \"low\" };\n        println!(\"{},{},{:.2},{},{}\", id, name, ltv, orders, last);\n    }\n}";
+        let cs_current_code = "fn main() {\n    let data = vec![\n        (\"C001\", \"Alice\", 2500.0, 12, \"2026-03-15\"),\n        (\"C002\", \"Bob\", 450.0, 3, \"2026-02-10\"),\n        (\"C003\", \"Charlie\", 8200.0, 45, \"2026-03-20\"),\n        (\"C004\", \"Diana\", 120.0, 1, \"2026-01-05\"),\n        (\"C005\", \"Eve\", 3100.0, 18, \"2025-12-01\"),\n    ];\n    println!(\"customer_id,name,lifetime_value,order_count,last_order,segment,churn_risk\");\n    for (id, name, ltv, orders, last_order) in &data {\n        let segment = if *ltv > 5000.0 { \"high_value\" } else if *ltv > 500.0 { \"medium_value\" } else { \"low_value\" };\n        let churn = if last_order < &\"2026-02-01\" { true } else { false };\n        println!(\"{},{},{:.2},{},{},{},{}\", id, name, ltv, orders, last_order, segment, churn);\n    }\n}";
+
+        let customer_segments = ExecutableTable {
+            table_name: "customer_segments".to_string(),
+            table_location: "s3://warehouse/customer_segments".to_string(),
+            transform: TableTransform {
+                transform_type: "rust".to_string(),
+                source_code: cs_current_code.to_string(),
+                source_hash: hash_source(cs_current_code),
+                binary_path: None,
+                binary_size: None,
+                binary_cached: false,
+                compiler_version: None,
+                target_arch: None,
+            },
+            schedule: Some("0 0 * * *".to_string()),
+            quality_gates: vec![
+                QualityGateRef {
+                    gate_type: "not_null".to_string(),
+                    column: Some("customer_id".to_string()),
+                    threshold: None,
+                    description: "customer_id must not be null".to_string(),
+                },
+                QualityGateRef {
+                    gate_type: "unique".to_string(),
+                    column: Some("customer_id".to_string()),
+                    threshold: None,
+                    description: "customer_id must be unique".to_string(),
+                },
+                QualityGateRef {
+                    gate_type: "row_count".to_string(),
+                    column: None,
+                    threshold: Some(1.0),
+                    description: "Must produce at least 1 row".to_string(),
+                },
+            ],
+            input_tables: vec!["customers".to_string(), "orders".to_string()],
+            status: ExecutableTableStatus {
+                state: "active".to_string(),
+                health: "healthy".to_string(),
+                last_error: None,
+                staleness_hours: 0.0,
+                data_freshness: "unknown".to_string(),
+            },
+            history: Vec::new(),
+            versions: vec![
+                TransformVersion {
+                    version: 1,
+                    source_code: cs_v1_code.to_string(),
+                    source_hash: hash_source(cs_v1_code),
+                    created_at: (now - chrono::Duration::hours(96)).to_rfc3339(),
+                    created_by: "user".to_string(),
+                    change_description: "Initial LTV calculation".to_string(),
+                    binary_size_bytes: None,
+                    snapshot_ids: Vec::new(),
+                },
+                TransformVersion {
+                    version: 2,
+                    source_code: cs_v2_code.to_string(),
+                    source_hash: hash_source(cs_v2_code),
+                    created_at: (now - chrono::Duration::hours(48)).to_rfc3339(),
+                    created_by: "user".to_string(),
+                    change_description: "Added last_order date and segmentation".to_string(),
+                    binary_size_bytes: None,
+                    snapshot_ids: Vec::new(),
+                },
+                TransformVersion {
+                    version: 3,
+                    source_code: cs_current_code.to_string(),
+                    source_hash: hash_source(cs_current_code),
+                    created_at: (now - chrono::Duration::hours(24)).to_rfc3339(),
+                    created_by: "user".to_string(),
+                    change_description: "Added churn risk detection and 5th customer".to_string(),
+                    binary_size_bytes: None,
+                    snapshot_ids: Vec::new(),
+                },
+            ],
+            created_at: (now - chrono::Duration::hours(96)).to_rfc3339(),
+            last_refresh: None,
+            next_refresh: None,
+            estimated_cost_usd: 0.0,
+            total_executions: 0,
+            total_cost_usd: 0.0,
+            incremental: false,
+            watermark_column: None,
+            last_watermark: None,
+            executions_skipped: 0,
+            cost_saved_usd: 0.0,
+            auto_refresh: false,
+            refresh_interval_seconds: 0,
+        };
+
+    state.seed_executable_table(customer_segments).await;
+}
+
 /// Sync all registered DataFusion tables into DuckDB for OLAP acceleration.
 #[cfg(feature = "duckdb")]
 async fn sync_tables_to_duckdb(state: &AppState) {
@@ -871,6 +1160,18 @@ async fn main() -> anyhow::Result<()> {
                     });
                 }
                 if !restored_configs.is_empty() {
+                    // Configure DuckDB S3 credentials for native access on restored configs
+                    if let Some(ref duckdb_engine) = state.duckdb_engine {
+                        for cfg in &restored_configs {
+                            if !cfg.access_key.is_empty() && !cfg.secret_key.is_empty() {
+                                let endpoint = if cfg.endpoint.is_empty() { None } else { Some(cfg.endpoint.as_str()) };
+                                match duckdb_engine.configure_s3(&cfg.access_key, &cfg.secret_key, &cfg.region, endpoint).await {
+                                    Ok(()) => tracing::info!(bucket = %cfg.bucket, "DuckDB: S3 credentials configured on startup"),
+                                    Err(e) => tracing::warn!(error = %e, bucket = %cfg.bucket, "DuckDB: S3 config failed on startup"),
+                                }
+                            }
+                        }
+                    }
                     tracing::info!(
                         count = restored_configs.len(),
                         total_tables = restored_configs.iter().map(|c| c.tables.len()).sum::<usize>(),
@@ -895,6 +1196,42 @@ async fn main() -> anyhow::Result<()> {
                     tracing::warn!(error = %e, url = %creds_url, "Failed to fetch S3 credentials from external API");
                 }
             }
+        }
+    }
+
+    // Initialize S3 binary cache for Rust notebook cells
+    {
+        let s3_configs = state.s3_configs.get_mut();
+        if let Some(first_s3) = s3_configs.first() {
+            // Use in-memory credentials if available, otherwise fall back to credential store
+            let (ak, sk) = if !first_s3.access_key.is_empty() && !first_s3.secret_key.is_empty() {
+                (first_s3.access_key.clone(), first_s3.secret_key.clone())
+            } else {
+                let all_creds = state.credential_store.load_all_s3_creds();
+                if let Some(creds) = all_creds.get(&first_s3.bucket).or_else(|| all_creds.values().next()) {
+                    (creds.access_key.clone(), creds.secret_key.clone())
+                } else {
+                    (String::new(), String::new())
+                }
+            };
+            if !ak.is_empty() && !sk.is_empty() {
+                rust_executor::init_s3_cache(
+                    &first_s3.endpoint,
+                    &first_s3.bucket,
+                    &ak,
+                    &sk,
+                    &first_s3.region,
+                ).await;
+            } else {
+                tracing::debug!("S3 binary cache: no credentials available for bucket {}", first_s3.bucket);
+            }
+        } else {
+            // Try MinIO defaults
+            let minio_endpoint = std::env::var("RUSTLAKE_MINIO_ENDPOINT").unwrap_or_else(|_| "http://localhost:9000".to_string());
+            let minio_bucket = std::env::var("RUSTLAKE_MINIO_BUCKET").unwrap_or_else(|_| "rustlake-warehouse".to_string());
+            let minio_key = std::env::var("RUSTLAKE_MINIO_ACCESS_KEY").unwrap_or_else(|_| "rustlake".to_string());
+            let minio_secret = std::env::var("RUSTLAKE_MINIO_SECRET_KEY").unwrap_or_else(|_| "rustlake123".to_string());
+            rust_executor::init_s3_cache(&minio_endpoint, &minio_bucket, &minio_key, &minio_secret, "us-east-1").await;
         }
     }
 
@@ -985,6 +1322,34 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Pre-register S3 object stores with DataFusion so CDC tables are immediately queryable
+    {
+        let s3_configs = state.s3_configs.get_mut();
+        let ctx = state.ctx.get_mut();
+        let df_ctx = ctx.datafusion_ctx();
+        let mut registered = 0;
+        for cfg in s3_configs.iter() {
+            if cfg.access_key.is_empty() || cfg.secret_key.is_empty() {
+                continue;
+            }
+            match iceberg_s3::build_s3_store(
+                &cfg.bucket, &cfg.access_key, &cfg.secret_key, &cfg.region,
+                if cfg.endpoint.is_empty() { None } else { Some(&cfg.endpoint) },
+            ) {
+                Ok(store) => {
+                    if let Ok(url) = url::Url::parse(&format!("s3://{}", cfg.bucket)) {
+                        df_ctx.runtime_env().register_object_store(&url, store);
+                        registered += 1;
+                    }
+                }
+                Err(e) => tracing::warn!(name = %cfg.name, error = %e, "Failed to pre-register S3 store"),
+            }
+        }
+        if registered > 0 {
+            tracing::info!(count = registered, "Pre-registered S3 object stores with DataFusion");
+        }
+    }
+
     let state = Arc::new(state);
 
     // Auto-reconnect previously saved connections (non-blocking)
@@ -1020,6 +1385,9 @@ async fn main() -> anyhow::Result<()> {
             }
         });
     }
+
+    // ── Seed demo executable tables (always runs) ───────────────────
+    seed_demo_executable_tables(&state).await;
 
     // ── Hardware & resource banner ──────────────────────────────────
     let cpu_cores = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(1);
@@ -1098,7 +1466,216 @@ async fn main() -> anyhow::Result<()> {
                 .on_request(DefaultOnRequest::new().level(Level::DEBUG))
                 .on_response(DefaultOnResponse::new().level(Level::DEBUG).latency_unit(tower_http::LatencyUnit::Millis)),
         )
-        .with_state(state);
+        .with_state(state.clone());
+
+    // State for background scheduler
+    let scheduler_state = state;
+
+    // Spawn background scheduler tick for executable table hot-swap + cost-aware scheduling + matview refresh
+    {
+        let sched_state = scheduler_state;
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+
+                // ── Feature 9: Executable table job execution ────────────
+                let jobs = sched_state.scheduled_jobs.read().await.clone();
+                for job in &jobs {
+                    if !job.enabled || job.job_type != "executable_table" {
+                        continue;
+                    }
+                    if let Some(next) = job.next_run {
+                        if chrono::Utc::now() < next {
+                            continue;
+                        }
+                    }
+                    let tables = sched_state.executable_tables.read().await;
+                    if let Some(table) = tables.iter().find(|t| t.table_name == job.target) {
+                        let tt = table.transform.transform_type.clone();
+                        let code = table.transform.source_code.clone();
+                        let name = table.table_name.clone();
+                        let input_tables = table.input_tables.clone();
+                        let last_refresh = table.last_refresh.clone();
+                        let estimated_cost = table.estimated_cost_usd;
+                        let incremental = table.incremental;
+                        let watermark_col = table.watermark_column.clone();
+                        let last_watermark = table.last_watermark.clone();
+                        let quality_gates = table.quality_gates.clone();
+                        let prev_version = table.versions.iter()
+                            .filter(|v| !v.change_description.starts_with("Auto-rollback"))
+                            .rev().nth(1).cloned();
+                        drop(tables);
+
+                        // ── Feature 6: Cost-aware skip detection ─────
+                        let mut should_skip = false;
+                        if !input_tables.is_empty() {
+                            let upstream_tables = sched_state.executable_tables.read().await;
+                            let upstream_changed = input_tables.iter().any(|input_name| {
+                                if let Some(ut) = upstream_tables.iter().find(|t| t.table_name == *input_name) {
+                                    if let (Some(ref my_lr), Some(ref upstream_lr)) = (&last_refresh, &ut.last_refresh) {
+                                        upstream_lr > my_lr // upstream refreshed after us
+                                    } else {
+                                        true // no refresh info → run
+                                    }
+                                } else {
+                                    false
+                                }
+                            });
+                            drop(upstream_tables);
+
+                            if !upstream_changed {
+                                should_skip = true;
+                                let mut tables = sched_state.executable_tables.write().await;
+                                if let Some(t) = tables.iter_mut().find(|t| t.table_name == name) {
+                                    t.executions_skipped += 1;
+                                    t.cost_saved_usd += estimated_cost;
+                                }
+                                tracing::info!(table=%name, "Scheduler: skipped (upstream unchanged), saved ${:.6}", estimated_cost);
+                            }
+                        }
+
+                        if !should_skip {
+                            // Determine if incremental or full
+                            let exec_code = if incremental && watermark_col.is_some() && last_watermark.is_some() {
+                                let wc = watermark_col.as_deref().unwrap_or("updated_at");
+                                let wv = last_watermark.as_deref().unwrap_or("1970-01-01");
+                                format!("{} WHERE {} > '{}'", code, wc, wv)
+                            } else {
+                                code.clone()
+                            };
+
+                            tracing::info!(table=%name, "Scheduler: executing executable table (hot-swap tick)");
+                            if tt == "rust" {
+                                let result = crate::rust_executor::execute_rust(&exec_code).await;
+                                tracing::info!(table=%name, success=%result.success, run_ms=%result.run_ms, "Scheduler: Rust transform complete");
+                            } else if tt == "sql" {
+                                let ctx = sched_state.ctx.read().await;
+                                match ctx.sql(&exec_code).await {
+                                    Ok(batches) => {
+                                        let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+                                        tracing::info!(table=%name, rows=%rows, "Scheduler: SQL transform complete");
+
+                                        // ── Self-Healing: validate quality gates after execution ──
+                                        let gate_failed = if !quality_gates.is_empty() {
+                                            let gate_results = crate::executable_table::validate_gates(&quality_gates, &batches);
+                                            let any_failed = gate_results.iter().any(|g| !g.passed);
+                                            if any_failed {
+                                                let failed_names: Vec<_> = gate_results.iter()
+                                                    .filter(|g| !g.passed)
+                                                    .map(|g| format!("{}: {}", g.gate_type, g.detail))
+                                                    .collect();
+                                                tracing::warn!(table=%name, gates=?failed_names, "Scheduler: quality gates FAILED");
+                                            }
+                                            any_failed
+                                        } else {
+                                            false
+                                        };
+
+                                        if gate_failed {
+                                            // Auto-rollback to previous version
+                                            if let Some(ref prev) = prev_version {
+                                                let mut tables = sched_state.executable_tables.write().await;
+                                                if let Some(t) = tables.iter_mut().find(|t| t.table_name == name) {
+                                                    let new_ver = t.versions.iter().map(|v| v.version).max().unwrap_or(1) + 1;
+                                                    t.versions.push(crate::executable_table::TransformVersion {
+                                                        version: new_ver,
+                                                        source_code: prev.source_code.clone(),
+                                                        source_hash: prev.source_hash.clone(),
+                                                        created_at: chrono::Utc::now().to_rfc3339(),
+                                                        created_by: "auto-heal".to_string(),
+                                                        change_description: format!("Auto-rollback to v{} (gate failure)", prev.version),
+                                                        binary_size_bytes: prev.binary_size_bytes,
+                                                        snapshot_ids: Vec::new(),
+                                                    });
+                                                    t.transform.source_code = prev.source_code.clone();
+                                                    t.transform.source_hash = prev.source_hash.clone();
+                                                    t.transform.binary_cached = false;
+                                                    t.status.health = "warning".to_string();
+                                                    tracing::warn!(table=%name, rolled_back_to=prev.version, "Scheduler: AUTO-ROLLBACK triggered (self-healing)");
+                                                }
+                                            } else {
+                                                tracing::warn!(table=%name, "Scheduler: gate failure but no previous version to rollback to");
+                                            }
+                                        } else {
+                                            // Gates passed (or no gates) — update last_refresh normally
+                                            let mut tables = sched_state.executable_tables.write().await;
+                                            if let Some(t) = tables.iter_mut().find(|t| t.table_name == name) {
+                                                t.last_refresh = Some(chrono::Utc::now().to_rfc3339());
+                                                if t.status.health == "warning" {
+                                                    t.status.health = "healthy".to_string();
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Err(e) => tracing::warn!(table=%name, error=%e, "Scheduler: SQL transform failed"),
+                                }
+                            }
+                        }
+                    } else {
+                        drop(tables);
+                    }
+                }
+
+                // ── Feature 3: Matview auto-refresh ──────────────────────
+                {
+                    let tables = sched_state.executable_tables.read().await;
+                    let matview_candidates: Vec<(String, String, String)> = tables.iter()
+                        .filter(|t| {
+                            t.transform.transform_type == "matview" || (t.auto_refresh && t.refresh_interval_seconds > 0)
+                        })
+                        .filter(|t| {
+                            if let Some(ref lr) = t.last_refresh {
+                                if let Ok(last) = chrono::DateTime::parse_from_rfc3339(lr) {
+                                    let elapsed = (chrono::Utc::now() - last.with_timezone(&chrono::Utc)).num_seconds() as u64;
+                                    elapsed >= t.refresh_interval_seconds
+                                } else { true }
+                            } else { true }
+                        })
+                        .map(|t| (t.table_name.clone(), t.transform.transform_type.clone(), t.transform.source_code.clone()))
+                        .collect();
+                    drop(tables);
+
+                    for (name, tt, code) in matview_candidates {
+                        tracing::info!(table=%name, "Scheduler: auto-refreshing matview");
+                        if tt == "sql" || tt == "matview" {
+                            let ctx = sched_state.ctx.read().await;
+                            match ctx.sql(&code).await {
+                                Ok(batches) => {
+                                    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+                                    tracing::info!(table=%name, rows=%rows, "Scheduler: matview refresh complete");
+                                    let mut tables = sched_state.executable_tables.write().await;
+                                    if let Some(t) = tables.iter_mut().find(|t| t.table_name == name) {
+                                        t.last_refresh = Some(chrono::Utc::now().to_rfc3339());
+                                        let exec_id = uuid::Uuid::new_v4().to_string();
+                                        t.history.push(crate::executable_table::ExecutionRecord {
+                                            execution_id: exec_id,
+                                            started_at: chrono::Utc::now().to_rfc3339(),
+                                            completed_at: Some(chrono::Utc::now().to_rfc3339()),
+                                            duration_ms: 0,
+                                            status: "success".to_string(),
+                                            rows_produced: Some(rows as u64),
+                                            bytes_written: None,
+                                            cost_usd: 0.0,
+                                            binary_cached: false,
+                                            compile_ms: 0,
+                                            run_ms: 0,
+                                            error: None,
+                                            execution_location: "local".to_string(),
+                                            version: t.versions.iter().map(|v| v.version).max().unwrap_or(1),
+                                        });
+                                        t.total_executions += 1;
+                                    }
+                                }
+                                Err(e) => tracing::warn!(table=%name, error=%e, "Scheduler: matview refresh failed"),
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        tracing::info!("Background scheduler started (60s tick for executable table hot-swap + matview + cost-aware)");
+    }
 
     let listener = TcpListener::bind(&bind_addr).await?;
 

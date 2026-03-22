@@ -63,6 +63,12 @@ pub struct SqlResponse {
     pub exec_ms: Option<u128>,
     /// Which engine executed the query ("DataFusion" or "DuckDB").
     pub engine: String,
+    /// How the engine accessed the data:
+    /// - "direct" — engine read from source directly (federated/S3 native)
+    /// - "synced" — data was fetched by DataFusion then synced to the engine
+    /// - "cached" — engine used previously synced data (no transfer)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub execution_mode: Option<String>,
 }
 
 /// JSON error response body returned for failed requests.
@@ -629,6 +635,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/api/v1/connections/{id}", delete(delete_connection).put(update_connection))
         .route("/api/v1/connections/{id}/status", get(connection_sync_status))
         .route("/api/v1/connections/{id}/reauth", post(reauth_connection))
+        .route("/api/v1/connections/{id}/engines", get(connection_engine_status))
         .route(
             "/api/v1/connections/{id}/register/{table}",
             post(register_external_table),
@@ -693,6 +700,7 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/api/v1/system/metrics", get(system_metrics))
         // Query cost estimation
         .route("/api/v1/sql/estimate", post(estimate_query))
+        .route("/api/v1/sql/profile", post(profile_query))
         // Connection testing
         .route("/api/v1/connections/test", post(test_connection))
         // Bulk import/export
@@ -725,6 +733,62 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/api/v1/migration/compare", post(migration_compare))
         .route("/api/v1/migration/{conn_id}/tables", get(migration_tables))
         .route("/api/v1/migration/comparisons", get(migration_comparisons))
+        // Iceberg table metadata + maintenance
+        .route("/api/v1/tables/{name}/snapshots", get(table_snapshots))
+        .route("/api/v1/tables/{name}/snapshots/{snapshot_id}/files", get(snapshot_files))
+        .route("/api/v1/tables/{name}/schemas", get(table_schemas))
+        .route("/api/v1/tables/{name}/schema/evolve", post(evolve_table_schema))
+        .route("/api/v1/tables/{name}/partitions", get(table_partitions))
+        .route("/api/v1/tables/{name}/partitions/evolve", post(evolve_table_partitions))
+        .route("/api/v1/tables/{name}/maintenance/compact", post(compact_table))
+        .route("/api/v1/tables/{name}/maintenance/expire-snapshots", post(expire_table_snapshots))
+        .route("/api/v1/tables/{name}/maintenance/remove-orphans", post(remove_table_orphans))
+        .route("/api/v1/tables/{name}/maintenance/status", get(table_maintenance_status))
+        // Neo4j graph database
+        .route("/api/v1/neo4j/connect", post(neo4j_connect))
+        .route("/api/v1/neo4j/cypher", post(neo4j_cypher))
+        .route("/api/v1/neo4j/schema", get(neo4j_schema))
+        .route("/api/v1/neo4j/graph", post(neo4j_graph_query))
+        // Notebook execution & ETL
+        .route("/api/v1/notebooks/execute", post(execute_notebook_handler))
+        .route("/api/v1/notebooks/plan", post(plan_notebook))
+        .route("/api/v1/notebooks/schedule", post(schedule_notebook))
+        .route("/api/v1/notebooks/jobs", get(list_notebook_jobs))
+        // Executable Lakehouse
+        .route("/api/v1/executable-tables", get(list_executable_tables).post(create_executable_table))
+        .route("/api/v1/executable-tables/cost-comparison", post(cost_comparison))
+        .route("/api/v1/executable-tables/{name}/execute", post(execute_executable_table))
+        .route("/api/v1/executable-tables/{name}/cost", get(executable_table_cost))
+        .route("/api/v1/executable-tables/{name}/versions", get(list_transform_versions))
+        .route("/api/v1/executable-tables/{name}/diff", post(diff_transform_versions))
+        .route("/api/v1/executable-tables/{name}/provenance", get(table_provenance))
+        .route("/api/v1/executable-tables/{name}/regression", post(check_regression))
+        .route("/api/v1/executable-tables/{name}", put(update_executable_table))
+        .route("/api/v1/executable-tables/{name}/rollback", post(rollback_executable_table))
+        .route("/api/v1/executable-tables/{name}/properties", get(executable_table_properties))
+        .route("/api/v1/executable-tables/{name}/execute-version", post(execute_version))
+        .route("/api/v1/executable-tables/{name}/restore", post(restore_executable_table_data))
+        .route("/api/v1/executable-tables/{name}/ab-test", post(ab_test_executable_table))
+        .route("/api/v1/data-contracts", get(list_data_contracts).post(create_data_contract))
+        .route("/api/v1/data-contracts/{id}/validate", post(validate_data_contract))
+        .route("/api/v1/marketplace", get(list_marketplace))
+        .route("/api/v1/marketplace/publish", post(publish_to_marketplace))
+        .route("/api/v1/marketplace/install", post(install_from_marketplace))
+        // Regulatory Compliance Automation
+        .route("/api/v1/executable-tables/{name}/column-lineage", get(column_lineage))
+        .route("/api/v1/executable-tables/{name}/cascade-replay", post(cascade_replay))
+        .route("/api/v1/executable-tables/{name}/debug", post(debug_execution))
+        .route("/api/v1/executable-pipelines", get(list_executable_pipelines).post(create_executable_pipeline))
+        .route("/api/v1/executable-pipelines/{id}/run", post(run_executable_pipeline))
+        .route("/api/v1/data-products", get(list_data_products).post(create_data_product))
+        .route("/api/v1/data-products/{name}/audit", get(audit_data_product))
+        // Spark SQL compatibility
+        .route("/api/v1/spark/compat", get(spark_compat_info))
+        .route("/api/v1/spark/translate", post(spark_translate))
+        // Rust notebook execution
+        .route("/api/v1/notebook/execute-rust", post(execute_rust_cell))
+        // Iceberg REST Catalog (Apache spec)
+        .merge(crate::iceberg_rest_catalog::iceberg_catalog_routes())
         // Server-Sent Events — replaces polling for metrics/health/tables
         .route("/api/v1/events", get(event_stream))
         // WebSocket
@@ -981,6 +1045,48 @@ async fn execute_sql(
         return handle_ctas(state, req.sql, query_id, query_type, parse_ms, start).await;
     }
 
+    // ── Time Travel: VERSION AS OF <id> / FOR SYSTEM_TIME AS OF '<ts>' ──
+    // Detect time travel patterns and rewrite SQL to query historical data
+    let sql_to_execute = if let Some(tt) = parse_time_travel(&req.sql) {
+        tracing::info!(%query_id, table = %tt.table, snapshot_ref = ?tt.snapshot_ref, "Time travel query detected");
+
+        let s3_configs = state.s3_configs.read().await;
+        match find_iceberg_table_state(&s3_configs, &tt.table).await {
+            Some(ts) => {
+                match crate::iceberg_metadata::resolve_snapshot(&ts, &tt.snapshot_ref) {
+                    Ok(snap) => {
+                        tracing::info!(%query_id, snapshot_id = snap.snapshot_id, timestamp = snap.timestamp_ms, "Resolved time travel snapshot");
+                        // For now, return a message about the resolved snapshot
+                        // Full implementation will create temp ListingTable from snapshot files
+                        tt.rewritten_sql.clone()
+                    }
+                    Err(e) => {
+                        return Err((StatusCode::BAD_REQUEST, Json(ErrorResponse {
+                            error: format!("Time travel resolution failed: {}", e),
+                        })));
+                    }
+                }
+            }
+            None => {
+                tracing::warn!(%query_id, table = %tt.table, "Time travel: no Iceberg metadata found, executing original SQL");
+                req.sql.clone()
+            }
+        }
+    } else {
+        req.sql.clone()
+    };
+
+    // ── Spark SQL compatibility: auto-translate Spark syntax ──
+    let (sql_to_execute, _spark_translated) = if crate::spark_compat::looks_like_spark_sql(&sql_to_execute) {
+        let result = crate::spark_compat::translate_spark_sql(&sql_to_execute);
+        if result.was_translated {
+            tracing::info!(%query_id, translations = ?result.translations_applied, "Spark SQL auto-translated");
+        }
+        (result.translated, result.was_translated)
+    } else {
+        (sql_to_execute, false)
+    };
+
     // Determine target engine: explicit override > classifier recommendation
     let engine_name = determine_engine(&state, &req.engine, &classification.engine);
 
@@ -992,14 +1098,21 @@ async fn execute_sql(
         "Engine selected"
     );
 
-    // Execute via the selected engine
+    // Execute via the selected engine, tracking execution mode
     let exec_start = Instant::now();
-    let result = match engine_name {
-        "DuckDB" => execute_via_duckdb(&state, &req.sql).await,
-        "Polars" => execute_via_polars(&state, &req.sql).await,
+    let (result, execution_mode): (std::result::Result<Vec<RecordBatch>, String>, Option<&str>) = match engine_name {
+        "DuckDB" => match execute_via_duckdb_with_mode(&state, &sql_to_execute).await {
+            Ok(r) => (Ok(r.batches), Some(r.execution_mode)),
+            Err(e) => (Err(e), None),
+        },
+        "Polars" => match execute_via_polars_with_mode(&state, &sql_to_execute).await {
+            Ok(r) => (Ok(r.batches), Some(r.execution_mode)),
+            Err(e) => (Err(e), None),
+        },
         _ => {
             let ctx = state.ctx.read().await;
-            ctx.sql(&req.sql).await.map_err(|e| e.to_string())
+            // DataFusion always reads from source directly (federated providers, object store, etc.)
+            (ctx.sql(&sql_to_execute).await.map_err(|e| e.to_string()), Some("direct"))
         }
     };
     let exec_ms = exec_start.elapsed().as_millis();
@@ -1016,13 +1129,14 @@ async fn execute_sql(
                 tracing::warn!(engine = engine_name, error = %e, "Engine failed, falling back to DataFusion");
                 let fallback_start = Instant::now();
                 let ctx = state.ctx.read().await;
-                match ctx.sql(&req.sql).await {
+                match ctx.sql(&sql_to_execute).await {
                     Ok(batches) => {
                         let fallback_ms = fallback_start.elapsed().as_millis();
                         let duration_ms = start.elapsed().as_millis();
                         return finish_sql_response(
-                            &state, query_id, &req.sql, query_type, "DataFusion",
+                            &state, query_id, &sql_to_execute, query_type, "DataFusion",
                             batches, parse_ms, fallback_ms, duration_ms,
+                            Some("direct".to_string()),
                         ).await;
                     }
                     Err(fallback_err) => {
@@ -1039,6 +1153,10 @@ async fn execute_sql(
                                 status: "error".to_string(),
                                 error: Some(fallback_err.to_string()),
                                 engine: "DataFusion".to_string(),
+                                s3_bytes_scanned: 0,
+                                s3_requests: 0,
+                                estimated_cost_usd: 0.0,
+                                snapshot_context: std::collections::HashMap::new(),
                             })
                             .await;
                         return Err((
@@ -1061,6 +1179,10 @@ async fn execute_sql(
                     status: "error".to_string(),
                     error: Some(e.to_string()),
                     engine: engine_name.to_string(),
+                    s3_bytes_scanned: 0,
+                    s3_requests: 0,
+                    estimated_cost_usd: 0.0,
+                    snapshot_context: std::collections::HashMap::new(),
                 })
                 .await;
 
@@ -1072,8 +1194,9 @@ async fn execute_sql(
     };
 
     finish_sql_response(
-        &state, query_id, &req.sql, query_type, engine_name,
+        &state, query_id, &sql_to_execute, query_type, engine_name,
         batches, parse_ms, exec_ms, duration_ms,
+        execution_mode.map(|s| s.to_string()),
     ).await
 }
 
@@ -1095,10 +1218,26 @@ pub(crate) fn determine_engine(state: &AppState, engine_choice: &str, recommende
 }
 
 /// Execute SQL via DuckDB engine, returning batches or error string.
+/// Result from an alternative engine execution, including execution mode.
+pub(crate) struct EngineExecResult {
+    pub batches: Vec<RecordBatch>,
+    /// "direct" = engine read from source natively (S3/Iceberg)
+    /// "synced" = DataFusion fetched data, then pushed to engine
+    /// "cached" = engine used previously synced data
+    pub execution_mode: &'static str,
+}
+
 pub(crate) async fn execute_via_duckdb(
     state: &AppState,
     sql: &str,
 ) -> std::result::Result<Vec<RecordBatch>, String> {
+    execute_via_duckdb_with_mode(state, sql).await.map(|r| r.batches)
+}
+
+pub(crate) async fn execute_via_duckdb_with_mode(
+    state: &AppState,
+    sql: &str,
+) -> std::result::Result<EngineExecResult, String> {
     #[cfg(feature = "duckdb")]
     {
         if let Some(ref engine) = state.duckdb_engine {
@@ -1111,36 +1250,61 @@ pub(crate) async fn execute_via_duckdb(
             let sql_upper = sql.to_uppercase();
             let table_names = ctx.list_tables().await.unwrap_or_default();
             let mut tables_to_sync: Vec<(String, Vec<RecordBatch>)> = Vec::new();
+            let mut all_cached = true;
 
+            let synced_cache = state.duckdb_synced_tables.read().await;
+            let mut any_table_referenced = false;
             for table_name in &table_names {
-                // Check if this table is referenced in the SQL
+                // Check if this table is referenced in the SQL and not already synced
                 let check_name = table_name.replace('.', "_").to_uppercase();
                 let dotted_name = table_name.to_uppercase();
+                let flat_name = table_name.replace('.', "_");
                 if sql_upper.contains(&check_name) || sql_upper.contains(&dotted_name) {
-                    // Fetch data from DataFusion
-                    let fetch_sql = format!("SELECT * FROM {}", table_name);
-                    match df_ctx.sql(&fetch_sql).await {
-                        Ok(df) => match df.collect().await {
-                            Ok(batches) if !batches.is_empty() && batches.iter().any(|b| b.num_rows() > 0) => {
-                                let flat_name = table_name.replace('.', "_");
-                                tables_to_sync.push((flat_name, batches));
+                    any_table_referenced = true;
+                    if !synced_cache.contains(&flat_name) {
+                        all_cached = false;
+                        // Fetch data from DataFusion
+                        let fetch_sql = format!("SELECT * FROM {}", table_name);
+                        match df_ctx.sql(&fetch_sql).await {
+                            Ok(df) => match df.collect().await {
+                                Ok(batches) if !batches.is_empty() && batches.iter().any(|b| b.num_rows() > 0) => {
+                                    tables_to_sync.push((flat_name, batches));
+                                }
+                                _ => {}
                             }
-                            _ => {}
+                            Err(_) => {}
                         }
-                        Err(_) => {}
                     }
                 }
             }
             drop(ctx);
 
+            drop(synced_cache);
+
+            // Determine execution mode
+            let execution_mode = if !any_table_referenced {
+                // No registered tables referenced — likely a DuckDB-native query (S3, iceberg_scan, etc.)
+                "direct"
+            } else if tables_to_sync.is_empty() && all_cached {
+                "cached"
+            } else {
+                "synced"
+            };
+
             if !tables_to_sync.is_empty() {
                 let sync_count = tables_to_sync.len();
+                let synced_names: Vec<String> = tables_to_sync.iter().map(|(n, _)| n.clone()).collect();
                 let synced = engine.sync_tables(tables_to_sync).await.unwrap_or(0);
                 tracing::info!(
                     tables_synced = synced, tables_attempted = sync_count,
                     elapsed_ms = sync_start.elapsed().as_millis(),
                     "DuckDB: synced tables from DataFusion for query"
                 );
+                // Cache synced table names to skip re-sync on next query
+                let mut cache = state.duckdb_synced_tables.write().await;
+                for name in synced_names {
+                    cache.insert(name);
+                }
             }
 
             // Now execute the SQL — rewrite table names from schema.table to schema_table
@@ -1153,7 +1317,8 @@ pub(crate) async fn execute_via_duckdb(
                 }
             });
 
-            return engine.sql(&rewritten_sql).await.map_err(|e| e.to_string());
+            let batches = engine.sql(&rewritten_sql).await.map_err(|e| e.to_string())?;
+            return Ok(EngineExecResult { batches, execution_mode });
         }
     }
     Err("DuckDB engine not available".to_string())
@@ -1164,6 +1329,13 @@ pub(crate) async fn execute_via_polars(
     state: &AppState,
     sql: &str,
 ) -> std::result::Result<Vec<RecordBatch>, String> {
+    execute_via_polars_with_mode(state, sql).await.map(|r| r.batches)
+}
+
+pub(crate) async fn execute_via_polars_with_mode(
+    state: &AppState,
+    sql: &str,
+) -> std::result::Result<EngineExecResult, String> {
     #[cfg(feature = "polars")]
     {
         if let Some(ref engine) = state.polars_engine {
@@ -1191,6 +1363,8 @@ pub(crate) async fn execute_via_polars(
             }
             drop(ctx);
 
+            let execution_mode = if tables_to_sync.is_empty() { "direct" } else { "synced" };
+
             if !tables_to_sync.is_empty() {
                 let synced = engine.sync_tables(tables_to_sync).await.unwrap_or(0);
                 tracing::info!(tables_synced = synced, "Polars: synced tables from DataFusion");
@@ -1200,7 +1374,8 @@ pub(crate) async fn execute_via_polars(
                 if name.contains('.') { s.replace(name, &name.replace('.', "_")) } else { s }
             });
 
-            return engine.sql(&rewritten_sql).await.map_err(|e| e.to_string());
+            let batches = engine.sql(&rewritten_sql).await.map_err(|e| e.to_string())?;
+            return Ok(EngineExecResult { batches, execution_mode });
         }
     }
     Err("Polars engine not available".to_string())
@@ -1521,6 +1696,7 @@ async fn finish_sql_response(
     parse_ms: u128,
     exec_ms: u128,
     duration_ms: u128,
+    execution_mode: Option<String>,
 ) -> std::result::Result<Json<SqlResponse>, (StatusCode, Json<ErrorResponse>)> {
     let columns = if let Some(batch) = batches.first() {
         batch.schema().fields().iter().map(|f| f.name().clone()).collect()
@@ -1560,8 +1736,27 @@ async fn finish_sql_response(
             status: "success".to_string(),
             error: None,
             engine: engine_name.to_string(),
+            s3_bytes_scanned: 0,
+            s3_requests: 0,
+            estimated_cost_usd: 0.0,
+            snapshot_context: std::collections::HashMap::new(),
         })
         .await;
+
+    // Feed execution result to the adaptive profiler for learning
+    let bytes_scanned = batches.iter().map(|b| {
+        b.get_array_memory_size() as u64
+    }).sum::<u64>();
+    state.query_profiler.record_execution(rustlake_router::ExecutionRecord {
+        query_hash: rustlake_router::hash_sql(sql),
+        engine: engine_name.to_string(),
+        execution_ms: exec_ms as u64,
+        rows_scanned: row_count as u64,
+        rows_returned: row_count as u64,
+        bytes_scanned,
+        timestamp: std::time::Instant::now(),
+        source_types: Vec::new(),
+    });
 
     Ok(Json(SqlResponse {
         query_id: query_id.to_string(),
@@ -1573,6 +1768,7 @@ async fn finish_sql_response(
         parse_ms: Some(parse_ms),
         exec_ms: Some(exec_ms),
         engine: engine_name.to_string(),
+        execution_mode,
     }))
 }
 
@@ -1657,6 +1853,10 @@ async fn handle_ctas(
             status: "success".to_string(),
             error: None,
             engine: "DataFusion".to_string(),
+            s3_bytes_scanned: 0,
+            s3_requests: 0,
+            estimated_cost_usd: 0.0,
+            snapshot_context: std::collections::HashMap::new(),
         })
         .await;
 
@@ -1670,6 +1870,7 @@ async fn handle_ctas(
         parse_ms: Some(parse_ms),
         exec_ms: Some(exec_ms),
         engine: "DataFusion".to_string(),
+        execution_mode: None,
     }))
 }
 
@@ -3990,6 +4191,55 @@ async fn reauth_connection(
     })))
 }
 
+/// GET /api/v1/connections/{id}/engines — check which engines can access this connection's tables.
+async fn connection_engine_status(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let connections = state.connections.read().await;
+    let conn = connections.iter().find(|c| c.id == id).cloned();
+    drop(connections);
+
+    let conn = conn.ok_or_else(|| (StatusCode::NOT_FOUND, Json(ErrorResponse {
+        error: format!("Connection '{}' not found", id),
+    })))?;
+
+    let tables = &conn.tables;
+    let has_tables = !tables.is_empty();
+
+    // DataFusion — always has access if tables are registered
+    let df_status = if has_tables && conn.sync_status == "ready" { "connected" } else { "no_tables" };
+
+    // DuckDB — check if engine is available
+    let duckdb_status = if !state.duckdb_available() {
+        "disabled"
+    } else if has_tables {
+        // Check if any tables are already synced
+        #[cfg(feature = "duckdb")]
+        {
+            let cache = state.duckdb_synced_tables.read().await;
+            let synced = tables.iter().any(|t| cache.contains(&t.replace('.', "_")));
+            if synced { "synced" } else { "available" }
+        }
+        #[cfg(not(feature = "duckdb"))]
+        { "disabled" }
+    } else { "no_tables" };
+
+    // Polars
+    let polars_status = if !state.polars_available() { "disabled" } else if has_tables { "available" } else { "no_tables" };
+
+    Ok(Json(serde_json::json!({
+        "connection_id": id,
+        "connection_name": conn.name,
+        "tables": tables.len(),
+        "engines": {
+            "datafusion": { "status": df_status, "label": "DataFusion" },
+            "duckdb": { "status": duckdb_status, "label": "DuckDB" },
+            "polars": { "status": polars_status, "label": "Polars" },
+        }
+    })))
+}
+
 /// DELETE /api/v1/connections/:id — remove a connection.
 async fn delete_connection(
     State(state): State<Arc<AppState>>,
@@ -5524,6 +5774,21 @@ async fn run_schedule(
                 "notebook" => run_notebook_job(&state, &target, &run_start).await,
                 "pipeline" => run_pipeline_job(&state, &target, &run_start).await,
                 "dashboard_refresh" => run_dashboard_refresh_job(&target, &run_start).await,
+                "executable_table" => {
+                    // Live hot-swap: execute the current HEAD version of the executable table
+                    let tables = state.executable_tables.read().await;
+                    if let Some(table) = tables.iter().find(|t| t.table_name == target) {
+                        let transform_type = table.transform.transform_type.clone();
+                        let source_code = table.transform.source_code.clone();
+                        drop(tables);
+                        let start = std::time::Instant::now();
+                        let (batches, rows, dur) = execute_transform_code(&state, &transform_type, &source_code, start).await;
+                        Ok(format!("Executable table '{}' executed: {} rows in {}ms", target, rows, dur))
+                    } else {
+                        drop(tables);
+                        Err(format!("Executable table '{}' not found", target))
+                    }
+                },
                 _ => run_simulated_job(&job_type, &target, &run_start),
             };
 
@@ -6130,6 +6395,15 @@ async fn start_pipeline(
                                                     }
                                                 })
                                                 .map_err(|e| tracing::warn!(error = %e, "Failed to call register-s3 API"));
+
+                                            // Write Iceberg metadata to S3
+                                            match s.finalize_iceberg().await {
+                                                Ok(path) => tracing::info!(
+                                                    metadata = %path,
+                                                    "Iceberg metadata written — table discoverable by Trino/Spark"
+                                                ),
+                                                Err(e) => tracing::warn!(error = %e, "Failed to write Iceberg metadata"),
+                                            }
                                         }
                                     }
                                 }
@@ -6211,6 +6485,15 @@ async fn start_pipeline(
                                     }
                                 })
                                 .map_err(|e| tracing::warn!(error = %e, "Failed to call register-s3 API on stop"));
+
+                            // Write Iceberg metadata on pipeline stop
+                            match s.finalize_iceberg().await {
+                                Ok(path) => tracing::info!(
+                                    metadata = %path,
+                                    "Iceberg metadata written on stop — table discoverable"
+                                ),
+                                Err(e) => tracing::warn!(error = %e, "Iceberg metadata write failed on stop"),
+                            }
                         }
                     }
 
@@ -6389,6 +6672,21 @@ async fn add_s3_config(
     let mut configs = state.s3_configs.write().await;
     configs.push(config);
     drop(configs);
+
+    // Configure DuckDB S3 credentials for native S3/Iceberg access
+    #[cfg(feature = "duckdb")]
+    if let Some(ref engine) = state.duckdb_engine {
+        let endpoint = if req.endpoint.is_empty() { None } else { Some(req.endpoint.as_str()) };
+        match engine.configure_s3(&req.access_key, &req.secret_key, &req.region, endpoint).await {
+            Ok(()) => tracing::info!(bucket = %req.bucket, "DuckDB: S3 credentials configured for native access"),
+            Err(e) => tracing::warn!(error = %e, "DuckDB: failed to configure S3 credentials"),
+        }
+    }
+
+    // Initialize Rust executor S3 binary cache with new credentials
+    crate::rust_executor::init_s3_cache(
+        &req.endpoint, &req.bucket, &req.access_key, &req.secret_key, &req.region,
+    ).await;
 
     tracing::info!(
         name = %req.name,
@@ -6807,11 +7105,12 @@ async fn register_s3_table(
         })));
     }
 
-    // Find S3 config for credentials
+    // Find S3 config with valid credentials (prefer configs that have secret_key)
     let configs = state.s3_configs.read().await;
-    let cfg = configs.iter().find(|c| {
-        c.name == s3_config_name || s3_uri.contains(&c.bucket)
-    }).cloned();
+    let cfg = configs.iter()
+        .filter(|c| c.name == s3_config_name || s3_uri.contains(&c.bucket))
+        .max_by_key(|c| if c.secret_key.is_empty() { 0 } else { 1 })
+        .cloned();
     drop(configs);
 
     let cfg = cfg.ok_or_else(|| (StatusCode::BAD_REQUEST, Json(ErrorResponse {
@@ -8156,6 +8455,186 @@ fn format_bytes(bytes: u64) -> String {
     } else {
         format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
     }
+}
+
+// ── Query Profiling (Adaptive Multi-Engine Cost Model) ──────────
+
+/// POST /api/v1/sql/profile — profile a query to get per-engine cost estimates
+/// and the recommended execution strategy (single engine, split plan, direct S3).
+///
+/// This does NOT execute the query — it only analyzes metadata and returns
+/// cost predictions for each available engine.
+async fn profile_query(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SqlRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    use rustlake_router::profiler::{QueryProfile, TableReference, SourceType};
+
+    let tables_referenced = extract_table_references(&req.sql);
+    let sql_upper = req.sql.to_uppercase();
+
+    // Build table references with source type detection
+    let mut table_refs: Vec<TableReference> = Vec::new();
+    let ctx = state.ctx.read().await;
+    let df_ctx = ctx.datafusion_ctx();
+
+    for table_name in &tables_referenced {
+        // Detect source type from table name prefix
+        let source = if table_name.starts_with("pg.") || table_name.starts_with("pg_") {
+            SourceType::Federated
+        } else if table_name.starts_with("mysql.") || table_name.starts_with("mysql_") {
+            SourceType::Federated
+        } else if table_name.starts_with("mongo.") || table_name.starts_with("mongo_") {
+            SourceType::Federated
+        } else if table_name.starts_with("trino_") || table_name.starts_with("trino.") {
+            SourceType::Trino
+        } else if table_name.starts_with("s3_") || table_name.contains("iceberg") {
+            SourceType::S3Iceberg
+        } else if table_name.starts_with("uploads_") {
+            SourceType::InMemory
+        } else {
+            // Check S3 configs for S3 tables
+            let s3_configs = state.s3_configs.read().await;
+            let is_s3 = s3_configs.iter().any(|c| c.tables.contains(table_name));
+            if is_s3 {
+                SourceType::S3Parquet
+            } else {
+                SourceType::Local
+            }
+        };
+
+        // Get row count estimate from profiler cache or quick COUNT(*)
+        let cached_profile = state.query_profiler.get_table_profile(table_name);
+        let (estimated_rows, estimated_bytes) = if let Some(p) = cached_profile {
+            (p.total_rows, p.total_bytes)
+        } else {
+            // Quick COUNT(*) — this is fast for most tables
+            match df_ctx.sql(&format!("SELECT COUNT(*) as cnt FROM {}", table_name)).await {
+                Ok(df) => {
+                    if let Ok(batches) = df.collect().await {
+                        let rows = batches.first()
+                            .and_then(|b| b.column(0).as_any().downcast_ref::<arrow::array::Int64Array>())
+                            .map(|a| a.value(0) as u64)
+                            .unwrap_or(10_000);
+                        (rows, rows * 100) // ~100 bytes/row estimate
+                    } else {
+                        (10_000, 1_000_000)
+                    }
+                }
+                Err(_) => (10_000, 1_000_000),
+            }
+        };
+
+        table_refs.push(TableReference {
+            name: table_name.clone(),
+            source,
+            estimated_rows,
+            estimated_bytes,
+        });
+    }
+    drop(ctx);
+
+    let has_federated = table_refs.iter().any(|t| matches!(t.source, SourceType::Federated | SourceType::Trino));
+    let total_rows: u64 = table_refs.iter().map(|t| t.estimated_rows).sum();
+    let total_bytes: u64 = table_refs.iter().map(|t| t.estimated_bytes).sum();
+
+    let profile = QueryProfile {
+        tables: table_refs,
+        estimated_rows: total_rows,
+        estimated_bytes: total_bytes,
+        has_aggregation: sql_upper.contains("GROUP BY") || sql_upper.contains("COUNT(") || sql_upper.contains("SUM(") || sql_upper.contains("AVG("),
+        has_join: sql_upper.contains(" JOIN "),
+        has_sort: sql_upper.contains("ORDER BY"),
+        has_vector_search: sql_upper.contains("VECTOR_SEARCH"),
+        has_federated_source: has_federated,
+        projected_columns: 5, // rough estimate
+    };
+
+    // Get available engines
+    let mut engines = vec!["DataFusion".to_string()];
+    if state.duckdb_available() { engines.push("DuckDB".to_string()); }
+    if state.polars_available() { engines.push("Polars".to_string()); }
+
+    // Get cached tables for DuckDB
+    #[cfg(feature = "duckdb")]
+    let cached_tables = state.duckdb_synced_tables.read().await.clone();
+    #[cfg(not(feature = "duckdb"))]
+    let cached_tables = std::collections::HashSet::new();
+
+    // Run cost model
+    let estimates = state.cost_model.estimate_all(&engines, &profile, &cached_tables);
+    let (recommended_engine, recommended_estimate) = state.cost_model.recommend(&engines, &profile, &cached_tables);
+    let split_plan = state.cost_model.estimate_split_plan(&profile, &cached_tables);
+
+    // Also get adaptive profiler recommendation if we have history
+    let adaptive = state.query_profiler.profile_query(&req.sql, &engines);
+
+    // Workload context — current system load for audit trail
+    let workload_ctx = {
+        let pipelines = state.streaming_pipelines.read().await;
+        let active_pipelines = pipelines.iter().filter(|p| p.status == "running").count();
+        drop(pipelines);
+        let jobs = state.scheduled_jobs.read().await;
+        let active_jobs = jobs.iter().filter(|j| j.last_status.as_deref() == Some("running")).count();
+        drop(jobs);
+        let total_queries = state.query_count.load(std::sync::atomic::Ordering::Relaxed);
+        let history = state.query_history.read().await;
+        let recent_5min = history.iter().filter(|q| {
+            (Utc::now() - q.timestamp).num_seconds() < 300
+        }).count();
+        drop(history);
+        let note = if active_pipelines > 0 || active_jobs > 0 {
+            format!("{} active pipelines + {} running jobs — DuckDB sync may contend for memory", active_pipelines, active_jobs)
+        } else {
+            "No active background workloads".to_string()
+        };
+        serde_json::json!({
+            "active_streaming_pipelines": active_pipelines,
+            "active_etl_jobs": active_jobs,
+            "total_queries_lifetime": total_queries,
+            "queries_last_5min": recent_5min,
+            "uptime_secs": state.start_time.elapsed().as_secs(),
+            "note": note,
+        })
+    };
+
+    Ok(Json(serde_json::json!({
+        "sql": req.sql,
+        "profile": {
+            "estimated_rows": total_rows,
+            "estimated_bytes": total_bytes,
+            "estimated_scan_size": format_bytes(total_bytes),
+            "has_aggregation": profile.has_aggregation,
+            "has_join": profile.has_join,
+            "has_sort": profile.has_sort,
+            "has_federated_source": profile.has_federated_source,
+            "tables": profile.tables.iter().map(|t| serde_json::json!({
+                "name": t.name,
+                "source": format!("{:?}", t.source),
+                "estimated_rows": t.estimated_rows,
+                "estimated_bytes": t.estimated_bytes,
+            })).collect::<Vec<_>>(),
+        },
+        "cost_estimates": estimates,
+        "recommended": {
+            "engine": recommended_engine,
+            "total_ms": recommended_estimate.total_ms,
+            "execution_mode": recommended_estimate.execution_mode,
+            "notes": recommended_estimate.notes,
+        },
+        "split_plan": split_plan,
+        "adaptive": {
+            "engine": adaptive.recommended_engine.primary_engine,
+            "confidence": adaptive.recommended_engine.confidence,
+            "reasoning": adaptive.recommended_engine.reasoning,
+            "strategy": format!("{:?}", adaptive.recommended_engine.execution_strategy),
+            "estimated_cost_ms": adaptive.recommended_engine.estimated_cost_ms,
+            "selectivity": adaptive.selectivity,
+        },
+        "available_engines": engines,
+        "cached_tables": cached_tables.len(),
+        "workload_context": workload_ctx,
+    })))
 }
 
 // ── Connection Test ──────────────────────────────────────────────
@@ -10525,3 +11004,3061 @@ fn build_alternatives(query_type: &str) -> Vec<AlternativeStrategy> {
     alts
 }
 
+// ── Iceberg Metadata + Maintenance Handlers ─────────────────────────
+
+/// GET /api/v1/tables/{name}/snapshots — list snapshot history.
+async fn table_snapshots(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let s3_configs = state.s3_configs.read().await;
+    let table_state = find_iceberg_table_state(&s3_configs, &name).await;
+
+    match table_state {
+        Some(ts) => {
+            let snapshots: Vec<serde_json::Value> = ts.snapshots.iter().map(|s| {
+                serde_json::json!({
+                    "snapshot_id": s.snapshot_id,
+                    "parent_snapshot_id": s.parent_snapshot_id,
+                    "timestamp_ms": s.timestamp_ms,
+                    "operation": s.operation,
+                    "summary": s.summary,
+                    "manifest_list_path": s.manifest_list_path,
+                    "data_files_count": s.data_files.len(),
+                })
+            }).collect();
+
+            Ok(Json(serde_json::json!({
+                "table": name,
+                "current_snapshot_id": ts.current_snapshot_id,
+                "snapshot_count": snapshots.len(),
+                "snapshots": snapshots,
+            })))
+        }
+        None => {
+            // Return empty for non-Iceberg tables
+            Ok(Json(serde_json::json!({
+                "table": name,
+                "current_snapshot_id": null,
+                "snapshot_count": 0,
+                "snapshots": [],
+                "note": "Not an Iceberg table or no metadata found",
+            })))
+        }
+    }
+}
+
+/// GET /api/v1/tables/{name}/snapshots/{snapshot_id}/files
+async fn snapshot_files(
+    State(state): State<Arc<AppState>>,
+    Path((name, snapshot_id)): Path<(String, i64)>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let s3_configs = state.s3_configs.read().await;
+    let table_state = find_iceberg_table_state(&s3_configs, &name).await;
+
+    match table_state {
+        Some(ts) => {
+            let snap_ref = crate::iceberg_metadata::SnapshotRef::ById(snapshot_id);
+            match crate::iceberg_metadata::resolve_snapshot(&ts, &snap_ref) {
+                Ok(snap) => {
+                    let files: Vec<serde_json::Value> = snap.data_files.iter().map(|f| {
+                        serde_json::json!({
+                            "file_path": f.file_path,
+                            "file_size": f.file_size,
+                            "row_count": f.row_count,
+                        })
+                    }).collect();
+
+                    Ok(Json(serde_json::json!({
+                        "table": name,
+                        "snapshot_id": snapshot_id,
+                        "files": files,
+                        "file_count": files.len(),
+                    })))
+                }
+                Err(e) => Err((StatusCode::NOT_FOUND, Json(serde_json::json!({"error": e})))),
+            }
+        }
+        None => Err((StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Iceberg metadata not found"})))),
+    }
+}
+
+/// GET /api/v1/tables/{name}/schemas — list all schema versions.
+async fn table_schemas(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let s3_configs = state.s3_configs.read().await;
+    let table_state = find_iceberg_table_state(&s3_configs, &name).await;
+
+    match table_state {
+        Some(ts) => {
+            let schemas: Vec<serde_json::Value> = ts.schemas.iter().map(|s| {
+                serde_json::json!({
+                    "schema_id": s.schema_id,
+                    "fields": s.fields.iter().map(|f| serde_json::json!({
+                        "id": f.id,
+                        "name": f.name,
+                        "required": f.required,
+                        "type": f.type_str,
+                    })).collect::<Vec<_>>(),
+                })
+            }).collect();
+
+            Ok(Json(serde_json::json!({
+                "table": name,
+                "current_schema_id": ts.current_schema_id,
+                "schemas": schemas,
+            })))
+        }
+        None => Ok(Json(serde_json::json!({
+            "table": name,
+            "current_schema_id": 0,
+            "schemas": [],
+        }))),
+    }
+}
+
+/// POST /api/v1/tables/{name}/schema/evolve
+async fn evolve_table_schema(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let s3_configs = state.s3_configs.read().await;
+    let table_state = find_iceberg_table_state(&s3_configs, &name).await;
+
+    let ts = table_state.ok_or_else(|| {
+        (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Iceberg table not found"})))
+    })?;
+
+    // Parse changes from body
+    let changes_arr = body.get("changes").and_then(|v| v.as_array()).ok_or_else(|| {
+        (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "Missing 'changes' array"})))
+    })?;
+
+    let mut changes = Vec::new();
+    for c in changes_arr {
+        let change_type = c.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        match change_type {
+            "add" => {
+                changes.push(crate::iceberg_metadata::SchemaChange::AddColumn {
+                    name: c.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    type_str: c.get("data_type").and_then(|v| v.as_str()).unwrap_or("string").to_string(),
+                    nullable: c.get("nullable").and_then(|v| v.as_bool()).unwrap_or(true),
+                });
+            }
+            "drop" => {
+                changes.push(crate::iceberg_metadata::SchemaChange::DropColumn {
+                    name: c.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                });
+            }
+            "rename" => {
+                changes.push(crate::iceberg_metadata::SchemaChange::RenameColumn {
+                    old_name: c.get("old_name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                    new_name: c.get("new_name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+                });
+            }
+            _ => {
+                return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": format!("Unknown change type: {}", change_type)}))));
+            }
+        }
+    }
+
+    // Build object store from first S3 config that has this table
+    let store = build_store_for_table(&s3_configs, &name).await.ok_or_else(|| {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Could not build S3 store"})))
+    })?;
+
+    match crate::iceberg_metadata::evolve_schema(&store, &ts, &changes).await {
+        Ok(path) => Ok(Json(serde_json::json!({
+            "status": "ok",
+            "metadata_path": path,
+            "new_schema_id": ts.current_schema_id + 1,
+        }))),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e})))),
+    }
+}
+
+/// GET /api/v1/tables/{name}/partitions
+async fn table_partitions(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let s3_configs = state.s3_configs.read().await;
+    let table_state = find_iceberg_table_state(&s3_configs, &name).await;
+
+    match table_state {
+        Some(ts) => {
+            let specs: Vec<serde_json::Value> = ts.partition_specs.iter().map(|s| {
+                serde_json::json!({
+                    "spec_id": s.spec_id,
+                    "fields": s.fields.iter().map(|f| serde_json::json!({
+                        "source_id": f.source_id,
+                        "field_id": f.field_id,
+                        "name": f.name,
+                        "transform": f.transform,
+                    })).collect::<Vec<_>>(),
+                })
+            }).collect();
+
+            let default_spec_id = ts.metadata.get("default-spec-id").and_then(|v| v.as_i64()).unwrap_or(0);
+
+            Ok(Json(serde_json::json!({
+                "table": name,
+                "default_spec_id": default_spec_id,
+                "partition_specs": specs,
+            })))
+        }
+        None => Ok(Json(serde_json::json!({
+            "table": name,
+            "default_spec_id": 0,
+            "partition_specs": [],
+        }))),
+    }
+}
+
+/// POST /api/v1/tables/{name}/partitions/evolve
+async fn evolve_table_partitions(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let s3_configs = state.s3_configs.read().await;
+    let table_state = find_iceberg_table_state(&s3_configs, &name).await;
+
+    let ts = table_state.ok_or_else(|| {
+        (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Iceberg table not found"})))
+    })?;
+
+    let fields_arr = body.get("fields").and_then(|v| v.as_array()).ok_or_else(|| {
+        (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "Missing 'fields' array"})))
+    })?;
+
+    let fields: Vec<crate::iceberg_metadata::PartitionField> = fields_arr.iter().map(|f| {
+        crate::iceberg_metadata::PartitionField {
+            source_id: f.get("source_id").and_then(|v| v.as_i64()).unwrap_or(0) as i32,
+            field_id: f.get("field_id").and_then(|v| v.as_i64()).unwrap_or(1000) as i32,
+            name: f.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            transform: f.get("transform").and_then(|v| v.as_str()).unwrap_or("identity").to_string(),
+        }
+    }).collect();
+
+    let store = build_store_for_table(&s3_configs, &name).await.ok_or_else(|| {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Could not build S3 store"})))
+    })?;
+
+    match crate::iceberg_metadata::evolve_partition(&store, &ts, fields).await {
+        Ok(path) => Ok(Json(serde_json::json!({
+            "status": "ok",
+            "metadata_path": path,
+        }))),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e})))),
+    }
+}
+
+/// POST /api/v1/tables/{name}/maintenance/compact
+async fn compact_table(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let target_mb = body.get("target_file_size_mb").and_then(|v| v.as_u64()).unwrap_or(128);
+
+    let s3_configs = state.s3_configs.read().await;
+    let table_state = find_iceberg_table_state(&s3_configs, &name).await;
+
+    let ts = table_state.ok_or_else(|| {
+        (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Iceberg table not found"})))
+    })?;
+
+    let store = build_store_for_table(&s3_configs, &name).await.ok_or_else(|| {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Could not build S3 store"})))
+    })?;
+
+    // Get schema from current snapshot
+    let schema = get_schema_for_table(&ts);
+
+    match crate::iceberg_maintenance::compact_table(&store, &ts, target_mb, &schema).await {
+        Ok(result) => Ok(Json(serde_json::json!({
+            "status": "ok",
+            "input_files": result.input_files,
+            "output_files": result.output_files,
+            "rows_rewritten": result.rows_rewritten,
+            "metadata_path": result.metadata_path,
+        }))),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e})))),
+    }
+}
+
+/// POST /api/v1/tables/{name}/maintenance/expire-snapshots
+async fn expire_table_snapshots(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let retain_last = body.get("retain_last").and_then(|v| v.as_u64()).unwrap_or(3) as usize;
+    let older_than_hours = body.get("older_than_hours").and_then(|v| v.as_u64()).unwrap_or(168); // 7 days
+    let older_than_ms = chrono::Utc::now().timestamp_millis() - (older_than_hours as i64 * 3600 * 1000);
+
+    let s3_configs = state.s3_configs.read().await;
+    let table_state = find_iceberg_table_state(&s3_configs, &name).await;
+
+    let ts = table_state.ok_or_else(|| {
+        (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Iceberg table not found"})))
+    })?;
+
+    let store = build_store_for_table(&s3_configs, &name).await.ok_or_else(|| {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Could not build S3 store"})))
+    })?;
+
+    match crate::iceberg_maintenance::expire_snapshots(&store, &ts, older_than_ms, retain_last).await {
+        Ok(result) => Ok(Json(serde_json::json!({
+            "status": "ok",
+            "expired_count": result.expired_count,
+            "expired_ids": result.expired_ids,
+            "manifests_deleted": result.manifests_deleted,
+        }))),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e})))),
+    }
+}
+
+/// POST /api/v1/tables/{name}/maintenance/remove-orphans
+async fn remove_table_orphans(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let s3_configs = state.s3_configs.read().await;
+    let table_state = find_iceberg_table_state(&s3_configs, &name).await;
+
+    let ts = table_state.ok_or_else(|| {
+        (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Iceberg table not found"})))
+    })?;
+
+    let store = build_store_for_table(&s3_configs, &name).await.ok_or_else(|| {
+        (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Could not build S3 store"})))
+    })?;
+
+    let prefix = crate::iceberg_metadata::strip_s3_prefix_pub(&ts.location);
+
+    match crate::iceberg_maintenance::remove_orphan_files(&store, &ts, &prefix).await {
+        Ok(result) => Ok(Json(serde_json::json!({
+            "status": "ok",
+            "orphan_files_found": result.orphan_files_found,
+            "orphan_files_deleted": result.orphan_files_deleted,
+            "bytes_reclaimed": result.bytes_reclaimed,
+        }))),
+        Err(e) => Err((StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e})))),
+    }
+}
+
+/// GET /api/v1/tables/{name}/maintenance/status
+async fn table_maintenance_status(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let s3_configs = state.s3_configs.read().await;
+    let table_state = find_iceberg_table_state(&s3_configs, &name).await;
+
+    match table_state {
+        Some(ts) => {
+            let status = crate::iceberg_maintenance::compute_maintenance_status(&ts, 128 * 1024 * 1024);
+            Ok(Json(serde_json::to_value(&status).unwrap_or_default()))
+        }
+        None => Ok(Json(serde_json::json!({
+            "total_files": 0,
+            "snapshot_count": 0,
+            "fragmentation_score": 0.0,
+            "recommendations": [],
+        }))),
+    }
+}
+
+// ── Iceberg helper functions ────────────────────────────────────────
+
+/// Try to find and load an Iceberg table state from S3 configs.
+async fn find_iceberg_table_state(
+    s3_configs: &[S3Config],
+    table_name: &str,
+) -> Option<crate::iceberg_metadata::IcebergTableState> {
+    for config in s3_configs {
+        // Check if this S3 config has a table matching the name
+        if config.tables.iter().any(|t| t == table_name || t.ends_with(&format!(".{}", table_name))) {
+            // Build store and try to find metadata
+            let store = build_s3_store(config)?;
+            // Try common prefix patterns
+            for prefix in &[
+                format!("{}", table_name),
+                format!("cdc/{}", table_name),
+                format!("warehouse/{}", table_name),
+            ] {
+                if let Ok(Some(metadata_path)) =
+                    crate::iceberg_metadata::find_latest_metadata(&store, prefix).await
+                {
+                    if let Ok(state) =
+                        crate::iceberg_metadata::load_table_state(&store, &metadata_path).await
+                    {
+                        return Some(state);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Build an ObjectStore from an S3Config.
+fn build_s3_store(config: &S3Config) -> Option<Arc<dyn object_store::ObjectStore>> {
+    let mut builder = object_store::aws::AmazonS3Builder::new()
+        .with_bucket_name(&config.bucket)
+        .with_region(&config.region)
+        .with_access_key_id(&config.access_key)
+        .with_secret_access_key(&config.secret_key)
+        .with_allow_http(true);
+
+    if !config.endpoint.is_empty() {
+        builder = builder.with_endpoint(&config.endpoint);
+        builder = builder.with_virtual_hosted_style_request(false);
+    }
+
+    builder.build().ok().map(|s| Arc::new(s) as Arc<dyn object_store::ObjectStore>)
+}
+
+/// Build a store for a table by finding its S3 config.
+async fn build_store_for_table(
+    s3_configs: &[S3Config],
+    table_name: &str,
+) -> Option<Arc<dyn object_store::ObjectStore>> {
+    for config in s3_configs {
+        if config.tables.iter().any(|t| t == table_name || t.ends_with(&format!(".{}", table_name))) {
+            return build_s3_store(config);
+        }
+    }
+    None
+}
+
+/// Get Arrow schema from Iceberg table state.
+fn get_schema_for_table(state: &crate::iceberg_metadata::IcebergTableState) -> arrow::datatypes::Schema {
+    let current = state.schemas.iter().find(|s| s.schema_id == state.current_schema_id);
+    match current {
+        Some(schema) => {
+            let fields: Vec<arrow::datatypes::Field> = schema.fields.iter().map(|f| {
+                let dt = iceberg_type_to_arrow(&f.type_str);
+                arrow::datatypes::Field::new(&f.name, dt, !f.required)
+            }).collect();
+            arrow::datatypes::Schema::new(fields)
+        }
+        None => arrow::datatypes::Schema::empty(),
+    }
+}
+
+// iceberg_type_to_arrow is defined earlier in this file (line ~6927)
+
+// ── Lineage helpers ─────────────────────────────────────────────────
+
+/// Extract table references from SQL for lineage tracking.
+/// Parses FROM and JOIN clauses to identify source tables.
+fn extract_lineage_tables(sql: &str) -> Vec<String> {
+    let upper = sql.to_uppercase();
+    let mut tables = Vec::new();
+
+    // Find tables after FROM
+    for keyword in &["FROM ", "JOIN "] {
+        let mut search_from = 0;
+        while let Some(pos) = upper[search_from..].find(keyword) {
+            let abs_pos = search_from + pos + keyword.len();
+            if abs_pos < sql.len() {
+                let rest = sql[abs_pos..].trim_start();
+                // Extract table name (stop at whitespace, comma, paren, semicolon)
+                let table: String = rest.chars()
+                    .take_while(|c| !c.is_whitespace() && *c != ',' && *c != ')' && *c != ';' && *c != '(')
+                    .collect();
+                if !table.is_empty()
+                    && !table.to_uppercase().starts_with("SELECT")
+                    && !table.to_uppercase().starts_with("(")
+                    && !table.starts_with('\'')
+                {
+                    tables.push(table);
+                }
+            }
+            search_from = abs_pos;
+        }
+    }
+
+    tables.sort();
+    tables.dedup();
+    tables
+}
+
+// ── Neo4j Graph Database Handlers ───────────────────────────────────
+
+#[derive(Deserialize)]
+struct Neo4jConnectRequest {
+    host: String,
+    port: u16,
+    username: String,
+    password: String,
+    #[serde(default = "default_neo4j_db")]
+    database: String,
+}
+
+fn default_neo4j_db() -> String { "neo4j".to_string() }
+
+#[derive(Deserialize)]
+struct CypherRequest {
+    cypher: String,
+    host: String,
+    port: u16,
+    username: String,
+    password: String,
+    #[serde(default = "default_neo4j_db")]
+    database: String,
+}
+
+async fn neo4j_connect(
+    Json(req): Json<Neo4jConnectRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let config = crate::neo4j_conn::Neo4jConfig {
+        host: req.host,
+        port: req.port,
+        username: req.username,
+        password: req.password,
+        database: req.database,
+        use_ssl: false,
+    };
+
+    match crate::neo4j_conn::connect(&config).await {
+        Ok(conn) => {
+            let node_count = crate::neo4j_conn::node_count(&conn).await.unwrap_or(0);
+            let rel_count = crate::neo4j_conn::relationship_count(&conn).await.unwrap_or(0);
+            let labels = crate::neo4j_conn::discover_labels(&conn).await.unwrap_or_default();
+            let rel_types = crate::neo4j_conn::discover_relationship_types(&conn).await.unwrap_or_default();
+
+            Ok(Json(serde_json::json!({
+                "status": "connected",
+                "node_count": node_count,
+                "relationship_count": rel_count,
+                "labels": labels,
+                "relationship_types": rel_types,
+            })))
+        }
+        Err(e) => Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e})))),
+    }
+}
+
+async fn neo4j_cypher(
+    Json(req): Json<CypherRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let config = crate::neo4j_conn::Neo4jConfig {
+        host: req.host,
+        port: req.port,
+        username: req.username,
+        password: req.password,
+        database: req.database,
+        use_ssl: false,
+    };
+
+    let conn = crate::neo4j_conn::connect(&config).await
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e}))))?;
+
+    let result = crate::neo4j_conn::execute_cypher(&conn, &req.cypher).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))))?;
+
+    // Convert to RecordBatch for tabular view
+    let batch_result = crate::neo4j_conn::cypher_result_to_recordbatch(&result);
+    let graph_data = crate::neo4j_conn::cypher_result_to_graph(&result);
+
+    // Serialize tabular data
+    let (columns, rows) = match batch_result {
+        Ok(batch) => {
+            let cols: Vec<String> = batch.schema().fields().iter().map(|f| f.name().clone()).collect();
+            let mut row_data = Vec::new();
+            for i in 0..batch.num_rows() {
+                let mut row = serde_json::Map::new();
+                for (j, col) in cols.iter().enumerate() {
+                    let arr = batch.column(j);
+                    let val = arrow::array::cast::as_string_array(arr).value(i);
+                    row.insert(col.clone(), serde_json::Value::String(val.to_string()));
+                }
+                row_data.push(serde_json::Value::Object(row));
+            }
+            (cols, row_data)
+        }
+        Err(_) => (vec![], vec![]),
+    };
+
+    Ok(Json(serde_json::json!({
+        "columns": columns,
+        "rows": rows,
+        "row_count": rows.len(),
+        "graph": {
+            "nodes": graph_data.nodes,
+            "edges": graph_data.edges,
+        },
+        "node_count": result.nodes.len(),
+        "relationship_count": result.relationships.len(),
+    })))
+}
+
+async fn neo4j_schema(
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let host = params.get("host").cloned().unwrap_or_else(|| "localhost".to_string());
+    let port: u16 = params.get("port").and_then(|p| p.parse().ok()).unwrap_or(7474);
+    let username = params.get("username").cloned().unwrap_or_else(|| "neo4j".to_string());
+    let password = params.get("password").cloned().unwrap_or_default();
+    let database = params.get("database").cloned().unwrap_or_else(|| "neo4j".to_string());
+
+    let config = crate::neo4j_conn::Neo4jConfig {
+        host, port, username, password, database, use_ssl: false,
+    };
+
+    let conn = crate::neo4j_conn::connect(&config).await
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e}))))?;
+
+    let schema = crate::neo4j_conn::discover_schema(&conn).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))))?;
+
+    Ok(Json(serde_json::json!({
+        "schema": schema.iter().map(|(label, props)| {
+            serde_json::json!({"label": label, "properties": props})
+        }).collect::<Vec<_>>(),
+    })))
+}
+
+async fn neo4j_graph_query(
+    Json(req): Json<CypherRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let config = crate::neo4j_conn::Neo4jConfig {
+        host: req.host,
+        port: req.port,
+        username: req.username,
+        password: req.password,
+        database: req.database,
+        use_ssl: false,
+    };
+
+    let conn = crate::neo4j_conn::connect(&config).await
+        .map_err(|e| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": e}))))?;
+
+    let result = crate::neo4j_conn::execute_cypher(&conn, &req.cypher).await
+        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": e}))))?;
+
+    let graph_data = crate::neo4j_conn::cypher_result_to_graph(&result);
+
+    Ok(Json(serde_json::json!({
+        "nodes": graph_data.nodes,
+        "edges": graph_data.edges,
+        "node_count": graph_data.nodes.len(),
+        "edge_count": graph_data.edges.len(),
+    })))
+}
+
+// ── Notebook ETL / Pipeline Handlers ────────────────────────────
+
+async fn execute_notebook_handler(
+    State(state): State<Arc<AppState>>,
+    Json(notebook): Json<crate::notebook_runner::NotebookSubmission>,
+) -> Json<serde_json::Value> {
+    let result = crate::notebook_runner::execute_notebook(&notebook, &state.ctx).await;
+    Json(serde_json::to_value(&result).unwrap_or_default())
+}
+
+async fn plan_notebook(
+    Json(notebook): Json<crate::notebook_runner::NotebookSubmission>,
+) -> Json<serde_json::Value> {
+    let plan = crate::notebook_runner::build_execution_plan(&notebook);
+    Json(serde_json::to_value(&plan).unwrap_or_default())
+}
+
+#[derive(Deserialize)]
+struct ScheduleNotebookRequest {
+    notebook_id: String,
+    notebook_name: String,
+    schedule: String, // cron expression
+    cells_to_run: Vec<String>,
+    #[serde(default = "default_optimization")]
+    optimization_level: String,
+    #[serde(default)]
+    tags: Vec<String>,
+}
+
+fn default_optimization() -> String {
+    "basic".to_string()
+}
+
+async fn schedule_notebook(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ScheduleNotebookRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let job_id = Uuid::new_v4().to_string();
+    let job = ScheduledJob {
+        id: job_id.clone(),
+        name: format!("notebook:{}", req.notebook_name),
+        job_type: "notebook".to_string(),
+        cron: req.schedule.clone(),
+        target: req.notebook_id.clone(),
+        enabled: true,
+        last_run: None,
+        next_run: None,
+        last_status: None,
+        created_at: chrono::Utc::now(),
+        engine: "auto".to_string(),
+        trigger_type: "time".to_string(),
+        event_config: None,
+        cluster: None,
+        timeout_seconds: Some(300),
+        retries: 1,
+        tags: req.tags,
+    };
+
+    state.add_scheduled_job(job).await;
+
+    Ok(Json(serde_json::json!({
+        "status": "scheduled",
+        "job_id": job_id,
+        "notebook_id": req.notebook_id,
+        "schedule": req.schedule,
+        "optimization_level": req.optimization_level,
+    })))
+}
+
+async fn list_notebook_jobs(
+    State(state): State<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    let jobs = state.scheduled_jobs.read().await;
+    let notebook_jobs: Vec<&ScheduledJob> = jobs.iter()
+        .filter(|j| j.job_type == "notebook")
+        .collect();
+    Json(serde_json::json!({
+        "jobs": notebook_jobs,
+        "count": notebook_jobs.len(),
+    }))
+}
+
+// ── Spark SQL Compatibility Handlers ────────────────────────────
+
+async fn spark_compat_info() -> Json<serde_json::Value> {
+    let compat = crate::spark_compat::compatibility_summary();
+    let items: Vec<serde_json::Value> = compat.iter().map(|(spark, df, status)| {
+        serde_json::json!({"spark_feature": spark, "rustlake_equivalent": df, "status": status})
+    }).collect();
+    Json(serde_json::json!({
+        "enabled": true,
+        "auto_translate": true,
+        "compatibility": items,
+    }))
+}
+
+#[derive(Deserialize)]
+struct SparkTranslateRequest {
+    sql: String,
+}
+
+async fn spark_translate(
+    Json(req): Json<SparkTranslateRequest>,
+) -> Json<serde_json::Value> {
+    let result = crate::spark_compat::translate_spark_sql(&req.sql);
+    Json(serde_json::json!({
+        "original": result.original,
+        "translated": result.translated,
+        "was_translated": result.was_translated,
+        "translations_applied": result.translations_applied,
+    }))
+}
+
+// ── Rust Notebook Execution ─────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct RustCellRequest {
+    code: String,
+}
+
+async fn execute_rust_cell(
+    Json(req): Json<RustCellRequest>,
+) -> Json<serde_json::Value> {
+    let result = crate::rust_executor::execute_rust(&req.code).await;
+    let (cache_entries, cache_hits) = crate::rust_executor::cache_stats().await;
+    let cached = result.compile_output == "(cached)";
+    Json(serde_json::json!({
+        "compiled": result.compiled,
+        "success": result.success,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+        "compile_output": result.compile_output,
+        "duration_ms": result.duration_ms,
+        "compile_ms": result.compile_ms,
+        "run_ms": result.run_ms,
+        "error": result.error,
+        "cached": cached,
+        "cache_entries": cache_entries,
+        "cache_hits": cache_hits,
+    }))
+}
+
+// ── Time Travel parsing ─────────────────────────────────────────────
+
+/// Parsed time travel query info.
+struct TimeTravelQuery {
+    table: String,
+    snapshot_ref: crate::iceberg_metadata::SnapshotRef,
+    rewritten_sql: String,
+}
+
+impl std::fmt::Debug for TimeTravelQuery {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TimeTravelQuery")
+            .field("table", &self.table)
+            .field("rewritten_sql", &self.rewritten_sql)
+            .finish()
+    }
+}
+
+/// Parse time travel syntax from SQL:
+/// - `SELECT ... FROM table VERSION AS OF <snapshot_id>`
+/// - `SELECT ... FROM table FOR SYSTEM_TIME AS OF '<timestamp>'`
+fn parse_time_travel(sql: &str) -> Option<TimeTravelQuery> {
+    let upper = sql.to_uppercase();
+
+    // Pattern 1: VERSION AS OF <id>
+    if let Some(ver_pos) = upper.find("VERSION AS OF") {
+        let before = &sql[..ver_pos].trim_end();
+        // Find the table name (last word before "VERSION AS OF")
+        let table = before.split_whitespace().last()?.to_string();
+
+        let after_clause = &sql[ver_pos + 13..].trim_start(); // skip "VERSION AS OF"
+        let snapshot_id_str = after_clause.split_whitespace().next()?;
+        let snapshot_id: i64 = snapshot_id_str.parse().ok()?;
+
+        // Rewrite: remove the VERSION AS OF clause
+        let rewritten = format!(
+            "{} {}",
+            before,
+            after_clause.strip_prefix(snapshot_id_str).unwrap_or("").trim_start()
+        );
+
+        return Some(TimeTravelQuery {
+            table,
+            snapshot_ref: crate::iceberg_metadata::SnapshotRef::ById(snapshot_id),
+            rewritten_sql: rewritten.trim().to_string(),
+        });
+    }
+
+    // Pattern 2: FOR SYSTEM_TIME AS OF '<timestamp>'
+    if let Some(ts_pos) = upper.find("FOR SYSTEM_TIME AS OF") {
+        let before = &sql[..ts_pos].trim_end();
+        let table = before.split_whitespace().last()?.to_string();
+
+        let after_clause = &sql[ts_pos + 21..].trim_start(); // skip "FOR SYSTEM_TIME AS OF"
+        // Extract quoted timestamp
+        let ts_str = if after_clause.starts_with('\'') {
+            let end = after_clause[1..].find('\'')?;
+            &after_clause[1..1 + end]
+        } else {
+            after_clause.split_whitespace().next()?
+        };
+
+        // Parse as ISO timestamp → millis
+        let timestamp_ms = chrono::NaiveDateTime::parse_from_str(ts_str, "%Y-%m-%d %H:%M:%S")
+            .or_else(|_| chrono::NaiveDateTime::parse_from_str(ts_str, "%Y-%m-%dT%H:%M:%S"))
+            .ok()
+            .map(|dt| dt.and_utc().timestamp_millis())
+            .or_else(|| {
+                // Try date-only
+                chrono::NaiveDate::parse_from_str(ts_str, "%Y-%m-%d")
+                    .ok()
+                    .and_then(|d| d.and_hms_opt(23, 59, 59))
+                    .map(|dt| dt.and_utc().timestamp_millis())
+            })?;
+
+        // Rewrite: remove the FOR SYSTEM_TIME AS OF clause
+        let skip_len = if after_clause.starts_with('\'') {
+            ts_str.len() + 2 // include quotes
+        } else {
+            ts_str.len()
+        };
+        let rest = after_clause[skip_len..].trim_start();
+        let rewritten = format!("{} {}", before, rest);
+
+        return Some(TimeTravelQuery {
+            table,
+            snapshot_ref: crate::iceberg_metadata::SnapshotRef::ByTimestamp(timestamp_ms),
+            rewritten_sql: rewritten.trim().to_string(),
+        });
+    }
+
+    None
+}
+
+// ── Executable Lakehouse Handlers ───────────────────────────────
+
+async fn list_executable_tables(
+    State(state): State<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    let tables = state.executable_tables.read().await;
+    Json(serde_json::json!({
+        "tables": *tables,
+        "count": tables.len(),
+    }))
+}
+
+async fn create_executable_table(
+    State(state): State<Arc<AppState>>,
+    Json(table): Json<crate::executable_table::ExecutableTable>,
+) -> Json<serde_json::Value> {
+    let props = crate::executable_table::to_iceberg_properties(&table);
+    let name = table.table_name.clone();
+
+    // Also create a scheduled job if schedule is set
+    if let Some(ref schedule) = table.schedule {
+        let job = crate::state::ScheduledJob {
+            id: Uuid::new_v4().to_string(),
+            name: format!("exec-table:{}", name),
+            job_type: "executable_table".to_string(),
+            cron: schedule.clone(),
+            target: name.clone(),
+            enabled: true,
+            last_run: None,
+            next_run: None,
+            last_status: None,
+            created_at: chrono::Utc::now(),
+            engine: "auto".to_string(),
+            trigger_type: "time".to_string(),
+            event_config: None,
+            cluster: None,
+            timeout_seconds: Some(60),
+            retries: 2,
+            tags: vec!["executable-table".to_string()],
+        };
+        state.add_scheduled_job(job).await;
+    }
+
+    state.executable_tables.write().await.push(table);
+
+    Json(serde_json::json!({
+        "status": "created",
+        "table": name,
+        "iceberg_properties": props,
+    }))
+}
+
+/// Parse CSV-formatted stdout from a Rust executable into Arrow RecordBatches.
+/// Expects first line as header (column names), remaining lines as data.
+/// All columns are typed as Utf8 (string) for simplicity.
+fn parse_csv_stdout_to_batches(stdout: &str) -> Option<Vec<arrow::record_batch::RecordBatch>> {
+    let lines: Vec<&str> = stdout.trim().lines().collect();
+    if lines.len() < 2 {
+        return None; // Need at least header + 1 data row
+    }
+
+    let headers: Vec<&str> = lines[0].split(',').map(|s| s.trim()).collect();
+    if headers.is_empty() {
+        return None;
+    }
+
+    // Build column arrays
+    let num_cols = headers.len();
+    let mut columns: Vec<Vec<String>> = vec![Vec::new(); num_cols];
+
+    for line in &lines[1..] {
+        let values: Vec<&str> = line.split(',').map(|s| s.trim()).collect();
+        for (i, col) in columns.iter_mut().enumerate() {
+            col.push(values.get(i).unwrap_or(&"").to_string());
+        }
+    }
+
+    // Try to detect numeric columns and build appropriate arrays
+    use arrow::array::{ArrayRef, Float64Array, StringArray};
+    use arrow::datatypes::{DataType, Field, Schema};
+
+    let mut fields = Vec::new();
+    let mut arrays: Vec<ArrayRef> = Vec::new();
+
+    for (i, header) in headers.iter().enumerate() {
+        let values = &columns[i];
+        // Try parsing as f64
+        let all_numeric = !values.is_empty() && values.iter().all(|v| v.parse::<f64>().is_ok());
+        if all_numeric {
+            fields.push(Field::new(*header, DataType::Float64, true));
+            let float_vals: Vec<f64> = values.iter().map(|v| v.parse::<f64>().unwrap_or(0.0)).collect();
+            arrays.push(std::sync::Arc::new(Float64Array::from(float_vals)));
+        } else {
+            fields.push(Field::new(*header, DataType::Utf8, true));
+            let str_vals: Vec<&str> = values.iter().map(|s| s.as_str()).collect();
+            arrays.push(std::sync::Arc::new(StringArray::from(str_vals)));
+        }
+    }
+
+    let schema = std::sync::Arc::new(Schema::new(fields));
+    match arrow::record_batch::RecordBatch::try_new(schema, arrays) {
+        Ok(batch) => Some(vec![batch]),
+        Err(_) => None,
+    }
+}
+
+async fn execute_executable_table(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let tables = state.executable_tables.read().await;
+    let table = tables.iter().find(|t| t.table_name == name)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": format!("Executable table '{}' not found", name)}))))?;
+
+    let transform_type = table.transform.transform_type.clone();
+    let source_code = table.transform.source_code.clone();
+    let current_version = table.versions.iter().map(|v| v.version).max().unwrap_or(1);
+    drop(tables); // release read lock
+
+    let start = std::time::Instant::now();
+    let exec_id = Uuid::new_v4().to_string();
+
+    let (status, rows, error, compile_ms, run_ms, binary_cached, sql_batches) = if transform_type == "sql" {
+        let ctx = state.ctx.read().await;
+        match ctx.sql(&source_code).await {
+            Ok(batches) => {
+                let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+                ("success".to_string(), Some(rows as u64), None, 0u64, start.elapsed().as_millis() as u64, false, Some(batches))
+            }
+            Err(e) => ("failed".to_string(), None, Some(e.to_string()), 0, 0, false, None)
+        }
+    } else if transform_type == "rust" {
+        let result = crate::rust_executor::execute_rust(&source_code).await;
+        let cached = result.compile_output == "(cached)";
+        if result.success {
+            // Parse CSV stdout into Arrow RecordBatch for S3 write
+            let batches = parse_csv_stdout_to_batches(&result.stdout);
+            let row_count = batches.as_ref().map(|bs| bs.iter().map(|b| b.num_rows() as u64).sum::<u64>());
+            ("success".to_string(), row_count, None, result.compile_ms, result.run_ms, cached, batches)
+        } else {
+            ("failed".to_string(), None, result.error, result.compile_ms, result.run_ms, cached, None)
+        }
+    } else {
+        ("unsupported".to_string(), None, Some(format!("Transform type '{}' not yet supported", transform_type)), 0, 0, false, None)
+    };
+
+    // Best-effort S3 Parquet + Iceberg write for SQL execution results
+    let mut files_written: Option<u64> = None;
+    let mut bytes_written_s3: Option<u64> = None;
+    let mut s3_snapshot_id: i64 = 0;
+    if status == "success" {
+        if let Some(ref batches) = sql_batches {
+            if !batches.is_empty() && batches.iter().any(|b| b.num_rows() > 0) {
+                let s3_configs = state.s3_configs.read().await;
+                if let Some(s3_config) = s3_configs.first() {
+                    let table_name_sanitized = name.replace('-', "_").replace(' ', "_");
+                    let s3_uri = format!("s3://{}/executable_tables/{}/v{}/data/", s3_config.bucket, table_name_sanitized, current_version);
+                    // Resolve credentials: in-memory first, then credential store fallback
+                    let (access_key, secret_key) = if !s3_config.access_key.is_empty() && !s3_config.secret_key.is_empty() {
+                        (s3_config.access_key.clone(), s3_config.secret_key.clone())
+                    } else {
+                        let all_creds = state.credential_store.load_all_s3_creds();
+                        if let Some(creds) = all_creds.get(&s3_config.bucket) {
+                            (creds.access_key.clone(), creds.secret_key.clone())
+                        } else if let Some(creds) = all_creds.values().next() {
+                            (creds.access_key.clone(), creds.secret_key.clone())
+                        } else {
+                            tracing::debug!(table = %name, "No S3 credentials available for executable table write");
+                            (String::new(), String::new())
+                        }
+                    };
+                    let sink_config = if access_key.is_empty() { None } else {
+                        Some(crate::parquet_sink::ParquetSinkConfig::from_s3_uri(
+                            &s3_uri,
+                            if s3_config.endpoint.is_empty() { None } else { Some(s3_config.endpoint.clone()) },
+                            access_key,
+                            secret_key,
+                            s3_config.region.clone(),
+                        ))
+                    };
+                    let s3_bucket = s3_config.bucket.clone();
+                    drop(s3_configs);
+
+                    match sink_config {
+                        Some(Ok(sc)) => match crate::parquet_sink::ParquetSink::new(&sc, 500) {
+                            Ok(mut sink) => {
+                                let mut write_ok = true;
+                                for batch in batches {
+                                    if batch.num_rows() == 0 {
+                                        continue;
+                                    }
+                                    if let Err(e) = sink.write_batch(batch.clone()).await {
+                                        tracing::warn!(table = %name, error = %e, "Executable table: failed to write batch to S3");
+                                        write_ok = false;
+                                        break;
+                                    }
+                                }
+                                if write_ok {
+                                    match sink.flush().await {
+                                        Ok(()) => {
+                                            files_written = Some(sink.files_written());
+                                            // Sum up bytes from data files written
+                                            bytes_written_s3 = Some(
+                                                sink.data_files().iter().map(|f| f.file_size).sum()
+                                            );
+
+                                            // Write Iceberg v2 metadata (incremental — append snapshot)
+                                            let prefix = sink.prefix().to_string();
+                                            let iceberg_result = match crate::iceberg_metadata::find_latest_metadata(sink.store(), &prefix).await {
+                                                Ok(Some(metadata_path)) => {
+                                                    match crate::iceberg_metadata::load_table_state(sink.store(), &metadata_path).await {
+                                                        Ok(state) => sink.finalize_iceberg_incremental(Some(&state)).await,
+                                                        Err(_) => sink.finalize_iceberg().await,
+                                                    }
+                                                }
+                                                _ => sink.finalize_iceberg().await,
+                                            };
+                                            s3_snapshot_id = match &iceberg_result {
+                                                Ok(path) => {
+                                                    tracing::info!(
+                                                        table = %name,
+                                                        metadata = %path,
+                                                        files = sink.files_written(),
+                                                        "Executable table results written to S3 with Iceberg metadata"
+                                                    );
+                                                    // Parse snapshot ID from metadata path timestamp
+                                                    chrono::Utc::now().timestamp_millis()
+                                                }
+                                                Err(e) => {
+                                                    tracing::warn!(
+                                                        table = %name, error = %e,
+                                                        "Executable table: Iceberg metadata write failed"
+                                                    );
+                                                    0
+                                                }
+                                            };
+
+                                            // Register the resulting table in DataFusion via self-call
+                                            let register_uri = format!(
+                                                "s3://{}/executable_tables/{}/v{}/data/",
+                                                s3_bucket, table_name_sanitized, current_version
+                                            );
+                                            let client = reqwest::Client::new();
+                                            let _ = client.post("http://127.0.0.1:3000/api/v1/tables/register-s3")
+                                                .json(&serde_json::json!({
+                                                    "table_name": format!("exec_{}", table_name_sanitized),
+                                                    "s3_uri": register_uri,
+                                                    "s3_config_name": "",
+                                                }))
+                                                .send()
+                                                .await
+                                                .map(|r| {
+                                                    if r.status().is_success() {
+                                                        tracing::info!(
+                                                            table = %name,
+                                                            "Executable table S3 result registered in DataFusion"
+                                                        );
+                                                    } else {
+                                                        tracing::warn!(
+                                                            table = %name, status = %r.status(),
+                                                            "Executable table S3 registration returned non-200"
+                                                        );
+                                                    }
+                                                })
+                                                .map_err(|e| tracing::warn!(
+                                                    table = %name, error = %e,
+                                                    "Executable table: failed to call register-s3 API"
+                                                ));
+                                        }
+                                        Err(e) => tracing::warn!(
+                                            table = %name, error = %e,
+                                            "Executable table: failed to flush Parquet to S3"
+                                        ),
+                                    }
+                                }
+                            }
+                            Err(e) => tracing::debug!(
+                                table = %name, error = %e,
+                                "Executable table: failed to create Parquet sink"
+                            ),
+                        },
+                        Some(Err(e)) => tracing::debug!(
+                            table = %name, error = %e,
+                            "Executable table: invalid S3 URI config"
+                        ),
+                        None => tracing::debug!(
+                            table = %name,
+                            "Executable table: no S3 credentials — skipping S3 write"
+                        ),
+                    }
+                } else {
+                    drop(s3_configs);
+                    tracing::debug!(table = %name, "No S3 config available — skipping S3 write for executable table");
+                }
+            }
+        }
+    }
+
+    // Rust binary upload to table-specific S3 path (co-located with data + metadata)
+    let mut binary_s3_path: Option<String> = None;
+    let mut binary_size_bytes: Option<u64> = None;
+    if status == "success" && transform_type == "rust" {
+        let source_hash = crate::executable_table::hash_source(&source_code);
+        let cache_dir = std::path::PathBuf::from(".rustlake-cache/rust-bins");
+        let local_bin = cache_dir.join(format!("bin-{}", source_hash));
+        if local_bin.exists() {
+            let s3_configs = state.s3_configs.read().await;
+            if let Some(s3_config) = s3_configs.first() {
+                let table_name_sanitized = name.replace('-', "_").replace(' ', "_");
+                let (access_key, secret_key) = if !s3_config.access_key.is_empty() && !s3_config.secret_key.is_empty() {
+                    (s3_config.access_key.clone(), s3_config.secret_key.clone())
+                } else {
+                    let all_creds = state.credential_store.load_all_s3_creds();
+                    if let Some(creds) = all_creds.get(&s3_config.bucket) {
+                        (creds.access_key.clone(), creds.secret_key.clone())
+                    } else if let Some(creds) = all_creds.values().next() {
+                        (creds.access_key.clone(), creds.secret_key.clone())
+                    } else {
+                        (String::new(), String::new())
+                    }
+                };
+                if !access_key.is_empty() {
+                    let s3_uri = format!("s3://{}/executable_tables/{}/v{}/data/", s3_config.bucket, table_name_sanitized, current_version);
+                    let endpoint = if s3_config.endpoint.is_empty() { None } else { Some(s3_config.endpoint.clone()) };
+                    let region = s3_config.region.clone();
+                    drop(s3_configs);
+
+                    if let Ok(sc) = crate::parquet_sink::ParquetSinkConfig::from_s3_uri(&s3_uri, endpoint, access_key, secret_key, region) {
+                        if let Ok(sink) = crate::parquet_sink::ParquetSink::new(&sc, 500) {
+                            let store = sink.store().clone();
+                            let bin_prefix = format!("executable_tables/{}/v{}/binary", table_name_sanitized, current_version);
+
+                            // Upload binary
+                            let bin_data = std::fs::read(&local_bin).unwrap_or_default();
+                            let bin_size = bin_data.len() as u64;
+                            let bin_s3 = format!("{}/bin-{}", bin_prefix, source_hash);
+                            if let Ok(()) = store.put(
+                                &object_store::path::Path::from(bin_s3.as_str()),
+                                object_store::PutPayload::from(bin_data),
+                            ).await.map(|_| ()) {
+                                binary_s3_path = Some(bin_s3.clone());
+                                binary_size_bytes = Some(bin_size);
+                                files_written = Some(files_written.unwrap_or(0) + 1);
+                                bytes_written_s3 = Some(bytes_written_s3.unwrap_or(0) + bin_size);
+
+                                // Upload binary manifest (Iceberg-style metadata)
+                                let manifest = serde_json::json!({
+                                    "format-version": 1,
+                                    "type": "rustlake-executable-binary",
+                                    "table-name": name,
+                                    "version": current_version,
+                                    "source-hash": source_hash,
+                                    "binary-path": bin_s3,
+                                    "binary-size": bin_size,
+                                    "compiled-at": chrono::Utc::now().to_rfc3339(),
+                                    "compiler": "rustc",
+                                    "target": std::env::consts::ARCH,
+                                    "os": std::env::consts::OS,
+                                    "properties": {
+                                        "rustlake.executable": "true",
+                                        "rustlake.transform.type": "rust",
+                                        "rustlake.transform.source-hash": source_hash,
+                                        "rustlake.function.cacheable": "true",
+                                        "rustlake.function.binary-format": "native",
+                                    }
+                                });
+                                let manifest_json = serde_json::to_string_pretty(&manifest).unwrap_or_default();
+                                let manifest_s3 = format!("{}/manifest-{}.json", bin_prefix, source_hash);
+                                let _ = store.put(
+                                    &object_store::path::Path::from(manifest_s3.as_str()),
+                                    object_store::PutPayload::from(manifest_json.as_bytes().to_vec()),
+                                ).await;
+
+                                tracing::info!(
+                                    table = %name,
+                                    binary = %bin_s3,
+                                    size = bin_size,
+                                    version = current_version,
+                                    "Rust binary uploaded to table S3 path"
+                                );
+                            }
+                        }
+                    }
+                } else {
+                    drop(s3_configs);
+                }
+            }
+        }
+    }
+
+    // Quality gate validation (Gap 4)
+    let gate_results = if status == "success" {
+        if let Some(ref batches) = sql_batches {
+            let gates = state.executable_tables.read().await
+                .iter().find(|t| t.table_name == name)
+                .map(|t| t.quality_gates.clone()).unwrap_or_default();
+            if !gates.is_empty() {
+                crate::executable_table::validate_gates(&gates, batches)
+            } else {
+                Vec::new()
+            }
+        } else { Vec::new() }
+    } else { Vec::new() };
+
+    let duration_ms = start.elapsed().as_millis() as u64;
+    let cost_usd = 0.000001 * duration_ms as f64;
+
+    // Record execution in history
+    let mut auto_regression: Option<crate::executable_table::RegressionResult> = None;
+    {
+        let mut tables = state.executable_tables.write().await;
+        if let Some(t) = tables.iter_mut().find(|t| t.table_name == name) {
+            t.history.push(crate::executable_table::ExecutionRecord {
+                execution_id: exec_id.clone(),
+                started_at: chrono::Utc::now().to_rfc3339(),
+                completed_at: Some(chrono::Utc::now().to_rfc3339()),
+                duration_ms,
+                status: status.clone(),
+                rows_produced: rows,
+                bytes_written: bytes_written_s3,
+                cost_usd,
+                binary_cached,
+                compile_ms,
+                run_ms,
+                error: error.clone(),
+                execution_location: "local".to_string(),
+                version: current_version,
+            });
+            t.total_executions += 1;
+            t.total_cost_usd += cost_usd;
+            if status == "success" {
+                t.last_refresh = Some(chrono::Utc::now().to_rfc3339());
+                t.status.state = "active".to_string();
+                t.status.health = "healthy".to_string();
+                t.status.data_freshness = "fresh".to_string();
+                t.status.staleness_hours = 0.0;
+            } else {
+                t.status.state = "error".to_string();
+                t.status.health = "critical".to_string();
+                t.status.last_error = error.clone();
+            }
+
+            // Gap 5: Link Iceberg snapshot to version
+            if s3_snapshot_id != 0 {
+                if let Some(ver) = t.versions.iter_mut().find(|v| v.version == current_version) {
+                    ver.snapshot_ids.push(s3_snapshot_id);
+                }
+            }
+
+            // Gap 7: Auto-regression after every execution
+            if t.history.len() >= 2 {
+                let prev = &t.history[t.history.len() - 2];
+                let curr = &t.history[t.history.len() - 1];
+                let r = crate::executable_table::detect_regression(
+                    prev.rows_produced, curr.rows_produced,
+                    prev.duration_ms, curr.duration_ms,
+                    prev.cost_usd, curr.cost_usd,
+                );
+                if r.has_regression {
+                    tracing::warn!(table=%name, severity=%r.severity, "Auto-regression detected after execution");
+                }
+                auto_regression = Some(r);
+            }
+        }
+    }
+
+    Ok(Json(serde_json::json!({
+        "execution_id": exec_id,
+        "status": status,
+        "rows_produced": rows,
+        "duration_ms": duration_ms,
+        "compile_ms": compile_ms,
+        "run_ms": run_ms,
+        "binary_cached": binary_cached,
+        "cost_usd": cost_usd,
+        "execution_location": "local",
+        "files_written": files_written,
+        "bytes_written": bytes_written_s3,
+        "error": error,
+        "gate_results": gate_results,
+        "regression": auto_regression,
+        "binary_path": binary_s3_path,
+        "binary_size": binary_size_bytes,
+    })))
+}
+
+// ── Execute a specific version without changing the current transform ──
+
+#[derive(Deserialize)]
+struct ExecuteVersionRequest {
+    version: u32,
+}
+
+async fn execute_version(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(req): Json<ExecuteVersionRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    // Find the table and the requested version
+    let tables = state.executable_tables.read().await;
+    let table = tables.iter().find(|t| t.table_name == name)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": format!("Table '{}' not found", name)}))))?;
+
+    let version = table.versions.iter().find(|v| v.version == req.version)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": format!("Version {} not found", req.version)}))))?;
+
+    let transform_type = table.transform.transform_type.clone();
+    let source_code = version.source_code.clone();
+    let version_num = version.version;
+    drop(tables);
+
+    let start = std::time::Instant::now();
+    let exec_id = Uuid::new_v4().to_string();
+
+    let (status, rows, error, compile_ms, run_ms, binary_cached, sql_batches) = if transform_type == "sql" {
+        let ctx = state.ctx.read().await;
+        match ctx.sql(&source_code).await {
+            Ok(batches) => {
+                let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+                ("success".to_string(), Some(rows as u64), None, 0u64, start.elapsed().as_millis() as u64, false, Some(batches))
+            }
+            Err(e) => ("failed".to_string(), None, Some(e.to_string()), 0, 0, false, None)
+        }
+    } else if transform_type == "rust" {
+        let result = crate::rust_executor::execute_rust(&source_code).await;
+        let cached = result.compile_output == "(cached)";
+        if result.success {
+            let batches = parse_csv_stdout_to_batches(&result.stdout);
+            let row_count = batches.as_ref().map(|bs| bs.iter().map(|b| b.num_rows() as u64).sum::<u64>());
+            ("success".to_string(), row_count, None, result.compile_ms, result.run_ms, cached, batches)
+        } else {
+            ("failed".to_string(), None, result.error, result.compile_ms, result.run_ms, cached, None)
+        }
+    } else {
+        ("unsupported".to_string(), None, Some("Unsupported transform type".to_string()), 0, 0, false, None)
+    };
+
+    let duration_ms = start.elapsed().as_millis() as u64;
+    let cost_usd = 0.000001 * duration_ms as f64;
+
+    // S3 write for execute-version (Gap 2)
+    let mut files_written: Option<u64> = None;
+    let mut bytes_written_s3: Option<u64> = None;
+    let mut s3_snapshot_id: i64 = 0;
+    if status == "success" {
+        if let Some(ref batches) = sql_batches {
+            if !batches.is_empty() && batches.iter().any(|b| b.num_rows() > 0) {
+                let s3_configs = state.s3_configs.read().await;
+                if let Some(s3_config) = s3_configs.first() {
+                    let table_name_sanitized = name.replace('-', "_").replace(' ', "_");
+                    let s3_uri = format!("s3://{}/executable_tables/{}/v{}/data/", s3_config.bucket, table_name_sanitized, version_num);
+                    let (access_key, secret_key) = if !s3_config.access_key.is_empty() && !s3_config.secret_key.is_empty() {
+                        (s3_config.access_key.clone(), s3_config.secret_key.clone())
+                    } else {
+                        let all_creds = state.credential_store.load_all_s3_creds();
+                        if let Some(creds) = all_creds.get(&s3_config.bucket) {
+                            (creds.access_key.clone(), creds.secret_key.clone())
+                        } else if let Some(creds) = all_creds.values().next() {
+                            (creds.access_key.clone(), creds.secret_key.clone())
+                        } else {
+                            (String::new(), String::new())
+                        }
+                    };
+                    let sink_config = if access_key.is_empty() { None } else {
+                        Some(crate::parquet_sink::ParquetSinkConfig::from_s3_uri(
+                            &s3_uri,
+                            if s3_config.endpoint.is_empty() { None } else { Some(s3_config.endpoint.clone()) },
+                            access_key,
+                            secret_key,
+                            s3_config.region.clone(),
+                        ))
+                    };
+                    let s3_bucket = s3_config.bucket.clone();
+                    drop(s3_configs);
+
+                    match sink_config {
+                        Some(Ok(sc)) => match crate::parquet_sink::ParquetSink::new(&sc, 500) {
+                            Ok(mut sink) => {
+                                let mut write_ok = true;
+                                for batch in batches {
+                                    if batch.num_rows() == 0 { continue; }
+                                    if let Err(e) = sink.write_batch(batch.clone()).await {
+                                        tracing::warn!(table=%name, error=%e, "execute-version: S3 write failed");
+                                        write_ok = false;
+                                        break;
+                                    }
+                                }
+                                if write_ok {
+                                    if let Ok(()) = sink.flush().await {
+                                        files_written = Some(sink.files_written());
+                                        bytes_written_s3 = Some(sink.data_files().iter().map(|f| f.file_size).sum());
+
+                                        // Incremental Iceberg metadata
+                                        let prefix = sink.prefix().to_string();
+                                        let iceberg_result = match crate::iceberg_metadata::find_latest_metadata(sink.store(), &prefix).await {
+                                            Ok(Some(mp)) => match crate::iceberg_metadata::load_table_state(sink.store(), &mp).await {
+                                                Ok(st) => sink.finalize_iceberg_incremental(Some(&st)).await,
+                                                Err(_) => sink.finalize_iceberg().await,
+                                            },
+                                            _ => sink.finalize_iceberg().await,
+                                        };
+                                        s3_snapshot_id = match &iceberg_result {
+                                            Ok(path) => {
+                                                tracing::info!(table=%name, metadata=%path, "execute-version: S3+Iceberg write complete");
+                                                chrono::Utc::now().timestamp_millis()
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(table=%name, error=%e, "execute-version: Iceberg metadata failed");
+                                                0
+                                            }
+                                        };
+
+                                        // Register in DataFusion
+                                        let register_uri = format!("s3://{}/executable_tables/{}/v{}/data/", s3_bucket, table_name_sanitized, version_num);
+                                        let client = reqwest::Client::new();
+                                        let _ = client.post("http://127.0.0.1:3000/api/v1/tables/register-s3")
+                                            .json(&serde_json::json!({
+                                                "table_name": format!("exec_{}_v{}", table_name_sanitized, version_num),
+                                                "s3_uri": register_uri,
+                                                "s3_config_name": "",
+                                            }))
+                                            .send().await;
+                                    }
+                                }
+                            }
+                            Err(e) => tracing::debug!(table=%name, error=%e, "execute-version: ParquetSink creation failed"),
+                        },
+                        Some(Err(e)) => tracing::debug!(table=%name, error=%e, "execute-version: invalid S3 URI"),
+                        None => {}
+                    }
+                } else {
+                    drop(s3_configs);
+                }
+            }
+        }
+    }
+
+    // Quality gate validation (Gap 4)
+    let gate_results = if status == "success" {
+        if let Some(ref batches) = sql_batches {
+            let gates = state.executable_tables.read().await
+                .iter().find(|t| t.table_name == name)
+                .map(|t| t.quality_gates.clone()).unwrap_or_default();
+            if !gates.is_empty() {
+                crate::executable_table::validate_gates(&gates, batches)
+            } else { Vec::new() }
+        } else { Vec::new() }
+    } else { Vec::new() };
+
+    let mut auto_regression: Option<crate::executable_table::RegressionResult> = None;
+
+    // Record in history (does NOT change the current transform)
+    {
+        let mut tables = state.executable_tables.write().await;
+        if let Some(t) = tables.iter_mut().find(|t| t.table_name == name) {
+            t.history.push(crate::executable_table::ExecutionRecord {
+                execution_id: exec_id.clone(),
+                started_at: chrono::Utc::now().to_rfc3339(),
+                completed_at: Some(chrono::Utc::now().to_rfc3339()),
+                duration_ms,
+                status: status.clone(),
+                rows_produced: rows,
+                bytes_written: bytes_written_s3,
+                cost_usd,
+                binary_cached,
+                compile_ms,
+                run_ms,
+                error: error.clone(),
+                execution_location: "local".to_string(),
+                version: version_num,
+            });
+            t.total_executions += 1;
+            t.total_cost_usd += cost_usd;
+
+            // Gap 5: Link Iceberg snapshot to version
+            if s3_snapshot_id != 0 {
+                if let Some(ver) = t.versions.iter_mut().find(|v| v.version == version_num) {
+                    ver.snapshot_ids.push(s3_snapshot_id);
+                }
+            }
+
+            // Gap 7: Auto-regression
+            if t.history.len() >= 2 {
+                let prev = &t.history[t.history.len() - 2];
+                let curr = &t.history[t.history.len() - 1];
+                let r = crate::executable_table::detect_regression(
+                    prev.rows_produced, curr.rows_produced,
+                    prev.duration_ms, curr.duration_ms,
+                    prev.cost_usd, curr.cost_usd,
+                );
+                if r.has_regression {
+                    tracing::warn!(table=%name, severity=%r.severity, "Auto-regression detected (execute-version)");
+                }
+                auto_regression = Some(r);
+            }
+        }
+    }
+
+    Ok(Json(serde_json::json!({
+        "execution_id": exec_id,
+        "version": version_num,
+        "status": status,
+        "rows_produced": rows,
+        "duration_ms": duration_ms,
+        "compile_ms": compile_ms,
+        "run_ms": run_ms,
+        "binary_cached": binary_cached,
+        "cost_usd": cost_usd,
+        "files_written": files_written,
+        "bytes_written": bytes_written_s3,
+        "error": error,
+        "gate_results": gate_results,
+        "regression": auto_regression,
+        "note": format!("Executed version {} without changing HEAD (current transform unchanged)", version_num),
+    })))
+}
+
+async fn executable_table_cost(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let tables = state.executable_tables.read().await;
+    let table = tables.iter().find(|t| t.table_name == name)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Table not found"}))))?;
+
+    let binary_size = table.transform.binary_size.unwrap_or(453000);
+    let exec_ms = if table.history.is_empty() { 500 } else {
+        table.history.last().map(|h| h.duration_ms).unwrap_or(500)
+    };
+    let comparison = crate::executable_table::estimate_costs(binary_size / 1024, exec_ms, 24);
+    Ok(Json(serde_json::to_value(&comparison).unwrap_or_default()))
+}
+
+#[derive(Deserialize)]
+struct CostComparisonRequest {
+    binary_size_kb: u64,
+    execution_ms: u64,
+    executions_per_day: u32,
+}
+
+async fn cost_comparison(Json(req): Json<CostComparisonRequest>) -> Json<serde_json::Value> {
+    let comparison = crate::executable_table::estimate_costs(
+        req.binary_size_kb,
+        req.execution_ms,
+        req.executions_per_day,
+    );
+    Json(serde_json::to_value(&comparison).unwrap_or_default())
+}
+
+// ── Code-Data Provenance (Binary Time Travel) Handlers ──────────
+
+async fn list_transform_versions(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let tables = state.executable_tables.read().await;
+    let table = tables.iter().find(|t| t.table_name == name)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Table not found"}))))?;
+
+    let versions = if table.versions.is_empty() {
+        // Return version 1 from current state
+        vec![crate::executable_table::TransformVersion {
+            version: 1,
+            source_code: table.transform.source_code.clone(),
+            source_hash: table.transform.source_hash.clone(),
+            created_at: table.created_at.clone(),
+            created_by: "user".to_string(),
+            change_description: "Initial transform".to_string(),
+            binary_size_bytes: table.transform.binary_size,
+            snapshot_ids: table.history.iter()
+                .enumerate()
+                .map(|(i, _)| i as i64 + 1)
+                .collect(),
+        }]
+    } else {
+        table.versions.clone()
+    };
+
+    let current_version = versions.iter().map(|v| v.version).max().unwrap_or(1);
+
+    Ok(Json(serde_json::json!({
+        "table": name,
+        "versions": versions,
+        "current_version": current_version,
+        "current_hash": table.transform.source_hash,
+    })))
+}
+
+#[derive(Deserialize)]
+struct DiffRequest {
+    old_source: String,
+    new_source: String,
+}
+
+async fn diff_transform_versions(
+    Path(name): Path<String>,
+    Json(req): Json<DiffRequest>,
+) -> Json<serde_json::Value> {
+    let (diff_lines, added, removed, changed) = crate::executable_table::diff_transforms(&req.old_source, &req.new_source);
+
+    Json(serde_json::json!({
+        "table": name,
+        "lines_added": added,
+        "lines_removed": removed,
+        "lines_changed": changed,
+        "total_diff_lines": diff_lines.len(),
+        "diff": diff_lines,
+    }))
+}
+
+async fn table_provenance(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let tables = state.executable_tables.read().await;
+    let table = tables.iter().find(|t| t.table_name == name)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Table not found"}))))?;
+
+    let mut timeline: Vec<serde_json::Value> = Vec::new();
+
+    // Add version change events from versions history
+    if table.versions.is_empty() {
+        // Only initial version
+        timeline.push(serde_json::json!({
+            "timestamp": table.created_at,
+            "event_type": "code_change",
+            "version": 1,
+            "description": "Initial transform created",
+            "source_hash": table.transform.source_hash,
+        }));
+    } else {
+        for v in &table.versions {
+            let event_type = if v.change_description.starts_with("Rollback") {
+                "rollback"
+            } else {
+                "code_change"
+            };
+            timeline.push(serde_json::json!({
+                "timestamp": v.created_at,
+                "event_type": event_type,
+                "version": v.version,
+                "description": v.change_description,
+                "source_hash": v.source_hash,
+            }));
+        }
+    }
+
+    // Add execution events
+    for (i, exec) in table.history.iter().enumerate() {
+        let exec_version = exec.version;
+
+        timeline.push(serde_json::json!({
+            "timestamp": exec.started_at,
+            "event_type": "execution",
+            "version": exec_version,
+            "description": format!("Execution #{}: {} in {}ms (cost: ${:.6})",
+                i + 1, exec.status, exec.duration_ms, exec.cost_usd),
+            "source_hash": table.transform.source_hash,
+            "duration_ms": exec.duration_ms,
+            "rows_produced": exec.rows_produced,
+            "cost_usd": exec.cost_usd,
+            "binary_cached": exec.binary_cached,
+        }));
+    }
+
+    // Gap 7: Insert regression_detected events between consecutive successful executions
+    let successful_execs: Vec<_> = table.history.iter().filter(|e| e.status == "success").collect();
+    for window in successful_execs.windows(2) {
+        let r = crate::executable_table::detect_regression(
+            window[0].rows_produced, window[1].rows_produced,
+            window[0].duration_ms, window[1].duration_ms,
+            window[0].cost_usd, window[1].cost_usd,
+        );
+        if r.has_regression {
+            timeline.push(serde_json::json!({
+                "timestamp": window[1].started_at,
+                "event_type": "regression_detected",
+                "version": window[1].version,
+                "description": format!("Regression detected: {} — {}", r.severity, r.recommendation),
+                "source_hash": table.transform.source_hash,
+            }));
+        }
+    }
+
+    // Sort timeline by timestamp
+    timeline.sort_by(|a, b| {
+        let ta = a.get("timestamp").and_then(|v| v.as_str()).unwrap_or("");
+        let tb = b.get("timestamp").and_then(|v| v.as_str()).unwrap_or("");
+        ta.cmp(tb)
+    });
+
+    let total_versions = if table.versions.is_empty() { 1 } else { table.versions.len() };
+
+    let chain = serde_json::json!({
+        "table_name": name,
+        "total_versions": total_versions,
+        "total_executions": table.total_executions,
+        "total_snapshots": table.history.len(),
+        "total_cost_usd": table.total_cost_usd,
+        "current_hash": table.transform.source_hash,
+        "timeline": timeline,
+    });
+
+    Ok(Json(chain))
+}
+
+#[derive(Deserialize)]
+struct RegressionRequest {
+    old_rows: Option<u64>,
+    new_rows: Option<u64>,
+    old_duration_ms: u64,
+    new_duration_ms: u64,
+    old_cost: f64,
+    new_cost: f64,
+}
+
+async fn check_regression(
+    Path(name): Path<String>,
+    Json(req): Json<RegressionRequest>,
+) -> Json<serde_json::Value> {
+    let result = crate::executable_table::detect_regression(
+        req.old_rows, req.new_rows, req.old_duration_ms, req.new_duration_ms, req.old_cost, req.new_cost,
+    );
+    Json(serde_json::json!({
+        "table": name,
+        "result": result,
+    }))
+}
+
+#[derive(Deserialize)]
+struct UpdateTransformRequest {
+    source_code: String,
+    #[serde(default)]
+    change_description: Option<String>,
+}
+
+async fn update_executable_table(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(req): Json<UpdateTransformRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let mut tables = state.executable_tables.write().await;
+    let table = tables.iter_mut().find(|t| t.table_name == name)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": format!("Executable table '{}' not found", name)}))))?;
+
+    let old_source = table.transform.source_code.clone();
+    let old_hash = table.transform.source_hash.clone();
+    let new_hash = crate::executable_table::hash_source(&req.source_code);
+
+    if old_hash == new_hash {
+        return Ok(Json(serde_json::json!({
+            "status": "unchanged",
+            "message": "Source code is identical to current version",
+        })));
+    }
+
+    // Determine new version number
+    let new_version = if table.versions.is_empty() { 2 } else {
+        table.versions.iter().map(|v| v.version).max().unwrap_or(1) + 1
+    };
+
+    // If versions is empty, store the original version first
+    if table.versions.is_empty() {
+        table.versions.push(crate::executable_table::TransformVersion {
+            version: 1,
+            source_code: old_source.clone(),
+            source_hash: old_hash.clone(),
+            created_at: table.created_at.clone(),
+            created_by: "user".to_string(),
+            change_description: "Initial transform".to_string(),
+            binary_size_bytes: table.transform.binary_size,
+            snapshot_ids: table.history.iter()
+                .enumerate()
+                .map(|(i, _)| i as i64 + 1)
+                .collect(),
+        });
+    }
+
+    // Compute diff
+    let (diff_lines, added, removed, changed) = crate::executable_table::diff_transforms(&old_source, &req.source_code);
+
+    let description = req.change_description.unwrap_or_else(|| {
+        format!("Code update: +{} -{} ~{} lines", added, removed, changed)
+    });
+
+    // Push new version
+    table.versions.push(crate::executable_table::TransformVersion {
+        version: new_version,
+        source_code: req.source_code.clone(),
+        source_hash: new_hash.clone(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        created_by: "user".to_string(),
+        change_description: description.clone(),
+        binary_size_bytes: table.transform.binary_size,
+        snapshot_ids: Vec::new(),
+    });
+
+    // Update current transform
+    table.transform.source_code = req.source_code;
+    table.transform.source_hash = new_hash.clone();
+    table.transform.binary_cached = false;
+    table.transform.binary_path = None; // Old binary is stale
+
+    // Regression detection: compare last two executions if they used different versions
+    let regression: Option<crate::executable_table::RegressionResult> = {
+        let execs: Vec<_> = table.history.iter().rev().take(2).collect();
+        if execs.len() == 2 {
+            Some(crate::executable_table::detect_regression(
+                execs[1].rows_produced, execs[0].rows_produced,
+                execs[1].duration_ms, execs[0].duration_ms,
+                execs[1].cost_usd, execs[0].cost_usd,
+            ))
+        } else {
+            None
+        }
+    };
+
+    let diff_summary = serde_json::json!({
+        "from_version": new_version - 1,
+        "to_version": new_version,
+        "from_hash": old_hash,
+        "to_hash": new_hash,
+        "lines_added": added,
+        "lines_removed": removed,
+        "lines_changed": changed,
+        "diff": diff_lines,
+    });
+
+    Ok(Json(serde_json::json!({
+        "status": "updated",
+        "table": name,
+        "version": new_version,
+        "change_description": description,
+        "diff": diff_summary,
+        "regression": regression,
+    })))
+}
+
+#[derive(Deserialize)]
+struct RollbackRequest {
+    version: u32,
+}
+
+async fn rollback_executable_table(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(req): Json<RollbackRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let mut tables = state.executable_tables.write().await;
+    let table = tables.iter_mut().find(|t| t.table_name == name)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": format!("Executable table '{}' not found", name)}))))?;
+
+    if table.versions.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "No version history available. Update the table at least once before rolling back."}))));
+    }
+
+    let target_version = table.versions.iter().find(|v| v.version == req.version)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": format!("Version {} not found", req.version)}))))?
+        .clone();
+
+    let current_source = table.transform.source_code.clone();
+    let (diff_lines, added, removed, changed) = crate::executable_table::diff_transforms(&current_source, &target_version.source_code);
+
+    let rollback_version = table.versions.iter().map(|v| v.version).max().unwrap_or(1) + 1;
+
+    // Push rollback as a new version entry
+    table.versions.push(crate::executable_table::TransformVersion {
+        version: rollback_version,
+        source_code: target_version.source_code.clone(),
+        source_hash: target_version.source_hash.clone(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        created_by: "user".to_string(),
+        change_description: format!("Rollback to version {}", req.version),
+        binary_size_bytes: target_version.binary_size_bytes,
+        snapshot_ids: Vec::new(),
+    });
+
+    // Restore transform
+    table.transform.source_code = target_version.source_code;
+    table.transform.source_hash = target_version.source_hash.clone();
+    table.transform.binary_cached = false;
+
+    Ok(Json(serde_json::json!({
+        "status": "rolled_back",
+        "table": name,
+        "rolled_back_to": req.version,
+        "new_version": rollback_version,
+        "restored_hash": target_version.source_hash,
+        "diff": {
+            "lines_added": added,
+            "lines_removed": removed,
+            "lines_changed": changed,
+            "diff": diff_lines,
+        },
+    })))
+}
+
+async fn executable_table_properties(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let tables = state.executable_tables.read().await;
+    let table = tables.iter().find(|t| t.table_name == name)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Table not found"}))))?;
+
+    let props = crate::executable_table::to_iceberg_properties(table);
+    Ok(Json(serde_json::json!({
+        "table": name,
+        "properties": props,
+        "format_version": 2,
+        "compatible_engines": ["Trino", "Spark", "Flink", "DuckDB", "DataFusion"],
+    })))
+}
+
+// ── Feature 7: Rollback with Data Restore ────────────────────────
+
+async fn restore_executable_table_data(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(req): Json<ExecuteVersionRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let tables = state.executable_tables.read().await;
+    let table = tables.iter().find(|t| t.table_name == name)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": format!("Table '{}' not found", name)}))))?;
+
+    // Verify the version exists
+    let _version = table.versions.iter().find(|v| v.version == req.version)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": format!("Version {} not found", req.version)}))))?;
+
+    let table_name_sanitized = name.replace('-', "_").replace(' ', "_");
+    drop(tables);
+
+    // Find S3 config and register the old version's data path
+    let s3_configs = state.s3_configs.read().await;
+    let s3_config = s3_configs.first()
+        .ok_or_else(|| (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "No S3 config available"}))))?;
+
+    let data_path = format!(
+        "s3://{}/executable_tables/{}/v{}/data/",
+        s3_config.bucket, table_name_sanitized, req.version
+    );
+    let registered_name = format!("exec_{}_v{}", table_name_sanitized, req.version);
+    drop(s3_configs);
+
+    // Register in DataFusion via self-call
+    let client = reqwest::Client::new();
+    let reg_result = client.post("http://127.0.0.1:3000/api/v1/tables/register-s3")
+        .json(&serde_json::json!({
+            "table_name": registered_name,
+            "s3_uri": data_path,
+            "s3_config_name": "",
+        }))
+        .send()
+        .await;
+
+    let restored = reg_result.map(|r| r.status().is_success()).unwrap_or(false);
+
+    tracing::info!(
+        table = %name,
+        version = req.version,
+        path = %data_path,
+        restored = restored,
+        "Data restore: pointer swap to version {}",
+        req.version
+    );
+
+    Ok(Json(serde_json::json!({
+        "status": if restored { "restored" } else { "restore_failed" },
+        "table": name,
+        "version": req.version,
+        "s3_data_path": data_path,
+        "registered_table": registered_name,
+        "note": format!("DataFusion catalog now points to v{} data. Query via: SELECT * FROM {} LIMIT 10", req.version, registered_name),
+    })))
+}
+
+// ── Feature 1: Cross-Version A/B Testing ─────────────────────────
+
+#[derive(Deserialize)]
+struct ABTestRequest {
+    version_a: u32,
+    version_b: u32,
+}
+
+async fn ab_test_executable_table(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(req): Json<ABTestRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let tables = state.executable_tables.read().await;
+    let table = tables.iter().find(|t| t.table_name == name)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": format!("Table '{}' not found", name)}))))?;
+
+    let ver_a = table.versions.iter().find(|v| v.version == req.version_a)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": format!("Version {} not found", req.version_a)}))))?;
+    let ver_b = table.versions.iter().find(|v| v.version == req.version_b)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": format!("Version {} not found", req.version_b)}))))?;
+
+    let transform_type = table.transform.transform_type.clone();
+    let code_a = ver_a.source_code.clone();
+    let code_b = ver_b.source_code.clone();
+    drop(tables);
+
+    // Execute version A
+    let start_a = std::time::Instant::now();
+    let (batches_a, rows_a, dur_a) = execute_transform_code(&state, &transform_type, &code_a, start_a).await;
+    let cost_a = 0.000001 * dur_a as f64;
+
+    // Execute version B
+    let start_b = std::time::Instant::now();
+    let (batches_b, rows_b, dur_b) = execute_transform_code(&state, &transform_type, &code_b, start_b).await;
+    let cost_b = 0.000001 * dur_b as f64;
+
+    let cols_a: Vec<String> = batches_a.as_ref().and_then(|bs| bs.first())
+        .map(|b| b.schema().fields().iter().map(|f| f.name().clone()).collect())
+        .unwrap_or_default();
+    let cols_b: Vec<String> = batches_b.as_ref().and_then(|bs| bs.first())
+        .map(|b| b.schema().fields().iter().map(|f| f.name().clone()).collect())
+        .unwrap_or_default();
+
+    let comparison = crate::executable_table::compare_ab_outputs(
+        batches_a.as_deref().unwrap_or(&[]),
+        batches_b.as_deref().unwrap_or(&[]),
+        dur_a, dur_b, cost_a, cost_b,
+    );
+
+    // Determine winner
+    let a_score: i32 = (if rows_a >= rows_b { 1 } else { 0 })
+        + (if dur_a <= dur_b { 1 } else { 0 })
+        + (if comparison.data_regressions.is_empty() { 0 } else { -1 });
+    let b_score: i32 = (if rows_b >= rows_a { 1 } else { 0 })
+        + (if dur_b <= dur_a { 1 } else { 0 })
+        + (if comparison.data_regressions.is_empty() { 0 } else { 1 });
+
+    let winner = if a_score > b_score { "version_a" } else if b_score > a_score { "version_b" } else { "tie" };
+    let confidence = ((a_score - b_score).abs() as f64 / 3.0).min(1.0);
+
+    let recommendation = match winner {
+        "version_a" => format!("Version {} is the winner. More rows, better performance.", req.version_a),
+        "version_b" => format!("Version {} is the winner. Better overall metrics.", req.version_b),
+        _ => "Tie — both versions perform similarly. Choose based on code clarity.".to_string(),
+    };
+
+    let result = crate::executable_table::ABTestResult {
+        table_name: name.clone(),
+        version_a: req.version_a,
+        version_b: req.version_b,
+        version_a_metrics: crate::executable_table::ABVersionMetrics {
+            version: req.version_a,
+            rows_produced: rows_a,
+            duration_ms: dur_a,
+            cost_usd: cost_a,
+            schema_columns: cols_a,
+        },
+        version_b_metrics: crate::executable_table::ABVersionMetrics {
+            version: req.version_b,
+            rows_produced: rows_b,
+            duration_ms: dur_b,
+            cost_usd: cost_b,
+            schema_columns: cols_b,
+        },
+        comparison,
+        winner: winner.to_string(),
+        confidence,
+        recommendation,
+    };
+
+    Ok(Json(serde_json::to_value(&result).unwrap_or_default()))
+}
+
+/// Helper: execute transform code and return batches + metrics
+async fn execute_transform_code(
+    state: &Arc<AppState>,
+    transform_type: &str,
+    source_code: &str,
+    start: std::time::Instant,
+) -> (Option<Vec<arrow::record_batch::RecordBatch>>, u64, u64) {
+    if transform_type == "sql" {
+        let ctx = state.ctx.read().await;
+        match ctx.sql(source_code).await {
+            Ok(batches) => {
+                let rows: u64 = batches.iter().map(|b| b.num_rows() as u64).sum();
+                let dur = start.elapsed().as_millis() as u64;
+                (Some(batches), rows, dur)
+            }
+            Err(_) => (None, 0, start.elapsed().as_millis() as u64),
+        }
+    } else if transform_type == "rust" {
+        let result = crate::rust_executor::execute_rust(source_code).await;
+        let dur = start.elapsed().as_millis() as u64;
+        if result.success {
+            let batches = parse_csv_stdout_to_batches(&result.stdout);
+            let rows = batches.as_ref().map(|bs| bs.iter().map(|b| b.num_rows() as u64).sum()).unwrap_or(0);
+            (batches, rows, dur)
+        } else {
+            (None, 0, dur)
+        }
+    } else {
+        (None, 0, 0)
+    }
+}
+
+// ── Feature 5: Data Contracts ────────────────────────────────────
+
+async fn list_data_contracts(
+    State(state): State<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    let contracts = state.data_contracts.read().await;
+    Json(serde_json::json!({
+        "contracts": *contracts,
+        "count": contracts.len(),
+    }))
+}
+
+#[derive(Deserialize)]
+struct CreateContractRequest {
+    producer_table: String,
+    consumer_tables: Vec<String>,
+    schema_checks: Vec<crate::executable_table::SchemaCheck>,
+    #[serde(default)]
+    freshness_sla_hours: Option<f64>,
+    #[serde(default)]
+    quality_gates: Vec<String>,
+}
+
+async fn create_data_contract(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CreateContractRequest>,
+) -> Json<serde_json::Value> {
+    let contract = crate::executable_table::DataContract {
+        id: Uuid::new_v4().to_string(),
+        producer_table: req.producer_table.clone(),
+        consumer_tables: req.consumer_tables,
+        schema_checks: req.schema_checks,
+        freshness_sla_hours: req.freshness_sla_hours,
+        quality_gates: req.quality_gates,
+        status: "unknown".to_string(),
+        last_validated: None,
+        created_at: chrono::Utc::now().to_rfc3339(),
+    };
+
+    let id = contract.id.clone();
+    state.data_contracts.write().await.push(contract);
+
+    Json(serde_json::json!({
+        "status": "created",
+        "contract_id": id,
+        "producer": req.producer_table,
+    }))
+}
+
+async fn validate_data_contract(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let contracts = state.data_contracts.read().await;
+    let contract = contracts.iter().find(|c| c.id == id)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Contract not found"}))))?;
+
+    let producer_name = contract.producer_table.clone();
+    let contract_clone = contract.clone();
+    drop(contracts);
+
+    // Execute the producer to get its current output
+    let tables = state.executable_tables.read().await;
+    let producer = tables.iter().find(|t| t.table_name == producer_name)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": format!("Producer table '{}' not found", producer_name)}))))?;
+
+    let transform_type = producer.transform.transform_type.clone();
+    let source_code = producer.transform.source_code.clone();
+    drop(tables);
+
+    let start = std::time::Instant::now();
+    let (batches, _, _) = execute_transform_code(&state, &transform_type, &source_code, start).await;
+
+    let validation = if let Some(ref bs) = batches {
+        crate::executable_table::validate_contract(&contract_clone, bs)
+    } else {
+        crate::executable_table::ContractValidationResult {
+            contract_id: id.clone(),
+            passed: false,
+            violations: vec![crate::executable_table::ContractViolation {
+                check_type: "execution_failed".to_string(),
+                column: "*".to_string(),
+                expected: "successful execution".to_string(),
+                actual: "producer execution failed".to_string(),
+            }],
+            validated_at: chrono::Utc::now().to_rfc3339(),
+        }
+    };
+
+    // Update contract status
+    let mut contracts = state.data_contracts.write().await;
+    if let Some(c) = contracts.iter_mut().find(|c| c.id == id) {
+        c.status = if validation.passed { "passing" } else { "failing" }.to_string();
+        c.last_validated = Some(validation.validated_at.clone());
+    }
+
+    Ok(Json(serde_json::to_value(&validation).unwrap_or_default()))
+}
+
+// ── Feature 10: Transform Marketplace ────────────────────────────
+
+async fn list_marketplace(
+    State(state): State<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    let packages = state.marketplace_packages.read().await;
+    Json(serde_json::json!({
+        "packages": *packages,
+        "count": packages.len(),
+    }))
+}
+
+#[derive(Deserialize)]
+struct PublishRequest {
+    table_name: String,
+    description: String,
+    author: String,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default = "default_category")]
+    category: String,
+}
+
+fn default_category() -> String { "analytics".to_string() }
+
+async fn publish_to_marketplace(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<PublishRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let tables = state.executable_tables.read().await;
+    let table = tables.iter().find(|t| t.table_name == req.table_name)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": format!("Table '{}' not found", req.table_name)}))))?;
+
+    let package = crate::executable_table::MarketplacePackage {
+        id: Uuid::new_v4().to_string(),
+        name: req.table_name.clone(),
+        description: req.description,
+        author: req.author,
+        version: format!("{}.0.0", table.versions.len()),
+        table_definition: table.clone(),
+        tags: req.tags,
+        category: req.category,
+        install_count: 0,
+        published_at: chrono::Utc::now().to_rfc3339(),
+    };
+
+    // Upload to S3 if available
+    let s3_configs = state.s3_configs.read().await;
+    let mut s3_uploaded = false;
+    if let Some(s3_config) = s3_configs.first() {
+        let (access_key, secret_key) = if !s3_config.access_key.is_empty() && !s3_config.secret_key.is_empty() {
+            (s3_config.access_key.clone(), s3_config.secret_key.clone())
+        } else {
+            let all_creds = state.credential_store.load_all_s3_creds();
+            all_creds.values().next().map(|c| (c.access_key.clone(), c.secret_key.clone())).unwrap_or_default()
+        };
+        if !access_key.is_empty() {
+            let s3_uri = format!("s3://{}/rustlake-marketplace/", s3_config.bucket);
+            let endpoint = if s3_config.endpoint.is_empty() { None } else { Some(s3_config.endpoint.clone()) };
+            let region = s3_config.region.clone();
+            drop(s3_configs);
+
+            if let Ok(sc) = crate::parquet_sink::ParquetSinkConfig::from_s3_uri(&s3_uri, endpoint, access_key, secret_key, region) {
+                if let Ok(sink) = crate::parquet_sink::ParquetSink::new(&sc, 500) {
+                    let store = sink.store().clone();
+                    let pkg_json = serde_json::to_string_pretty(&package).unwrap_or_default();
+                    let pkg_path = format!("rustlake-marketplace/{}-{}.json", package.name, package.version);
+                    if store.put(
+                        &object_store::path::Path::from(pkg_path.as_str()),
+                        object_store::PutPayload::from(pkg_json.as_bytes().to_vec()),
+                    ).await.is_ok() {
+                        s3_uploaded = true;
+                        tracing::info!(package=%package.name, "Marketplace package published to S3");
+                    }
+                }
+            }
+        } else {
+            drop(s3_configs);
+        }
+    } else {
+        drop(s3_configs);
+    }
+
+    let pkg_id = package.id.clone();
+    let pkg_name = package.name.clone();
+    state.marketplace_packages.write().await.push(package);
+
+    Ok(Json(serde_json::json!({
+        "status": "published",
+        "package_id": pkg_id,
+        "name": pkg_name,
+        "s3_uploaded": s3_uploaded,
+    })))
+}
+
+#[derive(Deserialize)]
+struct InstallRequest {
+    package_id: Option<String>,
+    package_name: Option<String>,
+}
+
+async fn install_from_marketplace(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<InstallRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let packages = state.marketplace_packages.read().await;
+    let package = if let Some(ref id) = req.package_id {
+        packages.iter().find(|p| p.id == *id)
+    } else if let Some(ref name) = req.package_name {
+        packages.iter().find(|p| p.name == *name)
+    } else {
+        None
+    }.ok_or_else(|| (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Package not found"}))))?;
+
+    let mut table_def = package.table_definition.clone();
+    let original_name = table_def.table_name.clone();
+    let pkg_name = package.name.clone();
+    drop(packages);
+
+    // Reset execution state for clean install
+    table_def.history.clear();
+    table_def.total_executions = 0;
+    table_def.total_cost_usd = 0.0;
+    table_def.last_refresh = None;
+    table_def.status.state = "active".to_string();
+    table_def.status.health = "healthy".to_string();
+    table_def.status.data_freshness = "unknown".to_string();
+    for v in &mut table_def.versions {
+        v.snapshot_ids.clear();
+    }
+
+    // Check if table already exists
+    let exists = state.executable_tables.read().await
+        .iter().any(|t| t.table_name == table_def.table_name);
+
+    if exists {
+        // Install with a suffix
+        table_def.table_name = format!("{}_installed", original_name);
+    }
+
+    let installed_name = table_def.table_name.clone();
+    state.executable_tables.write().await.push(table_def);
+
+    // Increment install count
+    let mut packages = state.marketplace_packages.write().await;
+    if let Some(p) = packages.iter_mut().find(|p| p.name == pkg_name) {
+        p.install_count += 1;
+    }
+
+    Ok(Json(serde_json::json!({
+        "status": "installed",
+        "table_name": installed_name,
+        "from_package": pkg_name,
+    })))
+}
+
+// ── Feature 2: Column-Level Lineage ─────────────────────────────
+
+async fn column_lineage(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let tables = state.executable_tables.read().await;
+    let table = tables.iter().find(|t| t.table_name == name)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": format!("Table '{}' not found", name)}))))?;
+
+    let lineage = if table.transform.transform_type == "sql" {
+        crate::executable_table::parse_sql_column_lineage(&table.transform.source_code, &table.input_tables)
+    } else {
+        // Rust/binary transforms: opaque lineage
+        vec![crate::executable_table::ColumnLineageEntry {
+            output_column: "*".to_string(),
+            source_table: table.input_tables.first().cloned(),
+            source_column: None,
+            transform_expression: format!("rust_binary/computed ({})", table.transform.source_hash),
+        }]
+    };
+
+    Ok(Json(serde_json::json!({
+        "table": name,
+        "transform_type": table.transform.transform_type,
+        "lineage": lineage,
+        "input_tables": table.input_tables,
+    })))
+}
+
+// ── Feature 1: Upstream Cascade Replay ──────────────────────────
+
+async fn cascade_replay(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let tables = state.executable_tables.read().await;
+    if !tables.iter().any(|t| t.table_name == name) {
+        return Err((StatusCode::NOT_FOUND, Json(serde_json::json!({"error": format!("Table '{}' not found", name)}))));
+    }
+
+    let all_tables = tables.clone();
+    drop(tables);
+
+    let dag = crate::executable_table::build_dependency_dag(&all_tables);
+    let execution_order = crate::executable_table::topological_sort_upstream(&dag, &name);
+
+    let mut results = Vec::new();
+    let mut all_gates_passed = true;
+    let mut all_contracts_valid = true;
+    let replay_start = std::time::Instant::now();
+
+    for table_name in &execution_order {
+        if let Some(table) = all_tables.iter().find(|t| &t.table_name == table_name) {
+            let version = table.versions.iter().map(|v| v.version).max().unwrap_or(1);
+            let start = std::time::Instant::now();
+
+            let (batches, rows, dur) = execute_transform_code(
+                &state,
+                &table.transform.transform_type,
+                &table.transform.source_code,
+                start,
+            ).await;
+
+            // Validate gates
+            let gate_results = if let Some(ref bs) = batches {
+                crate::executable_table::validate_gates(&table.quality_gates, bs)
+            } else {
+                Vec::new()
+            };
+            let gates_passed = gate_results.iter().all(|g| g.passed);
+            if !gates_passed { all_gates_passed = false; }
+
+            // Validate contracts
+            let contracts = state.data_contracts.read().await;
+            let contract = contracts.iter().find(|c| c.producer_table == *table_name);
+            let contracts_validated = if let (Some(contract), Some(ref bs)) = (contract, &batches) {
+                let validation = crate::executable_table::validate_contract(contract, bs);
+                if !validation.passed { all_contracts_valid = false; }
+                validation.passed
+            } else {
+                true
+            };
+
+            let status = if batches.is_some() { "success" } else { "failed" };
+            results.push(crate::executable_table::CascadeNodeResult {
+                table_name: table_name.clone(),
+                version,
+                rows,
+                duration_ms: dur,
+                gates_passed,
+                gate_results,
+                contracts_validated,
+                status: status.to_string(),
+                error: if batches.is_none() { Some("Execution failed".to_string()) } else { None },
+            });
+        }
+    }
+
+    let total_duration = replay_start.elapsed().as_millis() as u64;
+    let cascade_result = crate::executable_table::CascadeReplayResult {
+        target: name,
+        total_tables: results.len(),
+        total_duration_ms: total_duration,
+        results,
+        all_gates_passed,
+        all_contracts_valid,
+    };
+
+    Ok(Json(serde_json::to_value(&cascade_result).unwrap_or_default()))
+}
+
+// ── Feature 5: Time-Travel Debugging ────────────────────────────
+
+#[derive(Deserialize)]
+struct DebugRequest {
+    #[serde(default)]
+    execution_id: Option<String>,
+}
+
+async fn debug_execution(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(req): Json<DebugRequest>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let tables = state.executable_tables.read().await;
+    let table = tables.iter().find(|t| t.table_name == name)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": format!("Table '{}' not found", name)}))))?;
+
+    if table.history.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "No execution history available"}))));
+    }
+
+    // Find bad execution (specified or last failed, or last)
+    let bad_exec = if let Some(ref eid) = req.execution_id {
+        table.history.iter().find(|e| e.execution_id == *eid)
+    } else {
+        table.history.iter().rev().find(|e| e.status == "failed")
+            .or_else(|| table.history.last())
+    };
+
+    let bad_exec = bad_exec
+        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Execution not found"}))))?;
+
+    // Find previous good execution
+    let bad_idx = table.history.iter().position(|e| e.execution_id == bad_exec.execution_id).unwrap_or(0);
+    let good_exec = if bad_idx > 0 {
+        table.history[..bad_idx].iter().rev().find(|e| e.status == "success")
+    } else {
+        None
+    };
+
+    // Build execution summaries
+    let bad_summary = crate::executable_table::ExecutionSummary {
+        execution_id: bad_exec.execution_id.clone(),
+        version: bad_exec.version,
+        status: bad_exec.status.clone(),
+        rows_produced: bad_exec.rows_produced,
+        duration_ms: bad_exec.duration_ms,
+        cost_usd: bad_exec.cost_usd,
+        started_at: bad_exec.started_at.clone(),
+    };
+
+    let good_summary = good_exec.map(|e| crate::executable_table::ExecutionSummary {
+        execution_id: e.execution_id.clone(),
+        version: e.version,
+        status: e.status.clone(),
+        rows_produced: e.rows_produced,
+        duration_ms: e.duration_ms,
+        cost_usd: e.cost_usd,
+        started_at: e.started_at.clone(),
+    });
+
+    // Code diff between versions
+    let code_diff = if let Some(ref good) = good_exec {
+        if bad_exec.version != good.version {
+            let old_code = table.versions.iter().find(|v| v.version == good.version)
+                .map(|v| v.source_code.as_str()).unwrap_or("");
+            let new_code = table.versions.iter().find(|v| v.version == bad_exec.version)
+                .map(|v| v.source_code.as_str()).unwrap_or(&table.transform.source_code);
+            let (diff_lines, added, removed, changed) = crate::executable_table::diff_transforms(old_code, new_code);
+            Some(crate::executable_table::TransformDiff {
+                from_version: good.version,
+                to_version: bad_exec.version,
+                from_hash: table.versions.iter().find(|v| v.version == good.version)
+                    .map(|v| v.source_hash.clone()).unwrap_or_default(),
+                to_hash: table.versions.iter().find(|v| v.version == bad_exec.version)
+                    .map(|v| v.source_hash.clone()).unwrap_or_else(|| table.transform.source_hash.clone()),
+                lines_added: added,
+                lines_removed: removed,
+                lines_changed: changed,
+                diff_lines,
+                output_regression: None,
+            })
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Data diff
+    let data_diff = if let Some(ref good) = good_exec {
+        let good_rows = good.rows_produced.unwrap_or(0) as i64;
+        let bad_rows = bad_exec.rows_produced.unwrap_or(0) as i64;
+        let row_diff = bad_rows - good_rows;
+        let row_pct = if good_rows > 0 { (row_diff as f64 / good_rows as f64) * 100.0 } else { 0.0 };
+        crate::executable_table::DataDiffSummary {
+            row_count_diff: row_diff,
+            row_count_pct: row_pct,
+            duration_diff_ms: bad_exec.duration_ms as i64 - good.duration_ms as i64,
+            cost_diff_usd: bad_exec.cost_usd - good.cost_usd,
+            regressions: {
+                let r = crate::executable_table::detect_regression(
+                    good.rows_produced, bad_exec.rows_produced,
+                    good.duration_ms, bad_exec.duration_ms,
+                    good.cost_usd, bad_exec.cost_usd,
+                );
+                r.metrics
+            },
+        }
+    } else {
+        crate::executable_table::DataDiffSummary {
+            row_count_diff: 0,
+            row_count_pct: 0.0,
+            duration_diff_ms: 0,
+            cost_diff_usd: 0.0,
+            regressions: Vec::new(),
+        }
+    };
+
+    // Root cause analysis
+    let mut root_cause_lines = Vec::new();
+    if bad_exec.status == "failed" {
+        if let Some(ref err) = bad_exec.error {
+            root_cause_lines.push(format!("Error: {}", err));
+        }
+    }
+    if let Some(ref diff) = code_diff {
+        if diff.lines_changed > 0 {
+            root_cause_lines.push(format!("Code changed: {} lines modified between v{} and v{}", diff.lines_changed, diff.from_version, diff.to_version));
+        }
+    }
+    if data_diff.row_count_diff < 0 && data_diff.row_count_pct < -10.0 {
+        root_cause_lines.push(format!("Row count dropped {:.1}% ({} rows)", data_diff.row_count_pct, data_diff.row_count_diff));
+    }
+
+    // Upstream changes
+    let all_tables = tables.clone();
+    let upstream_changes: Vec<crate::executable_table::UpstreamChange> = table.input_tables.iter().map(|input_name| {
+        let upstream_table = all_tables.iter().find(|t| t.table_name == *input_name);
+        let (changed_at, version_before, version_after) = if let Some(ut) = upstream_table {
+            let latest_exec = ut.history.last();
+            (
+                latest_exec.map(|e| e.started_at.clone()),
+                if ut.versions.len() >= 2 { Some(ut.versions[ut.versions.len() - 2].version) } else { Some(1) },
+                ut.versions.last().map(|v| v.version),
+            )
+        } else {
+            (None, None, None)
+        };
+        crate::executable_table::UpstreamChange {
+            table_name: input_name.clone(),
+            changed_at,
+            version_before,
+            version_after,
+        }
+    }).collect();
+
+    let result = crate::executable_table::DebugResult {
+        table_name: name,
+        bad_execution: Some(bad_summary),
+        good_execution: good_summary,
+        code_diff,
+        data_diff,
+        root_cause_lines,
+        upstream_changes,
+    };
+
+    Ok(Json(serde_json::to_value(&result).unwrap_or_default()))
+}
+
+// ── Feature 4: Executable Pipelines ─────────────────────────────
+
+async fn list_executable_pipelines(
+    State(state): State<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    let pipelines = state.executable_pipelines.read().await;
+    Json(serde_json::json!({
+        "pipelines": *pipelines,
+        "count": pipelines.len(),
+    }))
+}
+
+#[derive(Deserialize)]
+struct CreateExecPipelineRequest {
+    name: String,
+    stages: Vec<crate::executable_table::PipelineStage>,
+}
+
+async fn create_executable_pipeline(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CreateExecPipelineRequest>,
+) -> Json<serde_json::Value> {
+    let pipeline = crate::executable_table::ExecutablePipeline {
+        id: Uuid::new_v4().to_string(),
+        name: req.name.clone(),
+        stages: req.stages,
+        status: "created".to_string(),
+        last_run: None,
+        total_runs: 0,
+    };
+    let id = pipeline.id.clone();
+    state.executable_pipelines.write().await.push(pipeline);
+    Json(serde_json::json!({
+        "status": "created",
+        "pipeline_id": id,
+        "name": req.name,
+    }))
+}
+
+async fn run_executable_pipeline(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let pipelines = state.executable_pipelines.read().await;
+    let pipeline = pipelines.iter().find(|p| p.id == id)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": "Pipeline not found"}))))?;
+
+    let pipeline_name = pipeline.name.clone();
+    let pipeline_id = pipeline.id.clone();
+    let stages = pipeline.stages.clone();
+    drop(pipelines);
+
+    // Resolve execution order using topo sort
+    let tables = state.executable_tables.read().await;
+    let all_tables = tables.clone();
+    drop(tables);
+
+    let dag = crate::executable_table::build_dependency_dag(&all_tables);
+
+    // Execute stages in dependency order
+    let mut stage_results = Vec::new();
+    let pipeline_start = std::time::Instant::now();
+    let mut pipeline_status = "success".to_string();
+
+    // Build execution order from stages
+    let stage_names: Vec<String> = stages.iter().map(|s| s.table_name.clone()).collect();
+    let mut ordered_stages = Vec::new();
+    for stage_name in &stage_names {
+        let upstream = crate::executable_table::topological_sort_upstream(&dag, stage_name);
+        for name in upstream {
+            if stage_names.contains(&name) && !ordered_stages.contains(&name) {
+                ordered_stages.push(name);
+            }
+        }
+    }
+
+    for stage_name in &ordered_stages {
+        let stage_def = stages.iter().find(|s| s.table_name == *stage_name);
+        if let Some(table) = all_tables.iter().find(|t| t.table_name == *stage_name) {
+            let start = std::time::Instant::now();
+            let (batches, rows, dur) = execute_transform_code(
+                &state,
+                &table.transform.transform_type,
+                &table.transform.source_code,
+                start,
+            ).await;
+
+            let gate_results = if let Some(ref bs) = batches {
+                crate::executable_table::validate_gates(&table.quality_gates, bs)
+            } else {
+                Vec::new()
+            };
+            let gates_passed = gate_results.iter().all(|g| g.passed);
+
+            // Contract validation
+            let contracts = state.data_contracts.read().await;
+            let contract = contracts.iter().find(|c| c.producer_table == *stage_name);
+            let contract_valid = if let (Some(contract), Some(ref bs)) = (contract, &batches) {
+                crate::executable_table::validate_contract(contract, bs).passed
+            } else {
+                true
+            };
+
+            let status = if batches.is_some() { "success" } else { "failed" };
+
+            // Stop on failure if gate or contract required
+            let should_stop = if let Some(sd) = stage_def {
+                (sd.gate_required && !gates_passed) || (sd.contract_required && !contract_valid) || batches.is_none()
+            } else {
+                batches.is_none()
+            };
+
+            stage_results.push(crate::executable_table::PipelineStageResult {
+                table_name: stage_name.clone(),
+                status: status.to_string(),
+                rows,
+                duration_ms: dur,
+                gate_results,
+                gates_passed,
+                contract_valid,
+                error: if batches.is_none() { Some("Execution failed".to_string()) } else { None },
+            });
+
+            if should_stop {
+                pipeline_status = "failed".to_string();
+                break;
+            }
+        }
+    }
+
+    let total_duration = pipeline_start.elapsed().as_millis() as u64;
+
+    // Update pipeline state
+    let mut pipelines = state.executable_pipelines.write().await;
+    if let Some(p) = pipelines.iter_mut().find(|p| p.id == pipeline_id) {
+        p.total_runs += 1;
+        p.last_run = Some(chrono::Utc::now().to_rfc3339());
+        p.status = pipeline_status.clone();
+    }
+
+    let result = crate::executable_table::PipelineRunResult {
+        pipeline_id,
+        pipeline_name,
+        status: pipeline_status,
+        total_duration_ms: total_duration,
+        stages: stage_results,
+    };
+
+    Ok(Json(serde_json::to_value(&result).unwrap_or_default()))
+}
+
+// ── Feature 7: Data Products + Compliance Audit ─────────────────
+
+async fn list_data_products(
+    State(state): State<Arc<AppState>>,
+) -> Json<serde_json::Value> {
+    let products = state.data_products.read().await;
+    Json(serde_json::json!({
+        "products": *products,
+        "count": products.len(),
+    }))
+}
+
+#[derive(Deserialize)]
+struct CreateDataProductRequest {
+    name: String,
+    table_name: String,
+    #[serde(default)]
+    contract_id: Option<String>,
+    #[serde(default = "default_sla_freshness")]
+    sla_freshness_hours: f64,
+    #[serde(default = "default_quality_score")]
+    sla_quality_score: f64,
+    #[serde(default)]
+    owner: String,
+    #[serde(default)]
+    consumers: Vec<String>,
+    #[serde(default)]
+    description: String,
+}
+
+fn default_sla_freshness() -> f64 { 24.0 }
+fn default_quality_score() -> f64 { 0.95 }
+
+async fn create_data_product(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CreateDataProductRequest>,
+) -> Json<serde_json::Value> {
+    let product = crate::executable_table::DataProduct {
+        id: Uuid::new_v4().to_string(),
+        name: req.name.clone(),
+        table_name: req.table_name,
+        contract_id: req.contract_id,
+        sla_freshness_hours: req.sla_freshness_hours,
+        sla_quality_score: req.sla_quality_score,
+        owner: if req.owner.is_empty() { "platform".to_string() } else { req.owner },
+        consumers: req.consumers,
+        certification: "pending".to_string(),
+        description: req.description,
+    };
+    let id = product.id.clone();
+    state.data_products.write().await.push(product);
+    Json(serde_json::json!({
+        "status": "created",
+        "product_id": id,
+        "name": req.name,
+    }))
+}
+
+async fn audit_data_product(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let products = state.data_products.read().await;
+    let product = products.iter().find(|p| p.name == name)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": format!("Data product '{}' not found", name)}))))?;
+    let product = product.clone();
+    drop(products);
+
+    let tables = state.executable_tables.read().await;
+    let table = tables.iter().find(|t| t.table_name == product.table_name);
+
+    // Freshness
+    let freshness_status = if let Some(t) = table {
+        let actual_hours = if let Some(ref lr) = t.last_refresh {
+            if let Ok(last) = chrono::DateTime::parse_from_rfc3339(lr) {
+                (chrono::Utc::now() - last.with_timezone(&chrono::Utc)).num_minutes() as f64 / 60.0
+            } else { 999.0 }
+        } else { 999.0 };
+        crate::executable_table::FreshnessStatus {
+            sla_hours: product.sla_freshness_hours,
+            actual_hours,
+            within_sla: actual_hours <= product.sla_freshness_hours,
+        }
+    } else {
+        crate::executable_table::FreshnessStatus {
+            sla_hours: product.sla_freshness_hours,
+            actual_hours: 999.0,
+            within_sla: false,
+        }
+    };
+
+    // Gate pass rate
+    let gate_pass_rate = if let Some(t) = table {
+        let successful = t.history.iter().filter(|e| e.status == "success").count();
+        let total = t.history.len();
+        if total > 0 { successful as f64 / total as f64 } else { 1.0 }
+    } else { 0.0 };
+
+    // Quality score = gate pass rate * freshness factor
+    let freshness_factor = if freshness_status.within_sla { 1.0 } else { 0.5 };
+    let quality_score = gate_pass_rate * freshness_factor;
+
+    // Cost summary
+    let cost_summary = if let Some(t) = table {
+        crate::executable_table::AuditCostSummary {
+            total_cost_usd: t.total_cost_usd,
+            total_saved_usd: t.cost_saved_usd,
+            total_executions: t.total_executions,
+            total_skipped: t.executions_skipped,
+        }
+    } else {
+        crate::executable_table::AuditCostSummary {
+            total_cost_usd: 0.0,
+            total_saved_usd: 0.0,
+            total_executions: 0,
+            total_skipped: 0,
+        }
+    };
+
+    // Contract validation
+    let contract_validation = if let Some(ref cid) = product.contract_id {
+        let contracts = state.data_contracts.read().await;
+        if let Some(contract) = contracts.iter().find(|c| c.id == *cid) {
+            if let Some(t) = table {
+                let start = std::time::Instant::now();
+                let (batches, _, _) = execute_transform_code(
+                    &state,
+                    &t.transform.transform_type,
+                    &t.transform.source_code,
+                    start,
+                ).await;
+                if let Some(ref bs) = batches {
+                    Some(crate::executable_table::validate_contract(contract, bs))
+                } else { None }
+            } else { None }
+        } else { None }
+    } else { None };
+
+    // Upstream chain
+    let all_tables = tables.clone();
+    drop(tables);
+    let dag = crate::executable_table::build_dependency_dag(&all_tables);
+    let upstream_chain = crate::executable_table::topological_sort_upstream(&dag, &product.table_name);
+
+    // Provenance chain length
+    let provenance_chain_length = upstream_chain.len();
+
+    // Certification eligibility
+    let contracts_ok = contract_validation.as_ref().map(|v| v.passed).unwrap_or(true);
+    let certification_eligible = freshness_status.within_sla
+        && quality_score >= product.sla_quality_score
+        && contracts_ok;
+
+    // Compliance issues
+    let mut compliance_issues = Vec::new();
+    if !freshness_status.within_sla {
+        compliance_issues.push(format!("SLA violation: data is {:.1}h old (SLA: {}h)", freshness_status.actual_hours, freshness_status.sla_hours));
+    }
+    if quality_score < product.sla_quality_score {
+        compliance_issues.push(format!("Quality below threshold: {:.1}% (required: {:.1}%)", quality_score * 100.0, product.sla_quality_score * 100.0));
+    }
+    if let Some(ref cv) = contract_validation {
+        if !cv.passed {
+            compliance_issues.push(format!("Contract violations: {}", cv.violations.len()));
+        }
+    }
+
+    let audit = crate::executable_table::DataProductAudit {
+        product: product.clone(),
+        provenance_chain_length,
+        contract_validation,
+        gate_pass_rate,
+        freshness_status,
+        quality_score,
+        cost_summary,
+        upstream_chain,
+        certification_eligible,
+        compliance_issues,
+    };
+
+    Ok(Json(serde_json::to_value(&audit).unwrap_or_default()))
+}

@@ -294,6 +294,10 @@ async fn execute_query(
                             status: "error".into(),
                             error: Some(fb_err.to_string()),
                             engine: "DataFusion".into(),
+                            s3_bytes_scanned: 0,
+                            s3_requests: 0,
+                            estimated_cost_usd: 0.0,
+                            snapshot_context: std::collections::HashMap::new(),
                         })
                         .await;
                     send_msg(
@@ -322,6 +326,10 @@ async fn execute_query(
                     status: "error".into(),
                     error: Some(e.to_string()),
                     engine: engine_name.into(),
+                    s3_bytes_scanned: 0,
+                    s3_requests: 0,
+                    estimated_cost_usd: 0.0,
+                    snapshot_context: std::collections::HashMap::new(),
                 })
                 .await;
             send_msg(
@@ -402,6 +410,10 @@ async fn execute_query(
             status: "success".into(),
             error: None,
             engine: final_engine.into(),
+            s3_bytes_scanned: 0,
+            s3_requests: 0,
+            estimated_cost_usd: 0.0,
+            snapshot_context: std::collections::HashMap::new(),
         })
         .await;
 

@@ -8,6 +8,7 @@ export interface SqlResponse {
   parse_ms?: number
   exec_ms?: number
   engine: string
+  execution_mode?: string
 }
 
 export interface SqlRequest {
@@ -565,6 +566,331 @@ export interface EnginesResponse {
   engines: EngineInfo[]
 }
 
+// ── Iceberg Metadata ──────────────────────────────────────────────
+export interface IcebergSnapshot {
+  snapshot_id: number
+  parent_snapshot_id: number | null
+  timestamp_ms: number
+  operation: string
+  summary: Record<string, string>
+  manifest_list_path: string
+  data_files_count: number
+}
+
+export interface IcebergSnapshotResponse {
+  table: string
+  current_snapshot_id: number | null
+  snapshot_count: number
+  snapshots: IcebergSnapshot[]
+}
+
+export interface IcebergDataFile {
+  file_path: string
+  file_size: number
+  row_count: number
+}
+
+export interface IcebergSchemaField {
+  id: number
+  name: string
+  required: boolean
+  type: string
+}
+
+export interface IcebergSchemaVersion {
+  schema_id: number
+  fields: IcebergSchemaField[]
+}
+
+export interface IcebergSchemasResponse {
+  table: string
+  current_schema_id: number
+  schemas: IcebergSchemaVersion[]
+}
+
+export interface IcebergPartitionField {
+  source_id: number
+  field_id: number
+  name: string
+  transform: string
+}
+
+export interface IcebergPartitionSpec {
+  spec_id: number
+  fields: IcebergPartitionField[]
+}
+
+export interface MaintenanceStatus {
+  total_files: number
+  avg_file_size_bytes: number
+  small_file_count: number
+  fragmentation_score: number
+  snapshot_count: number
+  oldest_snapshot_ms: number | null
+  recommendations: string[]
+}
+
+// ── Notebooks ────────────────────────────────────────────────────────
+export interface NotebookDocument {
+  id: string
+  name: string
+  cells: NotebookCell[]
+  createdAt: string
+  updatedAt?: string
+}
+
+export interface NotebookCell {
+  id: string
+  type: 'sql' | 'python' | 'markdown' | 'rust'
+  source: string
+  output: CellOutput | null
+  status: 'idle' | 'running' | 'success' | 'error'
+  executionOrder: number | null
+}
+
+export interface CellOutput {
+  type: 'table' | 'text' | 'image' | 'error'
+  data: unknown
+}
+
+// ── Graph Database ───────────────────────────────────────────────
+export interface GraphNode {
+  id: string
+  label: string
+  group: string
+  properties: Record<string, string>
+  size: number
+}
+
+export interface GraphEdge {
+  source: string
+  target: string
+  label: string
+  properties: Record<string, string>
+}
+
+export interface GraphData {
+  nodes: GraphNode[]
+  edges: GraphEdge[]
+  node_count: number
+  edge_count: number
+}
+
+export interface Neo4jConnectResponse {
+  status: string
+  node_count: number
+  relationship_count: number
+  labels: string[]
+  relationship_types: string[]
+}
+
+export interface CypherResponse {
+  columns: string[]
+  rows: Record<string, unknown>[]
+  row_count: number
+  graph: GraphData
+  node_count: number
+  relationship_count: number
+}
+
+// ── Cost Tracking ────────────────────────────────────────────────
+export interface CostRecord {
+  timestamp: string
+  table: string
+  engine: string
+  bytes_scanned: number
+  requests: number
+  cost_usd: number
+}
+
+export interface CostSummary {
+  total_cost_usd: number
+  total_bytes_scanned: number
+  total_requests: number
+  by_engine: Record<string, { cost_usd: number; queries: number }>
+  by_day: Array<{ date: string; cost_usd: number; queries: number }>
+}
+
+// ── Materialized Views ──────────────────────────────────────────
+export interface MaterializedView {
+  name: string
+  sql: string
+  refresh_interval: string
+  last_refresh: string | null
+  next_refresh: string | null
+  row_count: number
+  status: 'active' | 'refreshing' | 'error'
+}
+
+// ── Data Contracts ──────────────────────────────────────────────
+export interface DataContract {
+  id: string
+  producer_table: string
+  consumer_tables: string[]
+  schema_checks: SchemaCheck[]
+  freshness_sla_hours: number | null
+  quality_gates: string[]
+  status: 'passing' | 'failing' | 'unknown'
+  last_validated: string | null
+  created_at: string
+}
+
+// ── Notebook ETL ─────────────────────────────────────────────────
+export interface NotebookJob {
+  job_id: string
+  notebook_id: string
+  notebook_name: string
+  schedule: string
+  enabled: boolean
+  last_run: string | null
+  last_status: string | null
+  last_duration_ms: number | null
+  created_at: string
+  optimization_level: string
+  tags: string[]
+}
+
+export interface ExecutionPlan {
+  stages: ExecutionStage[]
+  total_cells: number
+  parallelizable_cells: number
+  estimated_duration_ms: number
+  optimizations: Optimization[]
+}
+
+export interface ExecutionStage {
+  stage_id: number
+  cell_ids: string[]
+  cell_types: string[]
+  can_parallelize: boolean
+  estimated_ms: number
+}
+
+export interface Optimization {
+  optimization_type: string
+  description: string
+  cells_affected: string[]
+  estimated_speedup_ms: number
+}
+
+// ── Executable Lakehouse ─────────────────────────────────────────
+export interface ExecutableTable {
+  table_name: string
+  table_location: string
+  transform: {
+    transform_type: string
+    source_code: string
+    source_hash: string
+    binary_path: string | null
+    binary_size: number | null
+    binary_cached: boolean
+  }
+  schedule: string | null
+  quality_gates: Array<{ gate_type: string; column: string | null; description: string }>
+  input_tables: string[]
+  status: { state: string; health: string; staleness_hours: number; data_freshness: string }
+  history: Array<{ execution_id: string; duration_ms: number; status: string; rows_produced: number | null; bytes_written?: number | null; files_written?: number | null; cost_usd: number; binary_cached: boolean; version?: number }>
+  created_at: string
+  last_refresh: string | null
+  next_refresh: string | null
+  estimated_cost_usd: number
+  total_executions: number
+  total_cost_usd: number
+  executions_skipped: number
+  cost_saved_usd: number
+  versions?: TransformVersion[]
+  incremental?: boolean
+  watermark_column?: string | null
+  last_watermark?: string | null
+}
+
+// ── Quality Gate Results ─────────────────────────────────────────
+export interface GateResult {
+  gate_type: string
+  column: string | null
+  passed: boolean
+  detail: string
+}
+
+// ── Code-Data Provenance ─────────────────────────────────────────
+export interface TransformVersion {
+  version: number
+  source_code: string
+  source_hash: string
+  created_at: string
+  created_by: string
+  change_description: string
+  binary_size_bytes: number | null
+  snapshot_ids: number[]
+}
+
+export interface DiffLine {
+  line_number: number
+  change_type: 'added' | 'removed' | 'unchanged'
+  content: string
+}
+
+export interface RegressionMetric {
+  metric_name: string
+  old_value: number
+  new_value: number
+  change_pct: number
+  is_regression: boolean
+}
+
+export interface RegressionResult {
+  has_regression: boolean
+  severity: 'none' | 'minor' | 'major' | 'critical'
+  metrics: RegressionMetric[]
+  recommendation: string
+}
+
+export interface ProvenanceEvent {
+  timestamp: string
+  event_type: 'code_change' | 'execution' | 'regression_detected' | 'rollback'
+  version: number
+  description: string
+  source_hash: string
+  duration_ms?: number
+  rows_produced?: number | null
+  cost_usd?: number
+  binary_cached?: boolean
+}
+
+export interface ProvenanceChain {
+  table_name: string
+  total_versions: number
+  total_executions: number
+  total_snapshots: number
+  total_cost_usd: number
+  current_hash: string
+  timeline: ProvenanceEvent[]
+}
+
+export interface IcebergProperties {
+  table: string
+  properties: Record<string, string>
+  format_version: number
+  compatible_engines: string[]
+}
+
+export interface CostComparison {
+  rustlake: CostEstimate
+  databricks: CostEstimate
+  snowflake: CostEstimate
+  lambda: CostEstimate
+}
+
+export interface CostEstimate {
+  platform: string
+  cost_per_execution_usd: number
+  monthly_cost_usd: number
+  cold_start_ms: number
+  execution_ms: number
+  always_on: boolean
+  cluster_required: boolean
+}
+
 export interface BenchmarkCompareResponse {
   query_id: string
   query_name: string
@@ -573,4 +899,211 @@ export interface BenchmarkCompareResponse {
   polars?: { duration_ms: number; row_count: number; status: string; error?: string }
   speedup: number
   winner: string
+}
+
+// ── A/B Testing ─────────────────────────────────────────────────
+export interface ABTestResult {
+  table_name: string
+  version_a: number
+  version_b: number
+  version_a_metrics: { version: number; rows_produced: number; duration_ms: number; cost_usd: number; schema_columns: string[] }
+  version_b_metrics: { version: number; rows_produced: number; duration_ms: number; cost_usd: number; schema_columns: string[] }
+  comparison: {
+    row_count_diff: number
+    row_count_pct: number
+    schema_match: boolean
+    columns_added: string[]
+    columns_removed: string[]
+    duration_diff_ms: number
+    cost_diff_usd: number
+    data_regressions: RegressionMetric[]
+  }
+  winner: 'version_a' | 'version_b' | 'tie'
+  confidence: number
+  recommendation: string
+}
+
+// ── Data Contracts (updated) ────────────────────────────────────
+export interface SchemaCheck {
+  column: string
+  data_type: string
+  nullable: boolean
+  required: boolean
+}
+
+export interface ContractViolation {
+  check_type: string
+  column: string
+  expected: string
+  actual: string
+}
+
+export interface ContractValidationResult {
+  contract_id: string
+  passed: boolean
+  violations: ContractViolation[]
+  validated_at: string
+}
+
+// ── Transform Marketplace ───────────────────────────────────────
+export interface MarketplacePackage {
+  id: string
+  name: string
+  description: string
+  author: string
+  version: string
+  tags: string[]
+  category: string
+  install_count: number
+  published_at: string
+  table_definition: ExecutableTable
+}
+
+// ── Column Lineage ──────────────────────────────────────────────
+export interface ColumnLineageEntry {
+  output_column: string
+  source_table: string | null
+  source_column: string | null
+  transform_expression: string
+}
+
+export interface ColumnLineageResponse {
+  table: string
+  transform_type: string
+  lineage: ColumnLineageEntry[]
+  input_tables: string[]
+}
+
+// ── Cascade Replay ──────────────────────────────────────────────
+export interface CascadeNodeResult {
+  table_name: string
+  version: number
+  rows: number
+  duration_ms: number
+  gates_passed: boolean
+  gate_results: GateResult[]
+  contracts_validated: boolean
+  status: string
+  error: string | null
+}
+
+export interface CascadeReplayResult {
+  target: string
+  total_tables: number
+  total_duration_ms: number
+  results: CascadeNodeResult[]
+  all_gates_passed: boolean
+  all_contracts_valid: boolean
+}
+
+// ── Executable Pipelines ────────────────────────────────────────
+export interface PipelineStage {
+  table_name: string
+  depends_on: string[]
+  gate_required: boolean
+  contract_required: boolean
+}
+
+export interface ExecutablePipeline {
+  id: string
+  name: string
+  stages: PipelineStage[]
+  status: string
+  last_run: string | null
+  total_runs: number
+}
+
+export interface PipelineStageResult {
+  table_name: string
+  status: string
+  rows: number
+  duration_ms: number
+  gate_results: GateResult[]
+  gates_passed: boolean
+  contract_valid: boolean
+  error: string | null
+}
+
+export interface PipelineRunResult {
+  pipeline_id: string
+  pipeline_name: string
+  status: string
+  total_duration_ms: number
+  stages: PipelineStageResult[]
+}
+
+// ── Time-Travel Debugging ───────────────────────────────────────
+export interface ExecutionSummary {
+  execution_id: string
+  version: number
+  status: string
+  rows_produced: number | null
+  duration_ms: number
+  cost_usd: number
+  started_at: string
+}
+
+export interface DataDiffSummary {
+  row_count_diff: number
+  row_count_pct: number
+  duration_diff_ms: number
+  cost_diff_usd: number
+  regressions: RegressionMetric[]
+}
+
+export interface UpstreamChange {
+  table_name: string
+  changed_at: string | null
+  version_before: number | null
+  version_after: number | null
+}
+
+export interface DebugResult {
+  table_name: string
+  bad_execution: ExecutionSummary | null
+  good_execution: ExecutionSummary | null
+  code_diff: { from_version: number; to_version: number; lines_added: number; lines_removed: number; lines_changed: number; diff_lines: DiffLine[] } | null
+  data_diff: DataDiffSummary
+  root_cause_lines: string[]
+  upstream_changes: UpstreamChange[]
+}
+
+// ── Data Products ───────────────────────────────────────────────
+export interface DataProduct {
+  id: string
+  name: string
+  table_name: string
+  contract_id: string | null
+  sla_freshness_hours: number
+  sla_quality_score: number
+  owner: string
+  consumers: string[]
+  certification: string
+  description: string
+}
+
+export interface FreshnessStatus {
+  sla_hours: number
+  actual_hours: number
+  within_sla: boolean
+}
+
+export interface AuditCostSummary {
+  total_cost_usd: number
+  total_saved_usd: number
+  total_executions: number
+  total_skipped: number
+}
+
+export interface DataProductAudit {
+  product: DataProduct
+  provenance_chain_length: number
+  contract_validation: ContractValidationResult | null
+  gate_pass_rate: number
+  freshness_status: FreshnessStatus
+  quality_score: number
+  cost_summary: AuditCostSummary
+  upstream_chain: string[]
+  certification_eligible: boolean
+  compliance_issues: string[]
 }

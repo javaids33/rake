@@ -4,7 +4,8 @@ import { useAppStore } from '../../stores/app'
 import {
   Home, Terminal, Database, FolderInput, Radio, Search,
   GitBranch, Clock, Settings, Info, Layers, PanelLeftClose, PanelLeft,
-  Gauge, ShieldCheck, Timer, Sun, Moon, ArrowLeftRight, Plus,
+  Gauge, ShieldCheck, Timer, Sun, Moon, ArrowLeftRight, Plus, FileText,
+  Activity, Zap,
 } from 'lucide-react'
 
 interface NavItem {
@@ -32,6 +33,7 @@ const sections: NavSection[] = [
     title: 'SQL',
     items: [
       { to: '/sql', icon: Terminal, label: 'SQL Editor', accent: 'amber' },
+      { to: '/notebooks', icon: FileText, label: 'Notebooks', accent: 'violet' },
       { to: '/history', icon: Layers, label: 'Query History', accent: 'emerald' },
     ],
   },
@@ -41,6 +43,8 @@ const sections: NavSection[] = [
       { to: '/streaming', icon: Radio, label: 'Streaming / CDC', accent: 'cyan' },
       { to: '/transforms', icon: GitBranch, label: 'Transforms', accent: 'violet' },
       { to: '/quality', icon: ShieldCheck, label: 'Data Quality', accent: 'cyan' },
+      { to: '/data-models', icon: Zap, label: 'Data Models', accent: 'amber' },
+      { to: '/data-products', icon: ShieldCheck, label: 'Data Products', accent: 'emerald' },
       { to: '/migration', icon: ArrowLeftRight, label: 'Migration', accent: 'rose' },
     ],
   },
@@ -53,6 +57,7 @@ const sections: NavSection[] = [
   {
     title: 'Infrastructure',
     items: [
+      { to: '/workflow', icon: Activity, label: 'Workflow Viz', accent: 'rose' },
       { to: '/metrics', icon: Gauge, label: 'Engine Metrics', accent: 'emerald' },
       { to: '/benchmarks', icon: Timer, label: 'Benchmarks', accent: 'amber' },
       { to: '/settings', icon: Settings, label: 'Settings', accent: 'zinc' },

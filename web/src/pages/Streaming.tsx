@@ -470,9 +470,9 @@ export function Streaming() {
                       <div className="mt-4 pt-4 border-t border-white/[0.04]">
                         {/* Quick actions row */}
                         <div className="flex items-center gap-2 mb-4">
-                          <Tooltip content={`SELECT * FROM ${p.sink_table.replace('iceberg://', '')} LIMIT 100`} position="bottom">
+                          <Tooltip content={`SELECT * FROM ${p.name.replace(/-/g, '_').replace(/ /g, '_')} LIMIT 100`} position="bottom">
                             <button
-                              onClick={(e) => { e.stopPropagation(); navigate('/sql', { state: { sql: `SELECT * FROM ${p.sink_table.replace('iceberg://', '').replace('s3://', '')} LIMIT 100;` } }) }}
+                              onClick={(e) => { e.stopPropagation(); navigate('/sql', { state: { sql: `-- CDC sink table: ${p.sink_table}\nSELECT * FROM ${p.name.replace(/-/g, '_').replace(/ /g, '_')} LIMIT 100;` } }) }}
                               className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-amber-400/10 border border-amber-400/20 text-amber-400 text-2xs font-medium hover:bg-amber-400/15 transition-colors"
                             >
                               <Terminal className="w-3 h-3" /> Query Sink

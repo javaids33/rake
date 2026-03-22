@@ -3,13 +3,13 @@ import { Link, useNavigate } from 'react-router-dom'
 import { cn, formatRelativeTime } from '../lib/utils'
 import {
   getTables, getQueryHistory, getTransforms, getSchedules,
-  getPipelines, getConnections,
+  getPipelines, getConnections, getS3Configs,
 } from '../api/client'
-import type { QueryHistoryEntry, ConnectionEntry } from '../types'
+import type { QueryHistoryEntry, ConnectionEntry, S3Config } from '../types'
 import {
   Database, Terminal, Radio, Search, Clock, Activity,
   ArrowRight, GitBranch, FileText, BarChart3,
-  Plus, Command, Upload, Server, Zap,
+  Plus, Command, Upload, Server, Zap, HardDrive, Snowflake,
 } from 'lucide-react'
 
 const TYPE_CONFIG: Record<string, { icon: typeof Terminal; color: string }> = {
@@ -19,6 +19,8 @@ const TYPE_CONFIG: Record<string, { icon: typeof Terminal; color: string }> = {
   Transform: { icon: Activity, color: 'text-violet-400' },
   Job: { icon: Clock, color: 'text-amber-400' },
   Connection: { icon: Server, color: 'text-emerald-400' },
+  'S3 Bucket': { icon: HardDrive, color: 'text-cyan-400' },
+  'Executable': { icon: Zap, color: 'text-amber-400' },
 }
 
 interface RecentItem {
@@ -37,6 +39,8 @@ export function Home() {
   const [transformCount, setTransformCount] = useState(0)
   const [jobCount, setJobCount] = useState(0)
   const [pipelineCount, setPipelineCount] = useState(0)
+  const [s3Configs, setS3Configs] = useState<S3Config[]>([])
+  const [executableTableCount, setExecutableTableCount] = useState(0)
   const [filter, setFilter] = useState<'suggested' | 'queries' | 'tables' | 'connections'>('suggested')
 
   useEffect(() => {
@@ -49,6 +53,8 @@ export function Home() {
     getSchedules().then(r => setJobCount(r.schedules?.length || 0)).catch(() => {})
     getPipelines().then(r => setPipelineCount(r.pipelines?.length || 0)).catch(() => {})
     getConnections().then(r => setConnections(r.connections || [])).catch(() => {})
+    getS3Configs().then(r => setS3Configs(r.configs || [])).catch(() => {})
+    fetch('/api/v1/executable-tables').then(r => r.json()).then(d => setExecutableTableCount(d.count || 0)).catch(() => {})
   }, [])
 
   // Build unified recent items list
@@ -72,6 +78,18 @@ export function Home() {
         to: '/sources',
       })
     }
+    // S3/Iceberg buckets
+    for (const s of s3Configs) {
+      const tableCount = s.tables?.length || 0
+      const formatInfo = s.format_counts ? Object.entries(s.format_counts).map(([k,v]) => `${v} ${k}`).join(', ') : ''
+      items.push({
+        name: `${s.name}`,
+        path: `${s.endpoint}/${s.bucket} — ${tableCount} tables${formatInfo ? ` (${formatInfo})` : ''} — ${s.status}`,
+        type: 'S3 Bucket',
+        viewedAt: s.created_at,
+        to: '/sources',
+      })
+    }
     // Sort by most recent
     items.sort((a, b) => {
       if (!a.viewedAt) return 1
@@ -79,7 +97,7 @@ export function Home() {
       return new Date(b.viewedAt).getTime() - new Date(a.viewedAt).getTime()
     })
     return items
-  }, [recentQueries, connections])
+  }, [recentQueries, connections, s3Configs])
 
   const filteredItems = useMemo(() => {
     if (filter === 'queries') return recentItems.filter(i => i.type === 'Query')
@@ -218,9 +236,11 @@ export function Home() {
       </div>
 
       {/* Quick stats footer */}
-      <div className="flex items-center gap-6 mt-auto pt-6 text-2xs text-zinc-600">
+      <div className="flex items-center gap-6 mt-auto pt-6 text-2xs text-zinc-600 flex-wrap">
         <Link to="/catalog" className="hover:text-zinc-400 transition-colors">{tableNames.length} tables</Link>
         <Link to="/sources" className="hover:text-zinc-400 transition-colors">{connections.length} connections</Link>
+        <Link to="/sources" className="hover:text-cyan-400 transition-colors">{s3Configs.length} S3 buckets</Link>
+        <Link to="/executable-tables" className="hover:text-amber-400 transition-colors">{executableTableCount} executable tables</Link>
         <Link to="/scheduler" className="hover:text-zinc-400 transition-colors">{jobCount} jobs</Link>
         <Link to="/streaming" className="hover:text-zinc-400 transition-colors">{pipelineCount} pipelines</Link>
         <Link to="/transforms" className="hover:text-zinc-400 transition-colors">{transformCount} transforms</Link>

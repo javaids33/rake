@@ -13,7 +13,8 @@ import { Tabs } from '../components/ui/Tabs'
 import { Modal } from '../components/ui/Modal'
 import { Input } from '../components/ui/Input'
 import { cn, formatDuration, QUERY_TYPE_COLORS } from '../lib/utils'
-import { executeSql, explainSql, estimateQuery, compareSql, getTables, getTableSchema, getConnections, getS3Configs, trinoBrowse, trinoColumns, trinoRefresh } from '../api/client'
+import { executeSql, explainSql, estimateQuery, compareSql, profileSql, getTables, getTableSchema, getConnections, getS3Configs, trinoBrowse, trinoColumns, trinoRefresh } from '../api/client'
+import type { SqlProfileResponse } from '../api/client'
 import { useWebSocket } from '../hooks/useWebSocket'
 import { useServerEvents } from '../components/layout/Shell'
 import type { SqlResponse } from '../types'
@@ -51,7 +52,9 @@ export function SqlEditorPage() {
       window.history.replaceState({}, '')
     }
   }, [location.state])
-  const result = store.results[store.activeTabId]
+  const resultArray = store.results[store.activeTabId]
+  const activeResultIdx = store.activeResultIndex[store.activeTabId] ?? 0
+  const result = resultArray ? resultArray[activeResultIdx] ?? resultArray[0] ?? null : null
   const error = store.errors[store.activeTabId]
   const loading = store.loading[store.activeTabId]
 
@@ -85,6 +88,8 @@ export function SqlEditorPage() {
   const [engineChoice, setEngineChoice] = useState<string>('auto')
   const [compareResult, setCompareResult] = useState<SqlCompareResponse | null>(null)
   const [comparing, setComparing] = useState(false)
+  const [profileResult, setProfileResult] = useState<SqlProfileResponse | null>(null)
+  const [profiling, setProfiling] = useState(false)
   // Trino catalog browser state
   const [trinoCatalogs, setTrinoCatalogs] = useState<Record<string, { catalogs: Array<{ name: string; schemas: Array<{ name: string; tables: string[] }> }>; cached_at: string | null; total_tables: number }>>({})
   const [expandedTrinoCatalog, setExpandedTrinoCatalog] = useState<Set<string>>(new Set()) // "connId:catalog"
@@ -245,6 +250,29 @@ export function SqlEditorPage() {
     }
   }, [cancelQuery])
 
+  /** Split SQL text into individual statements, respecting quoted strings. */
+  const splitStatements = useCallback((sql: string): string[] => {
+    const statements: string[] = []
+    let current = ''
+    let inSingleQuote = false
+    let inDoubleQuote = false
+    for (let i = 0; i < sql.length; i++) {
+      const ch = sql[i]
+      if (ch === "'" && !inDoubleQuote) inSingleQuote = !inSingleQuote
+      else if (ch === '"' && !inSingleQuote) inDoubleQuote = !inDoubleQuote
+      if (ch === ';' && !inSingleQuote && !inDoubleQuote) {
+        const trimmed = current.trim()
+        if (trimmed) statements.push(trimmed)
+        current = ''
+      } else {
+        current += ch
+      }
+    }
+    const trimmed = current.trim()
+    if (trimmed) statements.push(trimmed)
+    return statements
+  }, [])
+
   const runQuery = useCallback(async () => {
     const sql = activeTab.sql.trim()
     if (!sql) return
@@ -252,82 +280,121 @@ export function SqlEditorPage() {
     store.setLoading(tabId, true)
     store.setError(tabId, null)
 
-    // ── WebSocket streaming path ──
-    if (wsConnected) {
-      const queryId = crypto.randomUUID()
-      activeQueryIdRef.current = queryId
-      streamedRowsRef.current = []
-      streamedColumnsRef.current = []
+    const statements = splitStatements(sql)
 
-      sendQuery(queryId, sql, engineChoice, {
-        onStart: () => {
-          store.setResult(tabId, null)
-        },
-        onRows: (msg) => {
-          streamedRowsRef.current = streamedRowsRef.current.concat(msg.rows)
-          if (streamedColumnsRef.current.length === 0) {
-            streamedColumnsRef.current = msg.columns
-          }
-          // Batch UI updates via rAF to avoid per-chunk re-renders
-          cancelAnimationFrame(rafRef.current)
-          rafRef.current = requestAnimationFrame(() => {
-            const partial: SqlResponse = {
-              query_id: queryId,
+    // Single statement — use WebSocket streaming if available
+    if (statements.length <= 1) {
+      const singleSql = statements[0] || sql
+
+      if (wsConnected) {
+        const queryId = crypto.randomUUID()
+        activeQueryIdRef.current = queryId
+        streamedRowsRef.current = []
+        streamedColumnsRef.current = []
+
+        sendQuery(queryId, singleSql, engineChoice, {
+          onStart: () => {
+            store.setResult(tabId, null)
+          },
+          onRows: (msg) => {
+            streamedRowsRef.current = streamedRowsRef.current.concat(msg.rows)
+            if (streamedColumnsRef.current.length === 0) {
+              streamedColumnsRef.current = msg.columns
+            }
+            cancelAnimationFrame(rafRef.current)
+            rafRef.current = requestAnimationFrame(() => {
+              const partial: SqlResponse = {
+                query_id: queryId,
+                columns: streamedColumnsRef.current,
+                rows: streamedRowsRef.current,
+                row_count: streamedRowsRef.current.length,
+                query_type: 'STREAMING',
+                duration_ms: 0,
+                engine: engineChoice === 'auto' ? 'datafusion' : engineChoice,
+              }
+              store.setResult(tabId, partial)
+            })
+          },
+          onComplete: (msg) => {
+            cancelAnimationFrame(rafRef.current)
+            activeQueryIdRef.current = null
+            const final: SqlResponse = {
+              query_id: msg.query_id,
               columns: streamedColumnsRef.current,
               rows: streamedRowsRef.current,
-              row_count: streamedRowsRef.current.length,
-              query_type: 'STREAMING',
-              duration_ms: 0,
-              engine: engineChoice === 'auto' ? 'datafusion' : engineChoice,
+              row_count: msg.row_count,
+              query_type: msg.query_type,
+              duration_ms: msg.duration_ms,
+              parse_ms: msg.parse_ms,
+              exec_ms: msg.exec_ms,
+              engine: msg.engine,
             }
-            store.setResult(tabId, partial)
-          })
-        },
-        onComplete: (msg) => {
-          cancelAnimationFrame(rafRef.current)
-          activeQueryIdRef.current = null
-          const final: SqlResponse = {
-            query_id: msg.query_id,
-            columns: streamedColumnsRef.current,
-            rows: streamedRowsRef.current,
-            row_count: msg.row_count,
-            query_type: msg.query_type,
-            duration_ms: msg.duration_ms,
-            parse_ms: msg.parse_ms,
-            exec_ms: msg.exec_ms,
-            engine: msg.engine,
-          }
-          store.setResult(tabId, final)
-          store.setLoading(tabId, false)
-        },
-        onError: (msg) => {
-          cancelAnimationFrame(rafRef.current)
-          activeQueryIdRef.current = null
-          store.setError(tabId, msg.error)
-          store.setResult(tabId, null)
-          store.setLoading(tabId, false)
-        },
-        onCancelled: () => {
-          cancelAnimationFrame(rafRef.current)
-          activeQueryIdRef.current = null
-          store.setError(tabId, 'Query cancelled')
-          store.setLoading(tabId, false)
-        },
-      })
+            store.setResult(tabId, final)
+            store.setLoading(tabId, false)
+          },
+          onError: (msg) => {
+            cancelAnimationFrame(rafRef.current)
+            activeQueryIdRef.current = null
+            store.setError(tabId, msg.error)
+            store.setResult(tabId, null)
+            store.setLoading(tabId, false)
+          },
+          onCancelled: () => {
+            cancelAnimationFrame(rafRef.current)
+            activeQueryIdRef.current = null
+            store.setError(tabId, 'Query cancelled')
+            store.setLoading(tabId, false)
+          },
+        })
+        return
+      }
+
+      // HTTP fallback for single statement
+      try {
+        const res = await executeSql(singleSql, engineChoice)
+        store.setResult(tabId, res)
+      } catch (e) {
+        store.setError(tabId, (e as Error).message)
+        store.setResult(tabId, null)
+      } finally {
+        store.setLoading(tabId, false)
+      }
       return
     }
 
-    // ── HTTP fallback path ──
-    try {
-      const res = await executeSql(sql, engineChoice)
-      store.setResult(tabId, res)
-    } catch (e) {
-      store.setError(tabId, (e as Error).message)
-      store.setResult(tabId, null)
-    } finally {
-      store.setLoading(tabId, false)
+    // ── Multi-statement execution (HTTP only, sequential) ──
+    const results: SqlResponse[] = []
+    store.setResult(tabId, null)
+    store.setActiveResultIndex(tabId, 0)
+
+    for (let i = 0; i < statements.length; i++) {
+      try {
+        const res = await executeSql(statements[i], engineChoice)
+        // Tag each result with a statement label
+        results.push({ ...res, query_type: `${res.query_type} [${i + 1}/${statements.length}]` })
+        store.setResult(tabId, [...results])
+        store.setActiveResultIndex(tabId, i)
+      } catch (e) {
+        // Record error as a result entry so user sees which statement failed
+        results.push({
+          query_id: crypto.randomUUID(),
+          columns: ['error'],
+          rows: [{ error: (e as Error).message }],
+          row_count: 0,
+          query_type: `ERROR [${i + 1}/${statements.length}]`,
+          duration_ms: 0,
+          engine: engineChoice,
+        })
+        store.setResult(tabId, [...results])
+        store.setActiveResultIndex(tabId, i)
+        // Stop on error — remaining statements not executed
+        store.setError(tabId, `Statement ${i + 1} failed: ${(e as Error).message}`)
+        break
+      }
     }
-  }, [activeTab, store, engineChoice, wsConnected, sendQuery])
+
+    store.setLoading(tabId, false)
+  }, [activeTab, store, engineChoice, wsConnected, sendQuery, splitStatements])
 
   const runExplain = useCallback(async () => {
     const sql = activeTab.sql.trim()
@@ -375,6 +442,20 @@ export function SqlEditorPage() {
       store.setError(store.activeTabId, (e as Error).message)
     }
     setComparing(false)
+  }
+
+  const handleProfile = async () => {
+    const sql = activeTab.sql.trim()
+    if (!sql) return
+    setProfiling(true)
+    setProfileResult(null)
+    try {
+      const res = await profileSql(sql)
+      setProfileResult(res)
+    } catch (e) {
+      toast.error('Profile failed: ' + (e as Error).message)
+    }
+    setProfiling(false)
   }
 
   const toggleConn = (id: string) => {
@@ -647,6 +728,22 @@ export function SqlEditorPage() {
           <Button variant="ghost" size="sm" icon={<ArrowLeftRight className="w-3.5 h-3.5 text-cyan-400" />} onClick={handleCompare} loading={comparing}>
             <span className="text-cyan-400">Compare All</span>
           </Button>
+          <Button variant="ghost" size="sm" icon={<Gauge className="w-3.5 h-3.5 text-violet-400" />} onClick={handleProfile} loading={profiling}>
+            <span className="text-violet-400">Audit</span>
+          </Button>
+          <Tooltip content="Save as Executable Table" position="bottom">
+            <button
+              onClick={() => {
+                const sql = activeTab.sql.trim()
+                if (!sql) { toast.error('Write a query first'); return }
+                navigate(`/data-models?create=true&type=sql&sql=${encodeURIComponent(sql)}`)
+              }}
+              className="flex items-center gap-1 px-2 py-1 rounded-md text-2xs text-amber-400/80 border border-amber-500/20 bg-amber-500/5 hover:bg-amber-500/10 hover:text-amber-400 transition-colors"
+            >
+              <Zap className="w-3 h-3" />
+              <span>Exec Table</span>
+            </button>
+          </Tooltip>
           <Tooltip content="Command Palette — search tables, pages, actions" position="bottom">
             <button
               onClick={() => setCmdPaletteOpen(true)}
@@ -774,6 +871,151 @@ export function SqlEditorPage() {
             </div>
           )}
 
+          {/* Query Audit Panel */}
+          {profileResult && (
+            <div className="px-4 py-3 border-b border-white/[0.04] bg-navy-950/60 max-h-[340px] overflow-y-auto">
+              <div className="flex items-center justify-between mb-3">
+                <div className="flex items-center gap-2">
+                  <Gauge className="w-3.5 h-3.5 text-violet-400" />
+                  <span className="text-xs font-semibold text-zinc-200">Query Audit — Cost Breakdown</span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="text-2xs text-zinc-500">
+                    {profileResult.profile.tables.length} table{profileResult.profile.tables.length !== 1 ? 's' : ''} ·{' '}
+                    {profileResult.profile.estimated_scan_size} ·{' '}
+                    selectivity {(profileResult.adaptive.selectivity * 100).toFixed(0)}%
+                  </span>
+                  <button onClick={() => setProfileResult(null)} className="text-zinc-600 hover:text-zinc-400 transition-colors">
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              </div>
+
+              {/* Data characteristics */}
+              <div className="flex flex-wrap gap-2 mb-3">
+                {profileResult.profile.tables.map(t => (
+                  <span key={t.name} className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-2xs border border-white/[0.06] bg-white/[0.02]">
+                    <Database className="w-3 h-3 text-zinc-500" />
+                    <span className="text-zinc-300">{t.name}</span>
+                    <span className={cn('px-1 rounded text-2xs font-medium',
+                      t.source === 'Federated' ? 'bg-blue-500/15 text-blue-400' :
+                      t.source === 'S3Parquet' || t.source === 'S3Iceberg' ? 'bg-emerald-500/15 text-emerald-400' :
+                      t.source === 'Trino' ? 'bg-purple-500/15 text-purple-400' :
+                      'bg-zinc-500/15 text-zinc-400'
+                    )}>{t.source}</span>
+                    <span className="text-zinc-600">~{t.estimated_rows.toLocaleString()} rows</span>
+                  </span>
+                ))}
+                {profileResult.profile.has_aggregation && <Badge className="bg-amber-500/10 text-amber-400 border-amber-500/20 text-2xs">GROUP BY</Badge>}
+                {profileResult.profile.has_join && <Badge className="bg-rose-500/10 text-rose-400 border-rose-500/20 text-2xs">JOIN</Badge>}
+                {profileResult.profile.has_sort && <Badge className="bg-indigo-500/10 text-indigo-400 border-indigo-500/20 text-2xs">ORDER BY</Badge>}
+                {profileResult.profile.has_federated_source && <Badge className="bg-blue-500/10 text-blue-400 border-blue-500/20 text-2xs">FEDERATED</Badge>}
+              </div>
+
+              {/* Per-engine cost breakdown bars */}
+              <div className="space-y-2 mb-3">
+                {profileResult.cost_estimates
+                  .filter(e => e.total_ms < 1e300)
+                  .sort((a, b) => a.total_ms - b.total_ms)
+                  .map((est, i) => {
+                    const maxMs = Math.max(...profileResult.cost_estimates.filter(e => e.total_ms < 1e300).map(e => e.total_ms))
+                    const pct = maxMs > 0 ? (est.total_ms / maxMs) * 100 : 0
+                    const isRecommended = est.engine === profileResult.recommended.engine
+                    const color = est.engine === 'DuckDB' ? 'emerald' : est.engine === 'Polars' ? 'cyan' : 'amber'
+                    return (
+                      <div key={est.engine} className="group">
+                        <div className="flex items-center gap-2 mb-0.5">
+                          <span className={cn(
+                            'w-20 text-2xs font-bold',
+                            color === 'amber' ? 'text-amber-400' : color === 'emerald' ? 'text-emerald-400' : 'text-cyan-400'
+                          )}>
+                            {est.engine} {isRecommended && '★'}
+                          </span>
+                          <div className="flex-1 h-3.5 bg-white/[0.03] rounded-sm overflow-hidden relative">
+                            {/* Stacked bar: scan | compute | transfer | overhead */}
+                            <div className="absolute inset-0 flex">
+                              {est.scan_ms > 0 && (
+                                <div className="h-full bg-sky-500/50" style={{ width: `${(est.scan_ms / est.total_ms) * pct}%` }} title={`Scan: ${est.scan_ms.toFixed(2)}ms`} />
+                              )}
+                              {est.compute_ms > 0 && (
+                                <div className="h-full bg-amber-500/50" style={{ width: `${(est.compute_ms / est.total_ms) * pct}%` }} title={`Compute: ${est.compute_ms.toFixed(2)}ms`} />
+                              )}
+                              {est.transfer_ms > 0 && (
+                                <div className="h-full bg-rose-500/50" style={{ width: `${(est.transfer_ms / est.total_ms) * pct}%` }} title={`Transfer: ${est.transfer_ms.toFixed(1)}ms`} />
+                              )}
+                              {est.overhead_ms > 0 && (
+                                <div className="h-full bg-zinc-500/50" style={{ width: `${(est.overhead_ms / est.total_ms) * pct}%` }} title={`Overhead: ${est.overhead_ms.toFixed(1)}ms`} />
+                              )}
+                            </div>
+                          </div>
+                          <span className="w-20 text-right text-2xs font-mono text-zinc-300">{est.total_ms.toFixed(1)}ms</span>
+                          <span className={cn('w-14 text-2xs font-medium',
+                            est.execution_mode === 'direct' ? 'text-sky-400' :
+                            est.execution_mode === 'cached' ? 'text-violet-400' :
+                            'text-orange-400'
+                          )}>{est.execution_mode}</span>
+                        </div>
+                        {/* Expandable notes on hover */}
+                        <div className="hidden group-hover:flex flex-wrap gap-1 ml-[88px] mt-0.5">
+                          {est.notes.slice(0, -1).map((n, j) => (
+                            <span key={j} className="text-[9px] text-zinc-600 bg-white/[0.02] px-1.5 py-0.5 rounded">{n}</span>
+                          ))}
+                        </div>
+                      </div>
+                    )
+                  })}
+              </div>
+
+              {/* Legend */}
+              <div className="flex items-center gap-4 mb-3">
+                <div className="flex items-center gap-1"><div className="w-2.5 h-2.5 rounded-sm bg-sky-500/50" /><span className="text-[9px] text-zinc-600">Scan</span></div>
+                <div className="flex items-center gap-1"><div className="w-2.5 h-2.5 rounded-sm bg-amber-500/50" /><span className="text-[9px] text-zinc-600">Compute</span></div>
+                <div className="flex items-center gap-1"><div className="w-2.5 h-2.5 rounded-sm bg-rose-500/50" /><span className="text-[9px] text-zinc-600">Transfer</span></div>
+                <div className="flex items-center gap-1"><div className="w-2.5 h-2.5 rounded-sm bg-zinc-500/50" /><span className="text-[9px] text-zinc-600">Overhead</span></div>
+              </div>
+
+              {/* Adaptive recommendation */}
+              <div className="rounded-lg border border-violet-500/20 bg-violet-500/[0.04] p-2.5">
+                <div className="flex items-center justify-between mb-1">
+                  <span className="text-2xs font-semibold text-violet-300">Adaptive Recommendation</span>
+                  <span className="text-2xs text-zinc-500">confidence {(profileResult.adaptive.confidence * 100).toFixed(0)}%</span>
+                </div>
+                <div className="text-xs text-zinc-300 mb-1">{profileResult.adaptive.reasoning}</div>
+                <div className="flex items-center gap-2">
+                  <span className="text-2xs text-zinc-500">Strategy: {profileResult.adaptive.strategy}</span>
+                  {profileResult.split_plan && (
+                    <Badge className="bg-orange-500/10 text-orange-400 border-orange-500/20 text-2xs">
+                      Split Plan saves {Math.abs(profileResult.split_plan.vs_single_best_ms).toFixed(0)}ms
+                    </Badge>
+                  )}
+                </div>
+              </div>
+
+              {/* Workload context */}
+              {profileResult.workload_context && (
+                <div className="rounded-lg border border-white/[0.04] bg-white/[0.02] p-2 mt-2 mb-2 flex items-center gap-4 text-2xs">
+                  <span className="text-zinc-500">System:</span>
+                  <span className="text-zinc-400">{profileResult.workload_context.queries_last_5min} queries/5min</span>
+                  {profileResult.workload_context.active_streaming_pipelines > 0 && (
+                    <span className="text-amber-400">{profileResult.workload_context.active_streaming_pipelines} streaming pipelines</span>
+                  )}
+                  {profileResult.workload_context.active_etl_jobs > 0 && (
+                    <span className="text-amber-400">{profileResult.workload_context.active_etl_jobs} ETL jobs</span>
+                  )}
+                  <span className="text-zinc-600">{profileResult.workload_context.note}</span>
+                </div>
+              )}
+
+              {/* Prove the case button */}
+              <div className="mt-2 flex items-center gap-2">
+                <Button variant="ghost" size="sm" icon={<ArrowLeftRight className="w-3 h-3 text-cyan-400" />} onClick={handleCompare} loading={comparing}>
+                  <span className="text-2xs text-cyan-400">Prove it — Run on All Engines</span>
+                </Button>
+                <span className="text-[9px] text-zinc-600">Execute on all engines to validate cost model predictions</span>
+              </div>
+            </div>
+          )}
+
           {/* Results */}
           <div className="flex-1 min-h-0 flex flex-col">
             {error && (
@@ -784,6 +1026,37 @@ export function SqlEditorPage() {
 
             {result && (
               <>
+                {/* Multi-statement result tabs */}
+                {resultArray && resultArray.length > 1 && (
+                  <div className="flex items-center gap-0.5 px-4 py-1.5 border-b border-white/[0.03] bg-navy-950/60 overflow-x-auto">
+                    <span className="text-2xs text-zinc-600 mr-2">Results:</span>
+                    {resultArray.map((r, i) => {
+                      const isError = r.query_type.startsWith('ERROR')
+                      const isActive = i === activeResultIdx
+                      return (
+                        <button
+                          key={i}
+                          onClick={() => store.setActiveResultIndex(store.activeTabId, i)}
+                          className={cn(
+                            'px-2 py-0.5 rounded text-2xs font-mono transition-colors border',
+                            isActive
+                              ? 'bg-amber-500/10 text-amber-400 border-amber-500/30'
+                              : isError
+                                ? 'bg-rose-500/5 text-rose-400/60 border-rose-500/20 hover:bg-rose-500/10'
+                                : 'bg-white/[0.02] text-zinc-500 border-white/[0.04] hover:bg-white/[0.04] hover:text-zinc-300'
+                          )}
+                        >
+                          {i + 1}{isError ? ' ✗' : ''} · {r.row_count} row{r.row_count !== 1 ? 's' : ''} · {r.duration_ms}ms
+                          {r.engine && ` · ${r.engine}`}
+                        </button>
+                      )
+                    })}
+                    <span className="text-2xs text-zinc-600 ml-2">
+                      Total: {resultArray.reduce((s, r) => s + r.duration_ms, 0)}ms
+                    </span>
+                  </div>
+                )}
+
                 {/* Result toolbar */}
                 <div className="flex items-center justify-between px-4 py-2 border-b border-white/[0.03] bg-navy-950/40">
                   <div className="flex items-center gap-3">
@@ -900,6 +1173,24 @@ export function SqlEditorPage() {
                               : 'bg-amber-500/10 text-amber-400 border-amber-500/30'
                         )}>
                           {result.engine}
+                        </span>
+                      </Tooltip>
+                    )}
+                    {result.execution_mode && (
+                      <Tooltip content={
+                        result.execution_mode === 'direct' ? 'Engine read data directly from source (S3/federated)' :
+                        result.execution_mode === 'cached' ? 'Engine used previously synced in-memory data' :
+                        'DataFusion fetched data, then synced to engine'
+                      } position="bottom">
+                        <span className={cn(
+                          'inline-flex items-center px-2 py-0.5 rounded-md text-2xs font-medium border',
+                          result.execution_mode === 'direct'
+                            ? 'bg-sky-500/10 text-sky-400 border-sky-500/30'
+                            : result.execution_mode === 'cached'
+                              ? 'bg-violet-500/10 text-violet-400 border-violet-500/30'
+                              : 'bg-orange-500/10 text-orange-400 border-orange-500/30'
+                        )}>
+                          {result.execution_mode}
                         </span>
                       </Tooltip>
                     )}

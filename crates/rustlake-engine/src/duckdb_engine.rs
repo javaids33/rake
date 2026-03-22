@@ -38,6 +38,16 @@ impl DuckDbEngine {
                 .map_err(|e| RustLakeError::DuckDb(format!("Failed to set threads: {}", e)))?;
         }
 
+        // Install and load S3/Iceberg/Delta extensions for direct lake access
+        // These are bundled with DuckDB 1.4+ when using the "bundled" feature
+        let extensions = ["httpfs", "iceberg", "delta", "parquet"];
+        for ext in &extensions {
+            match conn.execute_batch(&format!("INSTALL {}; LOAD {};", ext, ext)) {
+                Ok(_) => tracing::info!(extension = ext, "DuckDB: extension loaded"),
+                Err(e) => tracing::debug!(extension = ext, error = %e, "DuckDB: extension not available (non-fatal)"),
+            }
+        }
+
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -191,6 +201,37 @@ impl DuckDbEngine {
             }
         }
         Ok(synced)
+    }
+
+    /// Configure S3 credentials so DuckDB can directly read S3/Iceberg/Delta tables.
+    pub async fn configure_s3(&self, access_key: &str, secret_key: &str, region: &str, endpoint: Option<&str>) -> Result<()> {
+        let conn = self.conn.clone();
+        let sql = format!(
+            "SET s3_access_key_id='{}'; SET s3_secret_access_key='{}'; SET s3_region='{}';{}{}",
+            access_key, secret_key, region,
+            endpoint.map(|ep| format!(" SET s3_endpoint='{}';", ep.trim_start_matches("http://").trim_start_matches("https://"))).unwrap_or_default(),
+            if endpoint.map(|ep| ep.starts_with("http://")).unwrap_or(false) { " SET s3_use_ssl=false; SET s3_url_style='path';" } else { "" },
+        );
+
+        tokio::task::spawn_blocking(move || {
+            let conn = conn.lock().map_err(|e| RustLakeError::DuckDb(format!("Lock: {}", e)))?;
+            conn.execute_batch(&sql).map_err(|e| RustLakeError::DuckDb(format!("S3 config: {}", e)))?;
+            Ok(())
+        }).await.map_err(|e| RustLakeError::DuckDb(format!("spawn_blocking: {}", e)))?
+    }
+
+    /// Query an S3 Parquet file directly (no DataFusion sync needed).
+    /// Returns "direct" execution mode — DuckDB reads from S3 itself.
+    pub async fn query_s3_parquet(&self, s3_path: &str) -> Result<Vec<RecordBatch>> {
+        let sql = format!("SELECT * FROM read_parquet('{}')", s3_path);
+        self.sql(&sql).await
+    }
+
+    /// Query an Iceberg table directly from S3 metadata.
+    /// Requires the iceberg extension to be loaded.
+    pub async fn query_iceberg(&self, metadata_path: &str) -> Result<Vec<RecordBatch>> {
+        let sql = format!("SELECT * FROM iceberg_scan('{}')", metadata_path);
+        self.sql(&sql).await
     }
 
     /// Get DuckDB version string.

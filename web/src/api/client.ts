@@ -163,6 +163,47 @@ export interface SqlCompareResponse {
 export const compareSql = (sql: string) =>
   request<SqlCompareResponse>('/api/v1/sql/compare', { method: 'POST', body: JSON.stringify({ sql }) })
 
+// Profile SQL — cost analysis without execution
+export interface CostEstimate {
+  engine: string
+  total_ms: number
+  scan_ms: number
+  compute_ms: number
+  transfer_ms: number
+  overhead_ms: number
+  execution_mode: string
+  notes: string[]
+}
+export interface SqlProfileResponse {
+  sql: string
+  profile: {
+    estimated_rows: number
+    estimated_bytes: number
+    estimated_scan_size: string
+    has_aggregation: boolean
+    has_join: boolean
+    has_sort: boolean
+    has_federated_source: boolean
+    tables: { name: string; source: string; estimated_rows: number; estimated_bytes: number }[]
+  }
+  cost_estimates: CostEstimate[]
+  recommended: { engine: string; total_ms: number; execution_mode: string; notes: string[] }
+  split_plan: { fragments: { table: string; engine: string; estimated_ms: number; execution_mode: string }[]; merge_cost_ms: number; total_ms: number; vs_single_best_ms: number } | null
+  adaptive: { engine: string; confidence: number; reasoning: string; strategy: string; estimated_cost_ms: number; selectivity: number }
+  available_engines: string[]
+  cached_tables: number
+  workload_context: {
+    active_streaming_pipelines: number
+    active_etl_jobs: number
+    total_queries_lifetime: number
+    queries_last_5min: number
+    uptime_secs: number
+    note: string
+  }
+}
+export const profileSql = (sql: string) =>
+  request<SqlProfileResponse>('/api/v1/sql/profile', { method: 'POST', body: JSON.stringify({ sql }) })
+
 // Quality
 export const getQualityChecks = () => request<QualityChecksResponse>('/api/v1/quality/checks')
 export const getQualityRules = () => request<{ rules: QualityRule[] }>('/api/v1/quality/rules')
@@ -261,3 +302,39 @@ export const getMigrationTables = (connId: string) =>
   request<{ tables: MigrationTable[] }>(`/api/v1/migration/${connId}/tables`)
 export const getMigrationComparisons = () =>
   request<{ comparisons: MigrationComparison[] }>('/api/v1/migration/comparisons')
+
+// ── Iceberg Metadata ──────────────────────────────────────────────
+import type { IcebergSnapshotResponse, IcebergSchemasResponse, MaintenanceStatus, IcebergDataFile } from '../types'
+
+export const getTableSnapshots = (name: string) =>
+  request<IcebergSnapshotResponse>(`/api/v1/tables/${name}/snapshots`)
+export const getSnapshotFiles = (name: string, snapshotId: number) =>
+  request<{ table: string; snapshot_id: number; files: IcebergDataFile[]; file_count: number }>(`/api/v1/tables/${name}/snapshots/${snapshotId}/files`)
+export const getTableSchemas = (name: string) =>
+  request<IcebergSchemasResponse>(`/api/v1/tables/${name}/schemas`)
+export const evolveTableSchema = (name: string, changes: Array<Record<string, unknown>>) =>
+  request<{ status: string; metadata_path: string }>(`/api/v1/tables/${name}/schema/evolve`, { method: 'POST', body: JSON.stringify({ changes }) })
+export const getTablePartitions = (name: string) =>
+  request<{ table: string; default_spec_id: number; partition_specs: Array<{ spec_id: number; fields: Array<Record<string, unknown>> }> }>(`/api/v1/tables/${name}/partitions`)
+export const evolveTablePartitions = (name: string, fields: Array<Record<string, unknown>>) =>
+  request<{ status: string; metadata_path: string }>(`/api/v1/tables/${name}/partitions/evolve`, { method: 'POST', body: JSON.stringify({ fields }) })
+export const compactTable = (name: string, targetFileSizeMb = 128) =>
+  request<{ status: string; input_files: number; output_files: number; rows_rewritten: number }>(`/api/v1/tables/${name}/maintenance/compact`, { method: 'POST', body: JSON.stringify({ target_file_size_mb: targetFileSizeMb }) })
+export const expireSnapshots = (name: string, retainLast = 3, olderThanHours = 168) =>
+  request<{ status: string; expired_count: number; expired_ids: number[] }>(`/api/v1/tables/${name}/maintenance/expire-snapshots`, { method: 'POST', body: JSON.stringify({ retain_last: retainLast, older_than_hours: olderThanHours }) })
+export const removeOrphans = (name: string) =>
+  request<{ status: string; orphan_files_found: number; orphan_files_deleted: number; bytes_reclaimed: number }>(`/api/v1/tables/${name}/maintenance/remove-orphans`, { method: 'POST' })
+export const getMaintenanceStatus = (name: string) =>
+  request<MaintenanceStatus>(`/api/v1/tables/${name}/maintenance/status`)
+
+// ── Neo4j Graph Database ──────────────────────────────────────────
+import type { Neo4jConnectResponse, CypherResponse, GraphData } from '../types'
+
+export const neo4jConnect = (host: string, port: number, username: string, password: string, database = 'neo4j') =>
+  request<Neo4jConnectResponse>('/api/v1/neo4j/connect', { method: 'POST', body: JSON.stringify({ host, port, username, password, database }) })
+export const neo4jCypher = (cypher: string, host: string, port: number, username: string, password: string, database = 'neo4j') =>
+  request<CypherResponse>('/api/v1/neo4j/cypher', { method: 'POST', body: JSON.stringify({ cypher, host, port, username, password, database }) })
+export const neo4jSchema = (host: string, port: number, username: string, password: string, database = 'neo4j') =>
+  request<{ schema: Array<{ label: string; properties: string[] }> }>(`/api/v1/neo4j/schema?host=${host}&port=${port}&username=${username}&password=${password}&database=${database}`)
+export const neo4jGraphQuery = (cypher: string, host: string, port: number, username: string, password: string, database = 'neo4j') =>
+  request<GraphData>('/api/v1/neo4j/graph', { method: 'POST', body: JSON.stringify({ cypher, host, port, username, password, database }) })

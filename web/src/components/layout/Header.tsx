@@ -126,6 +126,15 @@ export const Header = memo(function Header({ serverStatus, sseConnected }: Heade
             ))}
           </div>
           <span className={cn('text-2xs', label)}>{runningEngines.length}/{displayEngines.length}</span>
+          <div
+            title="Pyodide WASM — browser-side Python runtime"
+            className={cn(
+              'px-1.5 py-0.5 rounded text-2xs font-mono font-semibold',
+              darkMode ? 'bg-violet-400/10 text-violet-400' : 'bg-violet-50 text-violet-700'
+            )}
+          >
+            WA
+          </div>
         </div>
 
         {/* Tables */}

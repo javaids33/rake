@@ -1,5 +1,5 @@
 import { lazy, Suspense } from 'react'
-import { BrowserRouter, Routes, Route } from 'react-router-dom'
+import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import { Toaster } from 'react-hot-toast'
 import { Shell } from './components/layout/Shell'
 import { Home } from './pages/Home'
@@ -16,7 +16,11 @@ const Migration = lazy(() => import('./pages/Migration').then(m => ({ default: m
 const EngineMetrics = lazy(() => import('./pages/EngineMetrics').then(m => ({ default: m.EngineMetrics })))
 const DataQuality = lazy(() => import('./pages/DataQuality').then(m => ({ default: m.DataQuality })))
 const QueryHistory = lazy(() => import('./pages/QueryHistory').then(m => ({ default: m.QueryHistory })))
+const Notebooks = lazy(() => import('./pages/Notebooks').then(m => ({ default: m.Notebooks })))
 const Settings = lazy(() => import('./pages/Settings').then(m => ({ default: m.Settings })))
+const WorkflowViz = lazy(() => import('./pages/WorkflowViz').then(m => ({ default: m.WorkflowViz })))
+const ExecutableTables = lazy(() => import('./pages/ExecutableTables').then(m => ({ default: m.ExecutableTables })))
+const DataProducts = lazy(() => import('./pages/DataProducts').then(m => ({ default: m.DataProducts })))
 const About = lazy(() => import('./pages/About').then(m => ({ default: m.About })))
 
 function PageLoader() {
@@ -44,7 +48,12 @@ export default function App() {
           <Route path="migration" element={<Suspense fallback={<PageLoader />}><Migration /></Suspense>} />
           <Route path="metrics" element={<Suspense fallback={<PageLoader />}><EngineMetrics /></Suspense>} />
           <Route path="quality" element={<Suspense fallback={<PageLoader />}><DataQuality /></Suspense>} />
+          <Route path="notebooks" element={<Suspense fallback={<PageLoader />}><Notebooks /></Suspense>} />
           <Route path="history" element={<Suspense fallback={<PageLoader />}><QueryHistory /></Suspense>} />
+          <Route path="workflow" element={<Suspense fallback={<PageLoader />}><WorkflowViz /></Suspense>} />
+          <Route path="data-models" element={<Suspense fallback={<PageLoader />}><ExecutableTables /></Suspense>} />
+          <Route path="executable-tables" element={<Navigate to="/data-models" replace />} />
+          <Route path="data-products" element={<Suspense fallback={<PageLoader />}><DataProducts /></Suspense>} />
           <Route path="settings" element={<Suspense fallback={<PageLoader />}><Settings /></Suspense>} />
           <Route path="about" element={<Suspense fallback={<PageLoader />}><About /></Suspense>} />
         </Route>

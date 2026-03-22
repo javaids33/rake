@@ -30,6 +30,13 @@ impl RustLakeContext {
         df_config = df_config.with_information_schema(true);
         df_config.options_mut().catalog.has_header = true;
 
+        // Enable Parquet optimizations for maximum query performance
+        df_config.options_mut().execution.parquet.pushdown_filters = true;
+        df_config.options_mut().execution.parquet.reorder_filters = true;
+        df_config.options_mut().execution.parquet.enable_page_index = true;
+        df_config.options_mut().execution.parquet.bloom_filter_on_read = true;
+        df_config.options_mut().execution.parquet.pruning = true;
+
         // Build SessionState with federation support for cross-source query optimization.
         let mut state_builder = SessionStateBuilder::new()
             .with_config(df_config)

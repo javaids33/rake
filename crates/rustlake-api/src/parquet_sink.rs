@@ -58,6 +58,12 @@ pub struct ParquetSink {
     buffer_rows: usize,
     files_written: u64,
     total_rows_written: u64,
+    /// Track data files written for Iceberg metadata generation
+    data_files: Vec<crate::iceberg_writer::DataFileInfo>,
+    /// Last flushed schema (for Iceberg metadata)
+    last_schema: Option<Arc<arrow::datatypes::Schema>>,
+    /// Bucket name for Iceberg metadata
+    bucket: String,
 }
 
 impl ParquetSink {
@@ -95,6 +101,9 @@ impl ParquetSink {
             buffer_rows: 0,
             files_written: 0,
             total_rows_written: 0,
+            data_files: Vec::new(),
+            last_schema: None,
+            bucket: config.bucket.clone(),
         })
     }
 
@@ -119,9 +128,13 @@ impl ParquetSink {
         let schema = self.buffer[0].schema();
         let rows = self.buffer_rows;
 
-        // Write to in-memory Parquet buffer
+        // Write to in-memory Parquet buffer with optimized settings
         let props = WriterProperties::builder()
             .set_compression(Compression::SNAPPY)
+            .set_statistics_enabled(parquet::file::properties::EnabledStatistics::Page)
+            .set_bloom_filter_enabled(true)
+            .set_max_row_group_size(1024 * 1024) // 1M rows per row group for better pruning
+            .set_write_batch_size(8192)
             .build();
 
         let mut parquet_buf = Vec::new();
@@ -159,6 +172,14 @@ impl ParquetSink {
 
         self.total_rows_written += rows as u64;
 
+        // Track for Iceberg metadata
+        self.data_files.push(crate::iceberg_writer::DataFileInfo {
+            file_path: file_name.clone(),
+            file_size: file_size as u64,
+            row_count: rows as u64,
+        });
+        self.last_schema = Some(schema);
+
         tracing::info!(
             file = %file_name,
             rows = rows,
@@ -181,6 +202,87 @@ impl ParquetSink {
     /// Get total rows written.
     pub fn total_rows_written(&self) -> u64 {
         self.total_rows_written
+    }
+
+    /// Write Iceberg v2 metadata to S3 for the data files written so far.
+    /// This makes the table discoverable by Trino, Spark, and Iceberg-aware engines.
+    ///
+    /// If `existing_state` is provided, appends a new snapshot to the existing table.
+    /// Otherwise, creates a new table with its first snapshot.
+    pub async fn finalize_iceberg(&self) -> Result<String, String> {
+        self.finalize_iceberg_incremental(None).await
+    }
+
+    /// Write Iceberg metadata, optionally appending to an existing table state.
+    pub async fn finalize_iceberg_incremental(
+        &self,
+        existing_state: Option<&crate::iceberg_metadata::IcebergTableState>,
+    ) -> Result<String, String> {
+        if self.data_files.is_empty() {
+            return Err("No data files to create Iceberg metadata for".into());
+        }
+        let schema = self.last_schema.as_ref()
+            .ok_or_else(|| "No schema available for Iceberg metadata".to_string())?;
+
+        match existing_state {
+            Some(state) => {
+                // Append new snapshot to existing table
+                crate::iceberg_metadata::append_snapshot(
+                    &self.store,
+                    state,
+                    &self.data_files,
+                    schema,
+                    "append",
+                ).await
+            }
+            None => {
+                // Create new table with first snapshot
+                let table_uuid = uuid::Uuid::new_v4().to_string();
+                crate::iceberg_writer::write_iceberg_metadata(
+                    &self.store,
+                    &self.prefix,
+                    schema,
+                    &self.data_files,
+                    &table_uuid,
+                    &self.bucket,
+                ).await
+            }
+        }
+    }
+
+    /// Validate a batch against quality gates before writing.
+    /// Returns Ok(()) if validation passes or no gates configured,
+    /// Err with failure details if validation fails.
+    pub fn validate_batch_quality(
+        &self,
+        batch: &RecordBatch,
+        gate: Option<&crate::quality_gates::QualityGate>,
+    ) -> Result<(), String> {
+        if let Some(gate) = gate {
+            let result = crate::quality_gates::validate_batch(gate, batch);
+            if !result.passed {
+                let failures: Vec<String> = result.failures.iter()
+                    .map(|f| format!("{}: {}", f.check, f.message))
+                    .collect();
+                return Err(format!("Quality gate failed: {}", failures.join("; ")));
+            }
+        }
+        Ok(())
+    }
+
+    /// Get a reference to the data files written so far.
+    pub fn data_files(&self) -> &[crate::iceberg_writer::DataFileInfo] {
+        &self.data_files
+    }
+
+    /// Get the underlying ObjectStore.
+    pub fn store(&self) -> &Arc<dyn ObjectStore> {
+        &self.store
+    }
+
+    /// Get the prefix.
+    pub fn prefix(&self) -> &str {
+        &self.prefix
     }
 
     /// Get the S3 URI prefix where Parquet files are written (for ListingTable registration).

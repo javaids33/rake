@@ -244,6 +244,38 @@ export function Settings() {
                   </tbody>
                 </table>
               </Card>
+
+              <Card>
+                <h3 className="text-sm font-display font-semibold text-zinc-200 mb-4 flex items-center gap-2">
+                  <Cpu className="w-4 h-4 text-violet-400" /> Browser WASM Engines
+                </h3>
+                <p className="text-xs text-zinc-500 mb-4">
+                  WASM engines run computations directly in your browser — no server round-trips needed. Data stays local, works offline.
+                </p>
+                <div className="grid grid-cols-1 gap-3">
+                  {[
+                    { name: 'Pyodide', version: 'v0.26.4', size: '~10 MB', desc: 'Python runtime — pandas, numpy, matplotlib, scipy, scikit-learn', status: 'Available', color: 'text-cyan-400', bg: 'bg-cyan-500/10 border-cyan-500/20' },
+                    { name: 'DuckDB-WASM', version: 'v1.1', size: '~8 MB', desc: 'Offline SQL analytics — query Parquet files without server', status: 'Available', color: 'text-amber-400', bg: 'bg-amber-500/10 border-amber-500/20' },
+                    { name: 'SQLite-WASM', version: 'v3.46', size: '~1 MB', desc: 'Local persistence — notebooks, settings survive offline', status: 'Planned', color: 'text-emerald-400', bg: 'bg-emerald-500/10 border-emerald-500/20' },
+                    { name: 'Arrow-WASM', version: 'v17', size: '~2 MB', desc: 'Zero-copy data exchange between browser engines', status: 'Planned', color: 'text-rose-400', bg: 'bg-rose-500/10 border-rose-500/20' },
+                  ].map(engine => (
+                    <div key={engine.name} className={`flex items-center gap-3 p-3 rounded-lg border ${engine.bg}`}>
+                      <Cpu className={`w-5 h-5 ${engine.color} flex-shrink-0`} />
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-center gap-2">
+                          <span className="text-sm font-medium text-zinc-200">{engine.name}</span>
+                          <span className="text-2xs text-zinc-600">{engine.version}</span>
+                          <span className="text-2xs text-zinc-600">{engine.size}</span>
+                        </div>
+                        <p className="text-2xs text-zinc-500 mt-0.5">{engine.desc}</p>
+                      </div>
+                      <span className={`text-2xs font-medium ${engine.status === 'Available' ? 'text-emerald-400' : 'text-zinc-600'}`}>
+                        {engine.status}
+                      </span>
+                    </div>
+                  ))}
+                </div>
+              </Card>
             </>
           )}
 

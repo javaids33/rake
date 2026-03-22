@@ -12,21 +12,24 @@ interface SavedQuery {
 interface EditorState {
   tabs: EditorTab[]
   activeTabId: string
-  results: Record<string, SqlResponse | null>
+  results: Record<string, SqlResponse[] | null>
   errors: Record<string, string | null>
   loading: Record<string, boolean>
   chartType: ChartType
   savedQueries: SavedQuery[]
+  /** Which result index is active within a multi-statement result set */
+  activeResultIndex: Record<string, number>
 
   addTab: () => void
   removeTab: (id: string) => void
   setActiveTab: (id: string) => void
   updateTabSql: (id: string, sql: string) => void
   renameTab: (id: string, name: string) => void
-  setResult: (tabId: string, result: SqlResponse | null) => void
+  setResult: (tabId: string, result: SqlResponse | SqlResponse[] | null) => void
   setError: (tabId: string, error: string | null) => void
   setLoading: (tabId: string, loading: boolean) => void
   setChartType: (type: ChartType) => void
+  setActiveResultIndex: (tabId: string, index: number) => void
   saveQuery: (name: string, sql: string) => void
   deleteSavedQuery: (id: string) => void
 }
@@ -43,6 +46,7 @@ export const useEditorStore = create<EditorState>()(
       loading: {},
       chartType: 'bar',
       savedQueries: [],
+      activeResultIndex: {},
 
       addTab: () => {
         const tabs = get().tabs
@@ -71,11 +75,18 @@ export const useEditorStore = create<EditorState>()(
       renameTab: (id, name) =>
         set((s) => ({ tabs: s.tabs.map(t => t.id === id ? { ...t, name } : t) })),
       setResult: (tabId, result) =>
-        set((s) => ({ results: { ...s.results, [tabId]: result } })),
+        set((s) => ({
+          results: {
+            ...s.results,
+            [tabId]: result === null ? null : Array.isArray(result) ? result : [result],
+          },
+        })),
       setError: (tabId, error) =>
         set((s) => ({ errors: { ...s.errors, [tabId]: error } })),
       setLoading: (tabId, loading) =>
         set((s) => ({ loading: { ...s.loading, [tabId]: loading } })),
+      setActiveResultIndex: (tabId, index) =>
+        set((s) => ({ activeResultIndex: { ...s.activeResultIndex, [tabId]: index } })),
       setChartType: (chartType) => set({ chartType }),
       saveQuery: (name, sql) => {
         const id = String(Date.now())

@@ -122,6 +122,8 @@ pub fn build_s3_store(
     if let Some(ep) = endpoint {
         if !ep.is_empty() {
             builder = builder.with_endpoint(ep);
+            // MinIO and S3-compatible stores need path-style requests
+            builder = builder.with_virtual_hosted_style_request(false);
         }
     }
     let store = builder.build()
