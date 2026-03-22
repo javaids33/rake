@@ -43,7 +43,7 @@ const sections: NavSection[] = [
       { to: '/streaming', icon: Radio, label: 'Streaming / CDC', accent: 'cyan' },
       { to: '/transforms', icon: GitBranch, label: 'Transforms', accent: 'violet' },
       { to: '/quality', icon: ShieldCheck, label: 'Data Quality', accent: 'cyan' },
-      { to: '/data-models', icon: Zap, label: 'Data Models', accent: 'amber' },
+      { to: '/glaciers', icon: Zap, label: 'Glaciers', accent: 'amber' },
       { to: '/data-products', icon: ShieldCheck, label: 'Data Products', accent: 'emerald' },
       { to: '/migration', icon: ArrowLeftRight, label: 'Migration', accent: 'rose' },
     ],

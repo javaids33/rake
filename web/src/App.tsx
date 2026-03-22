@@ -51,8 +51,9 @@ export default function App() {
           <Route path="notebooks" element={<Suspense fallback={<PageLoader />}><Notebooks /></Suspense>} />
           <Route path="history" element={<Suspense fallback={<PageLoader />}><QueryHistory /></Suspense>} />
           <Route path="workflow" element={<Suspense fallback={<PageLoader />}><WorkflowViz /></Suspense>} />
-          <Route path="data-models" element={<Suspense fallback={<PageLoader />}><ExecutableTables /></Suspense>} />
-          <Route path="executable-tables" element={<Navigate to="/data-models" replace />} />
+          <Route path="glaciers" element={<Suspense fallback={<PageLoader />}><ExecutableTables /></Suspense>} />
+          <Route path="executable-tables" element={<Navigate to="/glaciers" replace />} />
+          <Route path="data-models" element={<Navigate to="/glaciers" replace />} />
           <Route path="data-products" element={<Suspense fallback={<PageLoader />}><DataProducts /></Suspense>} />
           <Route path="settings" element={<Suspense fallback={<PageLoader />}><Settings /></Suspense>} />
           <Route path="about" element={<Suspense fallback={<PageLoader />}><About /></Suspense>} />

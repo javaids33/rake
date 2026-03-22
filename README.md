@@ -5,6 +5,7 @@
   <img src="https://img.shields.io/badge/license-Apache%202.0-blue" alt="License">
   <img src="https://img.shields.io/badge/rust-1.75%2B-orange" alt="Rust Version">
   <img src="https://img.shields.io/badge/crates-13-yellow" alt="Crate Count">
+  <img src="https://img.shields.io/badge/tests-183%20pass-brightgreen" alt="Tests">
   <img src="https://img.shields.io/badge/TPC--H-22%2F22%20pass-brightgreen" alt="TPC-H">
   <img src="https://img.shields.io/badge/build-passing-brightgreen" alt="Build Status">
 </p>
@@ -17,9 +18,9 @@ Most data platforms require teams to stitch together JVM-based services — a cl
 
 ## What Makes RustLake Different
 
-### 1. Data Models — Self-Maintaining Data Organisms
+### 1. Glaciers — Self-Maintaining Iceberg Tables
 
-Traditional Iceberg tables are passive — they store data and wait for external systems to update them. RustLake tables are **active** — they store the compiled transform binary alongside the data it produces, on S3. Each table is a versioned, diffable, auditable unit with quality gates, lineage tracking, and self-healing capabilities.
+Traditional Iceberg tables are passive — they store data and wait for external systems to update them. RustLake Glaciers are **active** — they store the compiled transform binary alongside the data it produces, on S3. Each glacier is a versioned, diffable, auditable unit with quality gates, lineage tracking, and self-healing capabilities.
 
 ```
 s3://warehouse/daily_revenue/
@@ -36,7 +37,7 @@ s3://warehouse/daily_revenue/
 - Data and code are versioned together in Iceberg metadata — rollback both atomically (git semantics: rollback = new version with old code)
 - Compliance audit assembles full provenance chain, gate history, SLA freshness, and quality score in seconds
 
-**The Data Organism pattern:**
+**The Glacier pattern:**
 ```
 Raw Source
   → Ingestion Table (self-refreshing, CDC-aware)
@@ -235,12 +236,12 @@ All subsystems — SQL engine, vector search, scheduler, streaming, transforms, 
 
 ## Web Dashboard
 
-RustLake ships with a 19-page React dashboard built on Vite, Tailwind CSS, and Monaco Editor.
+RustLake ships with a 20-page React dashboard built on Vite, Tailwind CSS, and Monaco Editor.
 
 | Page | Path | Description |
 |------|------|-------------|
 | **Home** | `/` | Platform overview — search, quick actions, recent queries, connections |
-| **Catalog** | `/catalog` | 32+ tables with 7 tabs: Schema, Preview, Statistics, Lineage, History, Maintenance, Metadata |
+| **Catalog** | `/catalog` | Source-grouped table browser (PostgreSQL, MongoDB, S3/MinIO, etc.) with 7 tabs: Schema, Preview, Statistics, Lineage, History, Maintenance, Metadata |
 | **SQL Editor** | `/sql` | Multi-tab Monaco editor with catalog sidebar, engine selector, cost estimation, compare all engines |
 | **Notebooks** | `/notebooks` | Interactive notebook with SQL/Python/Markdown/Rust cells, WASM engine status panel |
 | **Query History** | `/history` | Full audit log with duration, engine, status, and query replay |
@@ -255,7 +256,7 @@ RustLake ships with a 19-page React dashboard built on Vite, Tailwind CSS, and M
 | **Workflow Viz** | `/workflow` | Real-time memory distribution, query pipeline flow, active job monitor |
 | **Benchmarks** | `/benchmarks` | TPC-H benchmark runner with multi-engine comparison |
 | **Settings** | `/settings` | System info, query router config, WASM engines, data providers, Flight/cluster config |
-| **Data Models** | `/data-models` | Versioned transforms — 6-tab detail view (Versions, Diff, History, Compare, Contracts, Lineage), quality gates, cascade replay |
+| **Glaciers** | `/glaciers` | Versioned transforms — 6-tab detail view (Versions, Diff, History, Compare, Contracts, Lineage), quality gates, cascade replay |
 | **Data Products** | `/data-products` | Compliance audit dashboard — freshness SLA, quality score, provenance chain, certification status |
 | **About** | `/about` | Platform version, architecture, credits |
 
@@ -919,7 +920,7 @@ The **Workflow Viz** page (`/workflow`) shows real-time memory distribution acro
 | `GET` | `/api/v1/neo4j/schema` | Discover labels, relationship types |
 | `POST` | `/api/v1/sql/profile` | Cost-based multi-engine profiling (no execution) |
 | `POST` | `/api/v1/sql/estimate` | Query cost estimation |
-| `GET/POST` | `/api/v1/executable-tables` | List/create data models (executable tables) |
+| `GET/POST` | `/api/v1/executable-tables` | List/create glaciers (executable tables) |
 | `PUT` | `/api/v1/executable-tables/{name}` | Update transform code (creates new version) |
 | `POST` | `/api/v1/executable-tables/{name}/execute-version` | Execute a specific version |
 | `POST` | `/api/v1/executable-tables/{name}/rollback` | Rollback to a previous version |

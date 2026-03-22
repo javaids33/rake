@@ -731,17 +731,17 @@ export function SqlEditorPage() {
           <Button variant="ghost" size="sm" icon={<Gauge className="w-3.5 h-3.5 text-violet-400" />} onClick={handleProfile} loading={profiling}>
             <span className="text-violet-400">Audit</span>
           </Button>
-          <Tooltip content="Save as Executable Table" position="bottom">
+          <Tooltip content="Save as Glacier" position="bottom">
             <button
               onClick={() => {
                 const sql = activeTab.sql.trim()
                 if (!sql) { toast.error('Write a query first'); return }
-                navigate(`/data-models?create=true&type=sql&sql=${encodeURIComponent(sql)}`)
+                navigate(`/glaciers?create=true&type=sql&sql=${encodeURIComponent(sql)}`)
               }}
               className="flex items-center gap-1 px-2 py-1 rounded-md text-2xs text-amber-400/80 border border-amber-500/20 bg-amber-500/5 hover:bg-amber-500/10 hover:text-amber-400 transition-colors"
             >
               <Zap className="w-3 h-3" />
-              <span>Exec Table</span>
+              <span>Glacier</span>
             </button>
           </Tooltip>
           <Tooltip content="Command Palette — search tables, pages, actions" position="bottom">

@@ -256,7 +256,7 @@ function UpdateDialog({ table, onClose, onUpdated }: {
         <div className="sticky top-0 bg-[#0c1222] border-b border-white/[0.06] px-6 py-4 flex items-center justify-between z-10">
           <h2 className="text-lg font-semibold text-zinc-100 flex items-center gap-2">
             <Edit3 className="w-5 h-5 text-violet-400" />
-            Edit Model: {table.table_name}
+            Edit Glacier: {table.table_name}
           </h2>
           <button onClick={onClose} className="text-zinc-500 hover:text-zinc-300"><X className="w-5 h-5" /></button>
         </div>
@@ -388,14 +388,14 @@ function CreateFormModal({ onCreated, onClose, initialSql, initialType }: {
         <div className="sticky top-0 bg-[#0c1222] border-b border-white/[0.06] px-6 py-4 flex items-center justify-between z-10">
           <h2 className="text-lg font-semibold text-zinc-100 flex items-center gap-2">
             <Plus className="w-5 h-5 text-amber-400" />
-            Create Data Model
+            Create Glacier
           </h2>
           <button onClick={onClose} className="text-zinc-500 hover:text-zinc-300"><X className="w-5 h-5" /></button>
         </div>
 
         <div className="p-6 space-y-4">
           <div className="grid grid-cols-2 gap-4">
-            <Input label="Model name" placeholder="orders_daily" value={name} onChange={e => setName(e.target.value)} />
+            <Input label="Glacier name" placeholder="orders_daily" value={name} onChange={e => setName(e.target.value)} />
             <div className="flex flex-col gap-1.5">
               <span className="text-xs font-medium text-zinc-400">Transform type</span>
               <select
@@ -461,7 +461,7 @@ function CreateFormModal({ onCreated, onClose, initialSql, initialType }: {
           <div className="flex justify-end gap-2 pt-2 border-t border-white/[0.06]">
             <Button variant="secondary" onClick={onClose}>Cancel</Button>
             <Button variant="primary" loading={saving} onClick={handleCreate} icon={<Zap className="w-4 h-4" />} disabled={!name || !source}>
-              Create Model
+              Create Glacier
             </Button>
           </div>
         </div>
@@ -1474,7 +1474,7 @@ function TemplatesModal({ onClose, onInstalled }: { onClose: () => void; onInsta
         <div className="sticky top-0 bg-[#0c1222] border-b border-white/[0.06] px-6 py-4 flex items-center justify-between z-10">
           <h2 className="text-lg font-semibold text-zinc-100 flex items-center gap-2">
             <ShoppingBag className="w-5 h-5 text-amber-400" />
-            Model Templates
+            Glacier Templates
           </h2>
           <button onClick={onClose} className="text-zinc-500 hover:text-zinc-300"><X className="w-5 h-5" /></button>
         </div>
@@ -1610,10 +1610,10 @@ export function ExecutableTables() {
           <div>
             <h1 className="text-2xl font-bold text-zinc-100 flex items-center gap-3">
               <Zap className="w-7 h-7 text-amber-400" />
-              Data Models
+              Glaciers
             </h1>
             <p className="text-sm text-zinc-500 mt-1">
-              Versioned transforms with quality gates, lineage, and contracts
+              Self-maintaining Iceberg tables with quality gates, lineage, and provenance
             </p>
           </div>
           <div className="flex items-center gap-3">
@@ -1657,7 +1657,7 @@ export function ExecutableTables() {
               <div className="py-12 text-center">
                 <Zap className="w-8 h-8 text-zinc-600 mx-auto mb-2" />
                 <p className="text-sm text-zinc-400">
-                  {filter ? 'No matching models' : 'No data models yet'}
+                  {filter ? 'No matching glaciers' : 'No glaciers yet'}
                 </p>
                 {!filter && (
                   <p className="text-xs text-zinc-600 mt-1">Create one to get started</p>
@@ -1705,7 +1705,7 @@ export function ExecutableTables() {
             <div className="flex-1 flex items-center justify-center">
               <div className="text-center">
                 <GitCommit className="w-12 h-12 text-zinc-700 mx-auto mb-3" />
-                <p className="text-zinc-400 text-sm">Select a model to view its version history</p>
+                <p className="text-zinc-400 text-sm">Select a glacier to view its version history</p>
                 <p className="text-zinc-600 text-xs mt-1">Browse versions, diffs, lineage, and contracts</p>
               </div>
             </div>
