@@ -90,7 +90,7 @@ Transforms can be scheduled via cron, triggered by events, or executed on demand
 | FNV-1a | - | Content-addressable binary storage: `hash(source_code)` produces a 64-bit hex key |
 | object_store | v0.12 | Unified S3/MinIO/local filesystem access with path-style request support |
 
-All components communicate via Arrow `RecordBatch` -- no serialization between crates. Data hits disk only as Parquet files on S3. This is a single-binary platform: `cargo install rustlake` gets the full system with sub-500ms cold start.
+All components communicate via Arrow `RecordBatch` -- no serialization between crates. Data hits disk only as Parquet files on S3. This is a single-binary platform: `cargo install rustlake-api` gets the `rustlake` binary with sub-500ms cold start.
 
 ---
 
@@ -302,7 +302,7 @@ We chose to compile Rust transforms to native binaries rather than interpreting 
 
 **Content-addressable caching.** Each binary is stored under its source hash: `bin-{hash}`. When a transform is submitted for execution, the system hashes the source code and checks the cache hierarchy (in-memory -> local disk -> S3). A cache hit means zero compilation -- the binary is loaded and executed directly. Cache invalidation is automatic: any change to source code produces a different hash, which misses the cache and triggers recompilation. Unchanged code always hits.
 
-**Single binary deployment.** RustLake ships as a single binary (`cargo install rustlake`). There is no cluster to provision, no package manager to run, no virtualenv to create. The compiled transform binaries are similarly self-contained -- copy the binary to any compatible machine and it runs.
+**Single binary deployment.** RustLake ships as a single binary (`cargo install rustlake-api` provides the `rustlake` command). There is no cluster to provision, no package manager to run, no virtualenv to create. The compiled transform binaries are similarly self-contained -- copy the binary to any compatible machine and it runs.
 
 **Predictable resource usage.** Native binaries have bounded memory usage with no garbage collection pauses. Memory allocation is explicit and deterministic. This matters for data transforms where consistent latency and predictable resource consumption are important for scheduling and capacity planning.
 

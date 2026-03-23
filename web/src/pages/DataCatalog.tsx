@@ -61,6 +61,8 @@ export function DataCatalog() {
   const [s3Configs, setS3Configs] = useState<S3Config[]>([])
   const [connections, setConnections] = useState<ConnectionEntry[]>([])
   const [collapsedSources, setCollapsedSources] = useState<Set<string>>(new Set())
+  const [collapsedSchemas, setCollapsedSchemas] = useState<Set<string>>(new Set())
+  const [glacierNames, setGlacierNames] = useState<Set<string>>(new Set())
   const navigate = useNavigate()
   const { updateTabSql, activeTabId } = useEditorStore()
 
@@ -69,6 +71,15 @@ export function DataCatalog() {
       const next = new Set(prev)
       if (next.has(source)) next.delete(source)
       else next.add(source)
+      return next
+    })
+  }
+
+  const toggleSchema = (schemaKey: string) => {
+    setCollapsedSchemas(prev => {
+      const next = new Set(prev)
+      if (next.has(schemaKey)) next.delete(schemaKey)
+      else next.add(schemaKey)
       return next
     })
   }
@@ -95,6 +106,9 @@ export function DataCatalog() {
     }).catch(() => {})
     getS3Configs().then(r => setS3Configs(r.configs || [])).catch(() => {})
     getConnections().then(r => setConnections(r.connections || [])).catch(() => {})
+    fetch('/api/v1/executable-tables').then(r => r.json()).then(d => {
+      setGlacierNames(new Set((d.tables || []).map((t: any) => t.table_name)))
+    }).catch(() => {})
   }
   useEffect(load, [])
 
@@ -171,13 +185,23 @@ export function DataCatalog() {
     other: { label: 'Other', icon: <Table2 className="w-3.5 h-3.5 text-zinc-400" />, color: 'text-zinc-400' },
   }
 
+  // Build reverse lookup: table name -> S3 config name
+  const s3TableToConfig = new Map<string, string>()
+  for (const s3 of s3Configs) {
+    for (const t of (s3.tables || [])) {
+      s3TableToConfig.set(t, s3.name)
+    }
+  }
+
   for (const t of allFiltered) {
     let prefix: string
     const dotIdx = t.name.indexOf('.')
-    if (dotIdx > 0) {
+    if (s3TableToConfig.has(t.name) || s3TableNames.has(t.name) || t.name.startsWith('s3_')) {
+      // Group by S3 config
+      const configName = s3TableToConfig.get(t.name) || 'unknown'
+      prefix = `s3_config_${configName}`
+    } else if (dotIdx > 0) {
       prefix = t.name.substring(0, dotIdx)
-    } else if (s3TableNames.has(t.name) || t.name.startsWith('s3_')) {
-      prefix = 's3'
     } else if (t.name.startsWith('uploads_')) {
       prefix = 'uploads'
     } else {
@@ -188,8 +212,15 @@ export function DataCatalog() {
   }
 
   for (const [prefix, tbls] of groupMap) {
-    const meta = SOURCE_META[prefix] || { label: prefix, icon: <Database className="w-3.5 h-3.5 text-zinc-400" />, color: 'text-zinc-400' }
-    sourceGroups.push({ key: prefix, label: meta.label, icon: meta.icon, color: meta.color, tables: tbls })
+    if (prefix.startsWith('s3_config_')) {
+      const configName = prefix.replace('s3_config_', '')
+      const s3Config = s3Configs.find(c => c.name === configName)
+      const bucketLabel = s3Config ? `${configName} (${s3Config.bucket})` : configName
+      sourceGroups.push({ key: prefix, label: bucketLabel, icon: <Cloud className="w-3.5 h-3.5 text-violet-400" />, color: 'text-violet-400', tables: tbls })
+    } else {
+      const meta = SOURCE_META[prefix] || { label: prefix, icon: <Database className="w-3.5 h-3.5 text-zinc-400" />, color: 'text-zinc-400' }
+      sourceGroups.push({ key: prefix, label: meta.label, icon: meta.icon, color: meta.color, tables: tbls })
+    }
   }
   sourceGroups.sort((a, b) => a.label.localeCompare(b.label))
 
@@ -288,6 +319,68 @@ export function DataCatalog() {
           {viewMode === 'list' ? (
             sourceGroups.map(group => {
               const isCollapsed = collapsedSources.has(group.key)
+              const isS3Config = group.key.startsWith('s3_config_')
+
+              // Build schema sub-groups for S3 config groups
+              const s3SchemaGroups = isS3Config ? (() => {
+                const schemas = new Map<string, TableInfo[]>()
+                for (const t of group.tables) {
+                  const underscoreIdx = t.name.indexOf('.')
+                  let schemaName: string
+                  if (underscoreIdx > 0) {
+                    schemaName = t.name.substring(0, underscoreIdx)
+                  } else {
+                    // For names like s3_analytics_events, extract schema from s3_ prefix
+                    const withoutS3 = t.name.startsWith('s3_') ? t.name.substring(3) : t.name
+                    const parts = withoutS3.split('_')
+                    schemaName = parts.length > 1 ? parts[0] : 'default'
+                  }
+                  if (!schemas.has(schemaName)) schemas.set(schemaName, [])
+                  schemas.get(schemaName)!.push(t)
+                }
+                return [...schemas.entries()].sort((a, b) => a[0].localeCompare(b[0]))
+              })() : []
+
+              const renderTableItem = (t: TableInfo, indent: string) => {
+                const shortName = t.name.includes('.') ? t.name.substring(t.name.lastIndexOf('.') + 1) : t.name
+                return (
+                  <button
+                    key={t.name}
+                    onClick={() => setSelected(t.name)}
+                    className={cn(
+                      'w-full flex items-center gap-2.5 pr-3 py-2 text-left border-b border-white/[0.02] transition-all',
+                      indent,
+                      selected === t.name
+                        ? 'bg-amber-400/[0.06] border-l-2 border-l-amber-400'
+                        : 'hover:bg-white/[0.03] border-l-2 border-l-transparent'
+                    )}
+                  >
+                    <Table2 className="w-3.5 h-3.5 text-zinc-600 flex-shrink-0" />
+                    <div className="flex-1 min-w-0">
+                      <p className="text-xs font-mono text-zinc-300 truncate">
+                        {shortName}
+                        {glacierNames.has(t.name) && (
+                          <span className="text-2xs px-1 py-px rounded border bg-cyan-400/10 text-cyan-400 border-cyan-400/20 ml-1">glacier</span>
+                        )}
+                        {s3MetaMap.has(t.name) && !glacierNames.has(t.name) && (
+                          <span className={cn('text-2xs px-1 py-px rounded border ml-1',
+                            s3MetaMap.get(t.name)!.format === 'iceberg' ? 'bg-violet-400/10 text-violet-400 border-violet-400/20' : 'bg-amber-400/10 text-amber-400 border-amber-400/20'
+                          )}>{s3MetaMap.get(t.name)!.format}</span>
+                        )}
+                      </p>
+                      {tableDeps[t.name] && (tableDeps[t.name].feedsInto > 0 || tableDeps[t.name].fedBy > 0) && (
+                        <span className="text-2xs text-zinc-500">
+                          {tableDeps[t.name].fedBy > 0 && <span className="text-cyan-400">{tableDeps[t.name].fedBy} in</span>}
+                          {tableDeps[t.name].fedBy > 0 && tableDeps[t.name].feedsInto > 0 && ' · '}
+                          {tableDeps[t.name].feedsInto > 0 && <span className="text-amber-400">{tableDeps[t.name].feedsInto} out</span>}
+                        </span>
+                      )}
+                    </div>
+                    <ChevronRight className={cn('w-3 h-3 text-zinc-700 transition-transform', selected === t.name && 'rotate-90 text-amber-400/60')} />
+                  </button>
+                )
+              }
+
               return (
                 <div key={group.key}>
                   <button
@@ -299,35 +392,25 @@ export function DataCatalog() {
                     <span className={cn('text-xs font-semibold', group.color)}>{group.label}</span>
                     <span className="text-2xs text-zinc-600 ml-auto">{group.tables.length}</span>
                   </button>
-                  {!isCollapsed && group.tables.map(t => {
-                    const fmt = inferFormat(t.name)
-                    const shortName = t.name.includes('.') ? t.name.substring(t.name.indexOf('.') + 1) : t.name
+                  {!isCollapsed && isS3Config && s3SchemaGroups.map(([schemaName, schemaTables]) => {
+                    const schemaKey = `${group.key}__${schemaName}`
+                    const isSchemaCollapsed = collapsedSchemas.has(schemaKey)
                     return (
-                      <button
-                        key={t.name}
-                        onClick={() => setSelected(t.name)}
-                        className={cn(
-                          'w-full flex items-center gap-2.5 pl-9 pr-3 py-2 text-left border-b border-white/[0.02] transition-all',
-                          selected === t.name
-                            ? 'bg-amber-400/[0.06] border-l-2 border-l-amber-400'
-                            : 'hover:bg-white/[0.03] border-l-2 border-l-transparent'
-                        )}
-                      >
-                        <Table2 className="w-3.5 h-3.5 text-zinc-600 flex-shrink-0" />
-                        <div className="flex-1 min-w-0">
-                          <p className="text-xs font-mono text-zinc-300 truncate">{shortName}</p>
-                          {tableDeps[t.name] && (tableDeps[t.name].feedsInto > 0 || tableDeps[t.name].fedBy > 0) && (
-                            <span className="text-2xs text-zinc-500">
-                              {tableDeps[t.name].fedBy > 0 && <span className="text-cyan-400">{tableDeps[t.name].fedBy} in</span>}
-                              {tableDeps[t.name].fedBy > 0 && tableDeps[t.name].feedsInto > 0 && ' · '}
-                              {tableDeps[t.name].feedsInto > 0 && <span className="text-amber-400">{tableDeps[t.name].feedsInto} out</span>}
-                            </span>
-                          )}
-                        </div>
-                        <ChevronRight className={cn('w-3 h-3 text-zinc-700 transition-transform', selected === t.name && 'rotate-90 text-amber-400/60')} />
-                      </button>
+                      <div key={schemaKey}>
+                        <button
+                          onClick={() => toggleSchema(schemaKey)}
+                          className="w-full flex items-center gap-2 pl-7 pr-3 py-1.5 text-left bg-white/[0.01] border-b border-white/[0.03] hover:bg-white/[0.03] transition-all"
+                        >
+                          {isSchemaCollapsed ? <ChevronRight className="w-2.5 h-2.5 text-zinc-600" /> : <ChevronDown className="w-2.5 h-2.5 text-zinc-600" />}
+                          <Layers className="w-3 h-3 text-violet-400/60" />
+                          <span className="text-2xs font-mono text-zinc-400">{schemaName}</span>
+                          <span className="text-2xs text-zinc-700 ml-auto">{schemaTables.length}</span>
+                        </button>
+                        {!isSchemaCollapsed && schemaTables.map(t => renderTableItem(t, 'pl-12'))}
+                      </div>
                     )
                   })}
+                  {!isCollapsed && !isS3Config && group.tables.map(t => renderTableItem(t, 'pl-9'))}
                 </div>
               )
             })
@@ -392,6 +475,9 @@ export function DataCatalog() {
                     if (!meta) return null
                     return <Badge className={cn('text-2xs', meta.color, 'border-current/20 bg-current/5')}>{meta.label}</Badge>
                   })()}
+                  {glacierNames.has(selected) && (
+                    <Badge className="text-2xs text-cyan-400 border-cyan-400/20 bg-cyan-400/5">Glacier</Badge>
+                  )}
                 </div>
                 <div className="flex items-center gap-3 mt-1.5">
                   {stats && <span className="text-2xs font-mono text-zinc-500">{formatNumber(stats.row_count)} rows</span>}
@@ -531,7 +617,17 @@ export function DataCatalog() {
               {tab === 'preview' && preview && (
                 <DataTable columns={preview.columns} rows={preview.rows} maxHeight="600px" />
               )}
-              {tab === 'preview' && !preview && (
+              {tab === 'preview' && !preview && s3MetaMap.has(selected) && (
+                <div className="py-8 text-center">
+                  <Cloud className="w-6 h-6 text-violet-400 mx-auto mb-2" />
+                  <p className="text-xs text-zinc-400">Preview requires table registration</p>
+                  <p className="text-2xs text-zinc-600 mt-1">Query this table in the SQL Editor to register it in DataFusion</p>
+                  <Button variant="secondary" size="sm" className="mt-3" onClick={() => { updateTabSql(activeTabId, `SELECT * FROM '${selected}' LIMIT 100`); navigate('/sql') }}>
+                    Open in SQL Editor
+                  </Button>
+                </div>
+              )}
+              {tab === 'preview' && !preview && !s3MetaMap.has(selected) && (
                 <EmptyState icon={<Eye className="w-5 h-5" />} title="Loading preview..." description="Fetching table data" />
               )}
 
@@ -871,6 +967,57 @@ export function DataCatalog() {
                       ))}
                     </div>
                   </Card>
+                  {s3MetaMap.has(selected) && (() => {
+                    const meta = s3MetaMap.get(selected)!
+                    const s3Path = selected.replace(/\./g, '/').replace(/_/g, '/')
+                    return (
+                      <Card>
+                        <h3 className="text-sm font-display font-semibold text-zinc-200 mb-4 flex items-center gap-2">
+                          <Cloud className="w-4 h-4 text-violet-400" /> S3 Storage Details
+                        </h3>
+                        <div className="grid grid-cols-2 gap-y-3 text-xs">
+                          <div className="flex items-center gap-3">
+                            <span className="text-zinc-500 w-28">Config</span>
+                            <span className="text-zinc-200 font-mono">{meta.configName}</span>
+                          </div>
+                          <div className="flex items-center gap-3">
+                            <span className="text-zinc-500 w-28">Bucket</span>
+                            <span className="text-zinc-200 font-mono">{meta.bucket}</span>
+                          </div>
+                          <div className="flex items-center gap-3">
+                            <span className="text-zinc-500 w-28">Endpoint</span>
+                            <span className="text-zinc-200 font-mono text-2xs">{meta.endpoint}</span>
+                          </div>
+                          <div className="flex items-center gap-3">
+                            <span className="text-zinc-500 w-28">Format</span>
+                            <Badge className={meta.format === 'iceberg' ? 'text-violet-400 border-violet-400/20' : 'text-amber-400 border-amber-400/20'}>
+                              {meta.format}
+                            </Badge>
+                          </div>
+                          <div className="flex items-center gap-3">
+                            <span className="text-zinc-500 w-28">S3 Path</span>
+                            <span className="text-zinc-200 font-mono text-2xs">s3://{meta.bucket}/{s3Path}/</span>
+                          </div>
+                        </div>
+                        <div className="mt-3 pt-3 border-t border-white/[0.04]">
+                          <Button variant="secondary" size="sm" icon={<ExternalLink className="w-3.5 h-3.5" />} onClick={() => navigate('/sources')}>
+                            Browse in S3
+                          </Button>
+                        </div>
+                      </Card>
+                    )
+                  })()}
+                  {glacierNames.has(selected) && (
+                    <Card>
+                      <h3 className="text-sm font-display font-semibold text-zinc-200 mb-4 flex items-center gap-2">
+                        <Layers className="w-4 h-4 text-cyan-400" /> Glacier Table
+                      </h3>
+                      <p className="text-xs text-zinc-400 mb-3">This table is managed as a Glacier (executable table) with transform logic and quality gates.</p>
+                      <Button variant="secondary" size="sm" icon={<ExternalLink className="w-3.5 h-3.5" />} onClick={() => navigate('/glaciers')}>
+                        View in Glaciers
+                      </Button>
+                    </Card>
+                  )}
                   <Card>
                     <h3 className="text-sm font-display font-semibold text-zinc-200 mb-4 flex items-center gap-2">
                       <Filter className="w-4 h-4 text-cyan-400" /> Quick Actions

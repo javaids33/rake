@@ -109,6 +109,10 @@ sha2 = "0.10"
 # System
 hostname = "0.4"
 
+# Kafka / Avro / Schema Registry
+rdkafka = { version = "0.36", features = ["cmake-build", "ssl-vendored"] }
+apache-avro = "0.17"
+
 # gRPC (for Arrow Flight — must match arrow-flight's tonic version)
 tonic = "0.14"
 prost = "0.13"

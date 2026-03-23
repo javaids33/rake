@@ -66,6 +66,11 @@ interface PipelineForm {
   s3_path: string
   s3_existing_table: string
   initial_snapshot: boolean
+  // Kafka-specific
+  group_id: string
+  offset_reset: string
+  schema_registry_url: string
+  format: string
 }
 
 const EMPTY_FORM: PipelineForm = {
@@ -73,6 +78,7 @@ const EMPTY_FORM: PipelineForm = {
   broker: '', topic: '', connection_id: '', collection: '', full_document: 'updateLookup',
   sink_type: 'iceberg', s3_config_name: '', s3_path: '', s3_existing_table: '',
   initial_snapshot: false,
+  group_id: 'rustlake-consumer', offset_reset: 'earliest', schema_registry_url: '', format: 'json',
 }
 
 export function Streaming() {
@@ -241,7 +247,14 @@ export function Streaming() {
           initial_snapshot: form.initial_snapshot,
         }
       } else {
-        sourceConfig = { broker: form.broker, topic: form.topic }
+        sourceConfig = {
+          brokers: form.broker,
+          topic: form.topic,
+          group_id: form.group_id || 'rustlake-consumer',
+          offset_reset: form.offset_reset || 'earliest',
+          format: form.format || 'json',
+          ...(form.schema_registry_url ? { schema_registry_url: form.schema_registry_url } : {}),
+        }
       }
       await createPipeline({
         name: form.name,
@@ -492,6 +505,31 @@ export function Streaming() {
                               className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-violet-400/10 border border-violet-400/20 text-violet-400 text-2xs font-medium hover:bg-violet-400/15 transition-colors"
                             >
                               <Clock className="w-3 h-3" /> Schedule
+                            </button>
+                          </Tooltip>
+                          <Tooltip content="Promote to Glacier — adds quality gates, versioning, lineage tracking, and compliance auditing" position="bottom">
+                            <button
+                              onClick={async (e) => {
+                                e.stopPropagation()
+                                try {
+                                  const res = await fetch('/api/v1/executable-tables/from-pipeline', {
+                                    method: 'POST',
+                                    headers: { 'Content-Type': 'application/json' },
+                                    body: JSON.stringify({ pipeline_id: p.id }),
+                                  })
+                                  if (res.ok) {
+                                    const data = await res.json()
+                                    toast.success(`Glacier "${data.glacier}" created from pipeline`)
+                                    navigate('/glaciers')
+                                  } else {
+                                    const err = await res.json()
+                                    toast.error(err.error || 'Failed to create Glacier')
+                                  }
+                                } catch (err) { toast.error((err as Error).message) }
+                              }}
+                              className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-cyan-400/10 border border-cyan-400/20 text-cyan-300 text-2xs font-medium hover:bg-cyan-400/15 transition-colors"
+                            >
+                              <Zap className="w-3 h-3" /> Promote to Glacier
                             </button>
                           </Tooltip>
                           {!!(p.source_config as Record<string, unknown>)?.connection_id && (
@@ -947,6 +985,34 @@ export function Streaming() {
             <>
               <Input label="Broker Address *" value={form.broker} onChange={e => setForm(f => ({ ...f, broker: e.target.value }))} placeholder="localhost:9092" />
               <Input label="Topic *" value={form.topic} onChange={e => setForm(f => ({ ...f, topic: e.target.value }))} placeholder="events" />
+              <div className="grid grid-cols-2 gap-3">
+                <Input label="Consumer Group" value={form.group_id} onChange={e => setForm(f => ({ ...f, group_id: e.target.value }))} placeholder="rustlake-consumer" />
+                <Select
+                  label="Offset Reset"
+                  value={form.offset_reset}
+                  onChange={e => setForm(f => ({ ...f, offset_reset: e.target.value }))}
+                  options={[{ value: 'earliest', label: 'Earliest' }, { value: 'latest', label: 'Latest' }]}
+                />
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <Select
+                  label="Message Format"
+                  value={form.format}
+                  onChange={e => setForm(f => ({ ...f, format: e.target.value }))}
+                  options={[
+                    { value: 'json', label: 'JSON' },
+                    { value: 'avro', label: 'Avro (Schema Registry)' },
+                    { value: 'string', label: 'Raw String' },
+                  ]}
+                />
+                <Input
+                  label="Schema Registry URL"
+                  value={form.schema_registry_url}
+                  onChange={e => setForm(f => ({ ...f, schema_registry_url: e.target.value }))}
+                  placeholder="http://localhost:8081"
+                  disabled={form.format !== 'avro'}
+                />
+              </div>
             </>
           )}
 

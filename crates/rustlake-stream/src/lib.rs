@@ -4,7 +4,11 @@
 //! Materializes streaming data into Iceberg tables via `rustlake-format`.
 
 pub mod connector;
+#[cfg(feature = "kafka")]
+pub mod kafka;
 pub mod pipeline;
+#[cfg(feature = "kafka")]
+pub mod schema_registry;
 
 use arrow::array::RecordBatch;
 use async_trait::async_trait;

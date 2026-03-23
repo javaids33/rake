@@ -921,8 +921,43 @@ async fn sync_tables_to_polars(state: &AppState) {
     }
 }
 
+#[derive(clap::Parser)]
+#[command(
+    name = "rustlake",
+    about = "RustLake — The All-Rust Data Platform",
+    version,
+    long_about = "Single-binary data platform built on Apache Arrow, DataFusion, and Iceberg.\n\nRun `rustlake serve` to start the platform."
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Option<CliCommand>,
+}
+
+#[derive(clap::Subcommand)]
+enum CliCommand {
+    /// Start the RustLake platform (API server + scheduler + all engines)
+    Serve {
+        /// Port to bind to
+        #[arg(long, short, default_value = "3000")]
+        port: u16,
+
+        /// Host to bind to
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+    },
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    use clap::Parser;
+    let cli = Cli::parse();
+
+    // If no subcommand, default to `serve`
+    let (host, port) = match cli.command {
+        Some(CliCommand::Serve { host, port }) => (host, port),
+        None => ("127.0.0.1".to_string(), 3000),
+    };
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| {
@@ -936,13 +971,14 @@ async fn main() -> anyhow::Result<()> {
         .with_timer(ChronoLocal::new("%H:%M:%S%.3f".to_string()))
         .init();
 
-    // Load config (from file if provided, otherwise defaults)
-    let config = match std::env::args().nth(1) {
-        Some(path) => RustLakeConfig::from_file(&path)?,
-        None => RustLakeConfig::default(),
+    // Load config (from RUSTLAKE_CONFIG env var or defaults)
+    let config = match std::env::var("RUSTLAKE_CONFIG") {
+        Ok(path) => RustLakeConfig::from_file(&path)?,
+        Err(_) => RustLakeConfig::default(),
     };
 
-    let bind_addr = format!("{}:{}", config.api.host, config.api.port);
+    // CLI args override config
+    let bind_addr = format!("{}:{}", host, port);
     let flight_enabled = config.flight.enabled;
     let flight_config = config.flight.clone();
     let cluster_config = config.cluster.clone();

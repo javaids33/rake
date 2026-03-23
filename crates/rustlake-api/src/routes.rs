@@ -672,6 +672,11 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/api/v1/streaming/pipelines/{id}/start", post(start_pipeline))
         .route("/api/v1/streaming/pipelines/{id}/stop", post(stop_pipeline))
         .route("/api/v1/streaming/pipelines/import", post(import_pipelines))
+        // Schema Registry endpoints
+        .route("/api/v1/schema-registry/subjects", get(list_schema_subjects))
+        .route("/api/v1/schema-registry/subjects/{subject}/versions", get(list_schema_versions))
+        .route("/api/v1/schema-registry/subjects/{subject}/versions/{version}", get(get_schema))
+        .route("/api/v1/schema-registry/compatibility/{subject}", post(check_schema_compatibility))
         // S3/Object storage config
         .route(
             "/api/v1/storage/s3",
@@ -756,6 +761,8 @@ pub fn api_routes() -> Router<Arc<AppState>> {
         .route("/api/v1/notebooks/jobs", get(list_notebook_jobs))
         // Executable Lakehouse
         .route("/api/v1/executable-tables", get(list_executable_tables).post(create_executable_table))
+        .route("/api/v1/executable-tables/convert-sql", post(convert_sql_to_glacier))
+        .route("/api/v1/executable-tables/from-pipeline", post(create_glacier_from_pipeline))
         .route("/api/v1/executable-tables/cost-comparison", post(cost_comparison))
         .route("/api/v1/executable-tables/{name}/execute", post(execute_executable_table))
         .route("/api/v1/executable-tables/{name}/cost", get(executable_table_cost))
@@ -5781,9 +5788,25 @@ async fn run_schedule(
                         let transform_type = table.transform.transform_type.clone();
                         let source_code = table.transform.source_code.clone();
                         drop(tables);
-                        let start = std::time::Instant::now();
-                        let (batches, rows, dur) = execute_transform_code(&state, &transform_type, &source_code, start).await;
-                        Ok(format!("Executable table '{}' executed: {} rows in {}ms", target, rows, dur))
+                        if transform_type == "streaming_cdc" {
+                            // Streaming CDC glacier: execute the SQL transform against
+                            // the pipeline's sink table to produce refined output
+                            let sql = extract_sql_from_streaming_cdc(&source_code);
+                            let start = std::time::Instant::now();
+                            let ctx = state.ctx.read().await;
+                            match ctx.sql(&sql).await {
+                                Ok(batches) => {
+                                    let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+                                    let dur = start.elapsed().as_millis();
+                                    Ok(format!("Streaming CDC glacier '{}' refreshed: {} rows in {}ms", target, rows, dur))
+                                }
+                                Err(e) => Err(format!("Streaming CDC glacier '{}' SQL failed: {}", target, e))
+                            }
+                        } else {
+                            let start = std::time::Instant::now();
+                            let (batches, rows, dur) = execute_transform_code(&state, &transform_type, &source_code, start).await;
+                            Ok(format!("Executable table '{}' executed: {} rows in {}ms", target, rows, dur))
+                        }
                     } else {
                         drop(tables);
                         Err(format!("Executable table '{}' not found", target))
@@ -6102,6 +6125,33 @@ async fn delete_pipeline(
         "status": "deleted",
         "id": id,
     })))
+}
+
+/// Update any Glacier tables linked to a streaming pipeline when new events arrive.
+///
+/// Finds glaciers whose transform source references `streaming_cdc:{pipeline_id}` and
+/// updates their status, freshness, and execution record with the latest event count.
+async fn update_glacier_from_pipeline(state: &Arc<AppState>, pipeline_id: &str, total_events: u64) {
+    let mut tables = state.executable_tables.write().await;
+    let needle = format!("streaming_cdc:{}", pipeline_id);
+    for table in tables.iter_mut() {
+        // Match glaciers created from this pipeline
+        let is_linked = table.transform.transform_type == "streaming_cdc"
+            && table.versions.first().map(|v| v.source_code.as_str()) == Some(needle.as_str());
+
+        if is_linked {
+            table.status.data_freshness = "fresh".into();
+            table.status.health = "healthy".into();
+            table.status.staleness_hours = 0.0;
+            table.last_refresh = Some(chrono::Utc::now().to_rfc3339());
+
+            // Update the latest execution record with current event count
+            if let Some(last) = table.history.last_mut() {
+                last.rows_produced = Some(total_events);
+                last.completed_at = Some(chrono::Utc::now().to_rfc3339());
+            }
+        }
+    }
 }
 
 /// POST /api/v1/streaming/pipelines/{id}/start — start a CDC pipeline.
@@ -6441,6 +6491,9 @@ async fn start_pipeline(
                                         phase,
                                     }
                                 );
+
+                                // Update any linked Glacier tables
+                                update_glacier_from_pipeline(&state_clone, &pipeline_id, total_events).await;
                             }
                             Err(e) => {
                                 tracing::error!(
@@ -6519,8 +6572,260 @@ async fn start_pipeline(
                 }),
             )),
         }
+    } else if pipeline.source_type == "kafka" {
+        // ── Kafka source pipeline ──────────────────────────────────────
+        #[cfg(feature = "kafka")]
+        {
+            use rustlake_stream::StreamSource as _;
+            use rustlake_stream::kafka::{KafkaConfig, KafkaSource};
+
+            tracing::info!(
+                pipeline_id = %id, pipeline_name = %pipeline.name,
+                "[KAFKA:1/3] Parsing Kafka source config"
+            );
+
+            let kafka_config: KafkaConfig =
+                serde_json::from_value(pipeline.source_config.clone()).map_err(|e| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        Json(ErrorResponse {
+                            error: format!("Invalid kafka source_config: {}", e),
+                        }),
+                    )
+                })?;
+
+            tracing::info!(
+                brokers = %kafka_config.brokers,
+                topic = %kafka_config.topic,
+                group_id = %kafka_config.group_id,
+                format = %kafka_config.format,
+                schema_registry = ?kafka_config.schema_registry_url,
+                "[KAFKA:2/3] Creating Kafka consumer"
+            );
+
+            let source = KafkaSource::new(&pipeline.name, kafka_config).map_err(|e| {
+                tracing::error!(error = %e, "[KAFKA:2/3] FAILED — could not create consumer");
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("Failed to create Kafka consumer: {}", e),
+                    }),
+                )
+            })?;
+
+            let source = std::sync::Arc::new(source);
+
+            // Store in active Kafka consumers for lifecycle management
+            state.active_kafka_consumers.write().await.insert(id.clone(), source.clone());
+
+            // Start consuming
+            let mut rx = source.start().await.map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("Failed to start Kafka consumer: {}", e),
+                    }),
+                )
+            })?;
+
+            // Update pipeline status
+            {
+                let mut pipelines = state.streaming_pipelines.write().await;
+                if let Some(p) = pipelines.iter_mut().find(|p| p.id == id) {
+                    p.status = "running".to_string();
+                    p.phase = "streaming".to_string();
+                }
+            }
+
+            tracing::info!(
+                pipeline_id = %id,
+                "[KAFKA:3/3] Pipeline RUNNING — Kafka events → Arrow RecordBatch → sink"
+            );
+
+            // Build S3 Parquet sink if the sink_table is an S3 path
+            let parquet_sink = if pipeline.sink_table.starts_with("s3://") || pipeline.sink_table.starts_with("s3a://") {
+                let s3_configs = state.s3_configs.read().await;
+                let matching_config = s3_configs.iter().find(|c| pipeline.sink_table.contains(&c.bucket)).cloned();
+                drop(s3_configs);
+
+                match matching_config {
+                    Some(cfg) => {
+                        let sink_config = crate::parquet_sink::ParquetSinkConfig::from_s3_uri(
+                            &pipeline.sink_table,
+                            Some(cfg.endpoint.clone()),
+                            cfg.access_key.clone(),
+                            cfg.secret_key.clone(),
+                            cfg.region.clone(),
+                        );
+                        match sink_config {
+                            Ok(sc) => match crate::parquet_sink::ParquetSink::new(&sc, 500) {
+                                Ok(sink) => {
+                                    tracing::info!(pipeline_id = %id, sink = %pipeline.sink_table, "Kafka → S3 Parquet sink ENABLED");
+                                    Some(sink)
+                                }
+                                Err(e) => { tracing::warn!(error = %e, "Failed to create Parquet sink"); None }
+                            }
+                            Err(e) => { tracing::warn!(error = %e, "Failed to parse sink URI"); None }
+                        }
+                    }
+                    None => {
+                        tracing::warn!(sink = %pipeline.sink_table, "No matching S3 config for Kafka sink");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            // Extract bucket and prefix for table registration
+            let (sink_bucket, sink_prefix) = {
+                let stripped = pipeline.sink_table.strip_prefix("s3://")
+                    .or_else(|| pipeline.sink_table.strip_prefix("s3a://"))
+                    .unwrap_or(&pipeline.sink_table);
+                let slash = stripped.find('/').unwrap_or(stripped.len());
+                (stripped[..slash].to_string(), if slash < stripped.len() { stripped[slash+1..].trim_end_matches('/').to_string() } else { String::new() })
+            };
+
+            // Spawn background consumer task
+            let state_clone = state.clone();
+            let pipeline_id = id.clone();
+            let pipeline_name = pipeline.name.clone();
+            let pipeline_sink = pipeline.sink_table.clone();
+
+            tokio::spawn(async move {
+                let mut total_events: u64 = 0;
+                let mut last_log_time = Instant::now();
+                let mut sink = parquet_sink;
+
+                while let Some(result) = rx.recv().await {
+                    match result {
+                        Ok(batch) => {
+                            let rows = batch.num_rows() as u64;
+                            total_events += rows;
+
+                            let should_log = total_events <= 1000 || last_log_time.elapsed().as_secs() >= 30;
+                            if should_log {
+                                tracing::info!(
+                                    pipeline_id = %pipeline_id,
+                                    batch_rows = rows,
+                                    total_events = total_events,
+                                    "Kafka batch received"
+                                );
+                                last_log_time = Instant::now();
+                            }
+
+                            // Write to Parquet sink if configured (auto-flushes at threshold)
+                            if let Some(ref mut s) = sink {
+                                let files_before = s.files_written();
+                                if let Err(e) = s.write_batch(batch).await {
+                                    tracing::error!(pipeline_id = %pipeline_id, error = %e, "Parquet sink write failed");
+                                }
+                                // If first file was just written, register the table
+                                if files_before == 0 && s.files_written() == 1 {
+                                    let table_name = pipeline_name.replace('-', "_").replace(' ', "_");
+                                    let s3_uri = format!("s3://{}/{}/", sink_bucket, sink_prefix);
+                                    tracing::info!(table = %table_name, s3 = %s3_uri, "Registering Kafka sink table via API");
+                                    let client = reqwest::Client::new();
+                                    let _ = client.post("http://127.0.0.1:3000/api/v1/tables/register-s3")
+                                        .json(&serde_json::json!({
+                                            "table_name": table_name,
+                                            "s3_uri": s3_uri,
+                                            "s3_config_name": "",
+                                        }))
+                                        .send().await.ok();
+
+                                    match s.finalize_iceberg().await {
+                                        Ok(path) => tracing::info!(metadata = %path, "Iceberg metadata written for Kafka sink"),
+                                        Err(e) => tracing::warn!(error = %e, "Failed to write Iceberg metadata"),
+                                    }
+                                }
+                            }
+
+                            // Update pipeline metadata
+                            {
+                                let mut pipelines = state_clone.streaming_pipelines.write().await;
+                                if let Some(p) = pipelines.iter_mut().find(|p| p.id == pipeline_id) {
+                                    p.events_processed = total_events;
+                                    p.phase = "streaming".to_string();
+                                    if let Some(ref s) = sink {
+                                        p.files_written = s.files_written();
+                                    }
+                                }
+                            }
+
+                            // Broadcast real-time event to SSE
+                            let _ = state_clone.pipeline_events_tx.send(
+                                crate::state::PipelineEvent {
+                                    pipeline_id: pipeline_id.clone(),
+                                    pipeline_name: pipeline_name.clone(),
+                                    status: "running".to_string(),
+                                    events_processed: total_events,
+                                    batch_rows: rows,
+                                    source_type: "kafka".to_string(),
+                                    sink_table: pipeline_sink.clone(),
+                                    phase: "streaming".to_string(),
+                                }
+                            );
+
+                            // Update any linked Glacier tables
+                            update_glacier_from_pipeline(&state_clone, &pipeline_id, total_events).await;
+                        }
+                        Err(e) => {
+                            tracing::error!(pipeline_id = %pipeline_id, error = %e, "Kafka source error");
+                            break;
+                        }
+                    }
+                }
+
+                // Final flush
+                if let Some(ref mut s) = sink {
+                    if let Err(e) = s.flush().await {
+                        tracing::error!(pipeline_id = %pipeline_id, error = %e, "Final Kafka flush failed");
+                    } else if s.files_written() > 0 {
+                        let table_name = pipeline_name.replace('-', "_").replace(' ', "_");
+                        let s3_uri = format!("s3://{}/{}/", sink_bucket, sink_prefix);
+                        let client = reqwest::Client::new();
+                        let _ = client.post("http://127.0.0.1:3000/api/v1/tables/register-s3")
+                            .json(&serde_json::json!({
+                                "table_name": table_name,
+                                "s3_uri": s3_uri,
+                                "s3_config_name": "",
+                            }))
+                            .send().await.ok();
+
+                        match s.finalize_iceberg().await {
+                            Ok(path) => tracing::info!(metadata = %path, "Iceberg metadata written on Kafka stop"),
+                            Err(e) => tracing::warn!(error = %e, "Iceberg metadata write failed on stop"),
+                        }
+                    }
+                }
+
+                // Pipeline ended
+                let mut pipelines = state_clone.streaming_pipelines.write().await;
+                if let Some(p) = pipelines.iter_mut().find(|p| p.id == pipeline_id) {
+                    p.status = "stopped".to_string();
+                }
+                state_clone.active_kafka_consumers.write().await.remove(&pipeline_id);
+                tracing::info!(pipeline_id = %pipeline_id, total_events = total_events, "Kafka pipeline ended");
+            });
+
+            Ok(Json(serde_json::json!({
+                "status": "started",
+                "id": id,
+                "source_type": "kafka",
+            })))
+        }
+        #[cfg(not(feature = "kafka"))]
+        {
+            Err((
+                StatusCode::NOT_IMPLEMENTED,
+                Json(ErrorResponse {
+                    error: "Kafka support not compiled. Build with --features kafka".to_string(),
+                }),
+            ))
+        }
     } else {
-        // For non-CDC pipelines, just update status
+        // For other pipeline types, just update status
         let mut pipelines = state.streaming_pipelines.write().await;
         if let Some(p) = pipelines.iter_mut().find(|p| p.id == id) {
             p.status = "running".to_string();
@@ -6547,6 +6852,17 @@ async fn stop_pipeline(
     }
     // Remove from active sources
     state.cdc_sources.write().await.remove(&id);
+
+    // Stop Kafka consumer if running
+    #[cfg(feature = "kafka")]
+    {
+        let consumers = state.active_kafka_consumers.read().await;
+        if let Some(source) = consumers.get(&id) {
+            source.signal_stop();
+        }
+        drop(consumers);
+        state.active_kafka_consumers.write().await.remove(&id);
+    }
 
     // Update pipeline status
     let mut pipelines = state.streaming_pipelines.write().await;
@@ -6605,6 +6921,92 @@ async fn import_pipelines(
         "count": created.len(),
         "pipelines": created,
     })))
+}
+
+// ── Schema Registry Proxy Handlers ───────────────────────────────────
+
+/// GET /api/v1/schema-registry/subjects — list all subjects in the configured Schema Registry.
+#[cfg(feature = "kafka")]
+async fn list_schema_subjects(
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let url = params.get("registry_url").cloned().unwrap_or_else(|| "http://localhost:8081".to_string());
+    let client = rustlake_stream::schema_registry::SchemaRegistryClient::new(&url);
+    match client.list_subjects().await {
+        Ok(subjects) => Ok(Json(serde_json::json!({ "subjects": subjects }))),
+        Err(e) => Err((StatusCode::BAD_GATEWAY, Json(ErrorResponse { error: format!("Schema Registry error: {}", e) }))),
+    }
+}
+
+#[cfg(not(feature = "kafka"))]
+async fn list_schema_subjects() -> std::result::Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    Err((StatusCode::NOT_IMPLEMENTED, Json(ErrorResponse { error: "Kafka/Schema Registry support not compiled".into() })))
+}
+
+/// GET /api/v1/schema-registry/subjects/{subject}/versions — list versions for a subject.
+#[cfg(feature = "kafka")]
+async fn list_schema_versions(
+    Path(subject): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let url = params.get("registry_url").cloned().unwrap_or_else(|| "http://localhost:8081".to_string());
+    let client = rustlake_stream::schema_registry::SchemaRegistryClient::new(&url);
+    match client.list_versions(&subject).await {
+        Ok(versions) => Ok(Json(serde_json::json!({ "subject": subject, "versions": versions }))),
+        Err(e) => Err((StatusCode::BAD_GATEWAY, Json(ErrorResponse { error: format!("Schema Registry error: {}", e) }))),
+    }
+}
+
+#[cfg(not(feature = "kafka"))]
+async fn list_schema_versions(Path(_subject): Path<String>) -> std::result::Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    Err((StatusCode::NOT_IMPLEMENTED, Json(ErrorResponse { error: "Kafka/Schema Registry support not compiled".into() })))
+}
+
+/// GET /api/v1/schema-registry/subjects/{subject}/versions/{version} — get a specific schema.
+#[cfg(feature = "kafka")]
+async fn get_schema(
+    Path((subject, version)): Path<(String, String)>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let url = params.get("registry_url").cloned().unwrap_or_else(|| "http://localhost:8081".to_string());
+    let client = rustlake_stream::schema_registry::SchemaRegistryClient::new(&url);
+    match client.get_schema(&subject, &version).await {
+        Ok(entry) => Ok(Json(serde_json::json!({
+            "id": entry.id,
+            "version": entry.version,
+            "subject": entry.subject,
+            "schema_type": entry.schema_type,
+            "schema": entry.schema,
+        }))),
+        Err(e) => Err((StatusCode::BAD_GATEWAY, Json(ErrorResponse { error: format!("Schema Registry error: {}", e) }))),
+    }
+}
+
+#[cfg(not(feature = "kafka"))]
+async fn get_schema(Path((_subject, _version)): Path<(String, String)>) -> std::result::Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    Err((StatusCode::NOT_IMPLEMENTED, Json(ErrorResponse { error: "Kafka/Schema Registry support not compiled".into() })))
+}
+
+/// POST /api/v1/schema-registry/compatibility/{subject} — check schema compatibility.
+#[cfg(feature = "kafka")]
+async fn check_schema_compatibility(
+    Path(subject): Path<String>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+    Json(body): Json<serde_json::Value>,
+) -> std::result::Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    let url = params.get("registry_url").cloned().unwrap_or_else(|| "http://localhost:8081".to_string());
+    let schema = body.get("schema").and_then(|v| v.as_str()).unwrap_or("{}");
+    let schema_type = body.get("schema_type").and_then(|v| v.as_str()).unwrap_or("AVRO");
+    let client = rustlake_stream::schema_registry::SchemaRegistryClient::new(&url);
+    match client.check_compatibility(&subject, schema, schema_type).await {
+        Ok(compatible) => Ok(Json(serde_json::json!({ "is_compatible": compatible, "subject": subject }))),
+        Err(e) => Err((StatusCode::BAD_GATEWAY, Json(ErrorResponse { error: format!("Schema Registry error: {}", e) }))),
+    }
+}
+
+#[cfg(not(feature = "kafka"))]
+async fn check_schema_compatibility(Path(_subject): Path<String>, Json(_body): Json<serde_json::Value>) -> std::result::Result<Json<serde_json::Value>, (StatusCode, Json<ErrorResponse>)> {
+    Err((StatusCode::NOT_IMPLEMENTED, Json(ErrorResponse { error: "Kafka/Schema Registry support not compiled".into() })))
 }
 
 // ── S3 / Object Storage Config Handlers ─────────────────────────────
@@ -12032,6 +12434,19 @@ async fn execute_executable_table(
         } else {
             ("failed".to_string(), None, result.error, result.compile_ms, result.run_ms, cached, None)
         }
+    } else if transform_type == "streaming_cdc" {
+        // Streaming CDC glacier: the source_code contains a SQL query that reads from
+        // the pipeline's sink table. Execute it like a SQL transform — this produces a
+        // refined "silver" layer from the raw CDC "bronze" data.
+        let sql = extract_sql_from_streaming_cdc(&source_code);
+        let ctx = state.ctx.read().await;
+        match ctx.sql(&sql).await {
+            Ok(batches) => {
+                let rows: usize = batches.iter().map(|b| b.num_rows()).sum();
+                ("success".to_string(), Some(rows as u64), None, 0u64, start.elapsed().as_millis() as u64, false, Some(batches))
+            }
+            Err(e) => ("failed".to_string(), None, Some(e.to_string()), 0, 0, false, None)
+        }
     } else {
         ("unsupported".to_string(), None, Some(format!("Transform type '{}' not yet supported", transform_type)), 0, 0, false, None)
     };
@@ -12637,6 +13052,370 @@ async fn cost_comparison(Json(req): Json<CostComparisonRequest>) -> Json<serde_j
         req.executions_per_day,
     );
     Json(serde_json::to_value(&comparison).unwrap_or_default())
+}
+
+/// Convert SQL to a Glacier — creates an executable table with a compiled Rust wrapper.
+///
+/// Takes a SQL query and optional name, wraps the SQL in a Rust binary template,
+/// creates the glacier with quality gates inferred from the SQL, and returns
+/// the glacier + generated Rust code.
+async fn convert_sql_to_glacier(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let sql = req.get("sql").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let name = req.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let compile = req.get("compile").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    if sql.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "sql is required"}))));
+    }
+
+    let table_name = if name.is_empty() {
+        // Derive name from SQL — use first table referenced
+        let words: Vec<&str> = sql.split_whitespace().collect();
+        let from_idx = words.iter().position(|w| w.eq_ignore_ascii_case("FROM"));
+        if let Some(idx) = from_idx {
+            if idx + 1 < words.len() {
+                format!("glacier_{}", words[idx + 1].trim_matches(|c: char| !c.is_alphanumeric() && c != '_'))
+            } else {
+                format!("glacier_{}", chrono::Utc::now().timestamp())
+            }
+        } else {
+            format!("glacier_{}", chrono::Utc::now().timestamp())
+        }
+    } else {
+        name
+    };
+
+    // Generate Rust wrapper code
+    let rust_code = crate::rust_executor::wrap_sql_in_rust(&sql);
+    let source_hash = crate::executable_table::hash_source(&sql);
+
+    // Infer quality gates from SQL
+    let mut gates = vec![
+        crate::executable_table::QualityGateRef {
+            gate_type: "row_count".into(),
+            column: None,
+            threshold: None,
+            description: "Must produce rows".into(),
+        },
+    ];
+
+    // Parse SQL for column names to add not_null gates on key columns
+    let lineage = crate::executable_table::parse_sql_column_lineage(&sql, &[]);
+    for entry in lineage.iter().take(3) {
+        if entry.output_column != "*" {
+            gates.push(crate::executable_table::QualityGateRef {
+                gate_type: "not_null".into(),
+                column: Some(entry.output_column.clone()),
+                threshold: None,
+                description: format!("{} must not be null", entry.output_column),
+            });
+        }
+    }
+
+    // Determine transform type based on compile flag
+    let (transform_type, source_code) = if compile {
+        ("rust".to_string(), rust_code.clone())
+    } else {
+        ("sql".to_string(), sql.clone())
+    };
+
+    // Parse input tables from SQL
+    let input_tables: Vec<String> = {
+        let words: Vec<&str> = sql.split_whitespace().collect();
+        let mut tables = Vec::new();
+        let mut i = 0;
+        while i < words.len() {
+            if words[i].eq_ignore_ascii_case("FROM") || words[i].eq_ignore_ascii_case("JOIN") {
+                if i + 1 < words.len() {
+                    let t = words[i + 1].trim_matches(|c: char| !c.is_alphanumeric() && c != '_' && c != '.');
+                    if !t.is_empty() && !t.eq_ignore_ascii_case("(") {
+                        tables.push(t.to_string());
+                    }
+                }
+            }
+            i += 1;
+        }
+        tables.sort();
+        tables.dedup();
+        tables
+    };
+
+    let table = crate::executable_table::ExecutableTable {
+        table_name: table_name.clone(),
+        table_location: format!("s3://warehouse/{}", table_name),
+        transform: crate::executable_table::TableTransform {
+            transform_type,
+            source_code,
+            source_hash: source_hash.clone(),
+            binary_path: None,
+            binary_size: None,
+            binary_cached: false,
+            compiler_version: None,
+            target_arch: None,
+        },
+        schedule: None,
+        quality_gates: gates.clone(),
+        input_tables,
+        status: crate::executable_table::ExecutableTableStatus {
+            state: "active".into(),
+            health: "healthy".into(),
+            last_error: None,
+            staleness_hours: 0.0,
+            data_freshness: "unknown".into(),
+        },
+        history: Vec::new(),
+        versions: Vec::new(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        last_refresh: None,
+        next_refresh: None,
+        estimated_cost_usd: 0.001,
+        total_executions: 0,
+        total_cost_usd: 0.0,
+        incremental: false,
+        watermark_column: None,
+        last_watermark: None,
+        executions_skipped: 0,
+        cost_saved_usd: 0.0,
+        auto_refresh: false,
+        refresh_interval_seconds: 0,
+    };
+
+    state.executable_tables.write().await.push(table);
+
+    Ok(Json(serde_json::json!({
+        "status": "converted",
+        "glacier": table_name,
+        "source_hash": source_hash,
+        "transform_type": if compile { "rust (compiled SQL)" } else { "sql" },
+        "quality_gates": gates.len(),
+        "rust_wrapper": rust_code,
+        "input_tables_detected": serde_json::json!({}),
+    })))
+}
+
+/// POST /api/v1/executable-tables/from-pipeline — create a Glacier from a streaming CDC pipeline.
+///
+/// This promotes a streaming pipeline (Kafka CDC, MongoDB CDC, etc.) to a full
+/// Glacier (executable table) with quality gates, versioning, lineage tracking,
+/// auto-refresh via the streaming pipeline, and compliance auditing.
+async fn create_glacier_from_pipeline(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let pipeline_id = req.get("pipeline_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let glacier_name = req.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let transform_sql = req.get("transform_sql").and_then(|v| v.as_str()).map(|s| s.to_string());
+    let quality_gates_json = req.get("quality_gates");
+
+    if pipeline_id.is_empty() {
+        return Err((StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "pipeline_id is required"}))));
+    }
+
+    // Find the streaming pipeline
+    let pipeline = {
+        let pipelines = state.streaming_pipelines.read().await;
+        pipelines.iter().find(|p| p.id == pipeline_id).cloned()
+    };
+    let pipeline = pipeline.ok_or_else(|| {
+        (StatusCode::NOT_FOUND, Json(serde_json::json!({"error": format!("Pipeline '{}' not found", pipeline_id)})))
+    })?;
+
+    // Derive glacier name from pipeline if not provided
+    let table_name = if glacier_name.is_empty() {
+        format!("glacier_{}", pipeline.name.replace('-', "_").replace(' ', "_"))
+    } else {
+        glacier_name
+    };
+
+    // Check if glacier already exists
+    {
+        let tables = state.executable_tables.read().await;
+        if tables.iter().any(|t| t.table_name == table_name) {
+            return Err((StatusCode::CONFLICT, Json(serde_json::json!({"error": format!("Glacier '{}' already exists", table_name)}))));
+        }
+    }
+
+    // Build the streaming CDC transform source code.
+    // The pipeline registers its sink table under a name derived from the pipeline name.
+    let registered_sink_name = pipeline.name.replace('-', "_").replace(' ', "_");
+
+    let source_code = if let Some(ref sql) = transform_sql {
+        // User-provided SQL transform applied to CDC data
+        format!(
+            "-- Glacier: {} (from streaming pipeline '{}')\n-- Source: {} → {}\n-- Registered sink table: {}\n-- Transform SQL applied to incoming CDC events\n\n{}",
+            table_name, pipeline.name, pipeline.source_type, pipeline.sink_table, registered_sink_name, sql
+        )
+    } else {
+        // Default: SELECT * from the registered CDC sink table
+        format!(
+            "-- Glacier: {} (from streaming pipeline '{}')\n-- Source: {} → {}\n-- Registered sink table: {}\n\nSELECT * FROM {}",
+            table_name, pipeline.name, pipeline.source_type, pipeline.sink_table, registered_sink_name, registered_sink_name
+        )
+    };
+
+    let source_hash = crate::executable_table::hash_source(&source_code);
+
+    // Build quality gates
+    let quality_gates: Vec<crate::executable_table::QualityGateRef> = if let Some(gates) = quality_gates_json {
+        serde_json::from_value(gates.clone()).unwrap_or_else(|_| default_cdc_gates())
+    } else {
+        default_cdc_gates()
+    };
+
+    // Infer input tables from the pipeline source config
+    let mut input_tables = Vec::new();
+    if pipeline.source_type == "mongodb-cdc" {
+        if let Some(db) = pipeline.source_config.get("database").and_then(|v| v.as_str()) {
+            if let Some(col) = pipeline.source_config.get("collection").and_then(|v| v.as_str()) {
+                input_tables.push(format!("mongo.{}.{}", db, col));
+            }
+        }
+    } else if pipeline.source_type == "kafka" {
+        if let Some(topic) = pipeline.source_config.get("topic").and_then(|v| v.as_str()) {
+            input_tables.push(format!("kafka.{}", topic));
+        }
+    }
+    // The sink table is also an input to the glacier (the materialized data)
+    if !pipeline.sink_table.is_empty() {
+        input_tables.push(pipeline.sink_table.clone());
+    }
+
+    let table = crate::executable_table::ExecutableTable {
+        table_name: table_name.clone(),
+        table_location: pipeline.sink_table.clone(),
+        transform: crate::executable_table::TableTransform {
+            transform_type: "streaming_cdc".into(),
+            source_code,
+            source_hash: source_hash.clone(),
+            binary_path: None,
+            binary_size: None,
+            binary_cached: false,
+            compiler_version: None,
+            target_arch: None,
+        },
+        schedule: None, // Streaming CDC is continuous, not scheduled
+        quality_gates: quality_gates.clone(),
+        input_tables,
+        status: crate::executable_table::ExecutableTableStatus {
+            state: "active".into(),
+            health: if pipeline.status == "running" { "healthy" } else { "warning" }.into(),
+            last_error: None,
+            staleness_hours: 0.0,
+            data_freshness: if pipeline.status == "running" { "fresh" } else { "unknown" }.into(),
+        },
+        history: if pipeline.events_processed > 0 {
+            vec![crate::executable_table::ExecutionRecord {
+                execution_id: Uuid::new_v4().to_string(),
+                started_at: pipeline.created_at.to_rfc3339(),
+                completed_at: Some(chrono::Utc::now().to_rfc3339()),
+                duration_ms: 0,
+                status: "success".into(),
+                rows_produced: Some(pipeline.events_processed),
+                bytes_written: None,
+                cost_usd: 0.0,
+                binary_cached: false,
+                compile_ms: 0,
+                run_ms: 0,
+                error: None,
+                execution_location: "streaming".into(),
+                version: 1,
+            }]
+        } else {
+            Vec::new()
+        },
+        versions: vec![crate::executable_table::TransformVersion {
+            version: 1,
+            source_code: format!("streaming_cdc:{}", pipeline_id),
+            source_hash: source_hash.clone(),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            created_by: "pipeline-promotion".into(),
+            change_description: format!("Created from streaming pipeline '{}'", pipeline.name),
+            binary_size_bytes: None,
+            snapshot_ids: Vec::new(),
+        }],
+        created_at: chrono::Utc::now().to_rfc3339(),
+        last_refresh: if pipeline.events_processed > 0 { Some(chrono::Utc::now().to_rfc3339()) } else { None },
+        next_refresh: None,
+        estimated_cost_usd: 0.0, // Streaming is continuous, cost tracked differently
+        total_executions: if pipeline.events_processed > 0 { 1 } else { 0 },
+        total_cost_usd: 0.0,
+        incremental: true, // CDC is inherently incremental
+        watermark_column: Some("timestamp".into()),
+        last_watermark: None,
+        executions_skipped: 0,
+        cost_saved_usd: 0.0,
+        auto_refresh: true,
+        refresh_interval_seconds: 0, // Continuous, not interval-based
+    };
+
+    let props = crate::executable_table::to_iceberg_properties(&table);
+    state.executable_tables.write().await.push(table);
+
+    tracing::info!(
+        glacier = %table_name,
+        pipeline_id = %pipeline_id,
+        pipeline_name = %pipeline.name,
+        source_type = %pipeline.source_type,
+        events = pipeline.events_processed,
+        "Glacier created from streaming pipeline"
+    );
+
+    Ok(Json(serde_json::json!({
+        "status": "created",
+        "glacier": table_name,
+        "pipeline_id": pipeline_id,
+        "pipeline_name": pipeline.name,
+        "source_type": pipeline.source_type,
+        "sink_table": pipeline.sink_table,
+        "transform_type": "streaming_cdc",
+        "source_hash": source_hash,
+        "quality_gates": quality_gates.len(),
+        "incremental": true,
+        "events_already_processed": pipeline.events_processed,
+        "files_written": pipeline.files_written,
+        "iceberg_properties": props,
+    })))
+}
+
+/// Extract the SQL query from a streaming_cdc transform's source_code.
+///
+/// The source_code contains comment headers followed by a SQL query.
+/// We extract the last SQL statement (after all `--` comment lines).
+fn extract_sql_from_streaming_cdc(source_code: &str) -> String {
+    let sql_lines: Vec<&str> = source_code
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim();
+            !trimmed.is_empty() && !trimmed.starts_with("--")
+        })
+        .collect();
+
+    if sql_lines.is_empty() {
+        // Fallback: treat the whole thing as SQL
+        source_code.to_string()
+    } else {
+        sql_lines.join("\n")
+    }
+}
+
+fn default_cdc_gates() -> Vec<crate::executable_table::QualityGateRef> {
+    vec![
+        crate::executable_table::QualityGateRef {
+            gate_type: "row_count".into(),
+            column: None,
+            threshold: None,
+            description: "CDC batch must produce rows".into(),
+        },
+        crate::executable_table::QualityGateRef {
+            gate_type: "not_null".into(),
+            column: Some("timestamp".into()),
+            threshold: None,
+            description: "Timestamp must not be null".into(),
+        },
+    ]
 }
 
 // ── Code-Data Provenance (Binary Time Travel) Handlers ──────────

@@ -3,8 +3,17 @@ name = "rustlake-api"
 version.workspace = true
 edition.workspace = true
 
+[[bin]]
+name = "rustlake-api"
+path = "src/main.rs"
+
+[[bin]]
+name = "rustlake"
+path = "src/main.rs"
+
 [features]
-default = ["duckdb", "postgres", "mysql", "sqlite", "polars"]
+default = ["duckdb", "postgres", "mysql", "sqlite", "polars", "kafka"]
+kafka = ["rustlake-stream/kafka"]
 duckdb = ["rustlake-engine/duckdb", "dep:duckdb"]
 polars = ["rustlake-engine/polars"]
 postgres = ["datafusion-table-providers/postgres-federation"]
@@ -40,6 +49,7 @@ datafusion = { workspace = true }
 datafusion-table-providers = { workspace = true, optional = true }
 datafusion-federation = { workspace = true }
 anyhow = { workspace = true }
+clap = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 tokio-postgres = { workspace = true }

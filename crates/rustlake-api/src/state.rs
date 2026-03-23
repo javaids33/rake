@@ -694,6 +694,9 @@ pub struct AppState {
     pub credential_store: crate::credential_store::CredentialStore,
     /// Active MongoDB CDC sources keyed by pipeline ID.
     pub cdc_sources: RwLock<std::collections::HashMap<String, std::sync::Arc<crate::mongodb_cdc::MongoDbCdcSource>>>,
+    /// Active Kafka consumers keyed by pipeline ID.
+    #[cfg(feature = "kafka")]
+    pub active_kafka_consumers: RwLock<std::collections::HashMap<String, std::sync::Arc<rustlake_stream::kafka::KafkaSource>>>,
     /// Broadcast channel for real-time pipeline event updates.
     /// The CDC consumer sends updates here, and the SSE loop reads them to push to the UI immediately.
     pub pipeline_events_tx: tokio::sync::broadcast::Sender<PipelineEvent>,
@@ -807,6 +810,8 @@ impl AppState {
             read_only_tables: RwLock::new(std::collections::HashSet::new()),
             credential_store: crate::credential_store::CredentialStore::new(),
             cdc_sources: RwLock::new(std::collections::HashMap::new()),
+            #[cfg(feature = "kafka")]
+            active_kafka_consumers: RwLock::new(std::collections::HashMap::new()),
             pipeline_events_tx: tokio::sync::broadcast::channel(256).0,
             #[cfg(feature = "duckdb")]
             state_db: match crate::state_db::StateDb::open("rustlake_state.duckdb") {
@@ -880,6 +885,8 @@ impl AppState {
             read_only_tables: RwLock::new(std::collections::HashSet::new()),
             credential_store: crate::credential_store::CredentialStore::new(),
             cdc_sources: RwLock::new(std::collections::HashMap::new()),
+            #[cfg(feature = "kafka")]
+            active_kafka_consumers: RwLock::new(std::collections::HashMap::new()),
             pipeline_events_tx: tokio::sync::broadcast::channel(256).0,
             #[cfg(feature = "duckdb")]
             state_db: match crate::state_db::StateDb::open("rustlake_state.duckdb") {

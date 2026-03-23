@@ -255,7 +255,7 @@ export function Settings() {
                 <div className="grid grid-cols-1 gap-3">
                   {[
                     { name: 'Pyodide', version: 'v0.26.4', size: '~10 MB', desc: 'Python runtime — pandas, numpy, matplotlib, scipy, scikit-learn', status: 'Available', color: 'text-cyan-400', bg: 'bg-cyan-500/10 border-cyan-500/20' },
-                    { name: 'DuckDB-WASM', version: 'v1.1', size: '~8 MB', desc: 'Offline SQL analytics — query Parquet files without server', status: 'Available', color: 'text-amber-400', bg: 'bg-amber-500/10 border-amber-500/20' },
+                    { name: 'DuckDB-WASM', version: 'v1.29.0', size: '~8 MB', desc: 'Browser-side SQL — query CSV/Parquet/JSON files locally. Use "-- @wasm" in notebooks or DuckDB-WASM engine in SQL Editor.', status: 'Available', color: 'text-amber-400', bg: 'bg-amber-500/10 border-amber-500/20' },
                     { name: 'SQLite-WASM', version: 'v3.46', size: '~1 MB', desc: 'Local persistence — notebooks, settings survive offline', status: 'Planned', color: 'text-emerald-400', bg: 'bg-emerald-500/10 border-emerald-500/20' },
                     { name: 'Arrow-WASM', version: 'v17', size: '~2 MB', desc: 'Zero-copy data exchange between browser engines', status: 'Planned', color: 'text-rose-400', bg: 'bg-rose-500/10 border-rose-500/20' },
                   ].map(engine => (

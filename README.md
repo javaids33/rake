@@ -5,7 +5,7 @@
   <img src="https://img.shields.io/badge/license-Apache%202.0-blue" alt="License">
   <img src="https://img.shields.io/badge/rust-1.75%2B-orange" alt="Rust Version">
   <img src="https://img.shields.io/badge/crates-13-yellow" alt="Crate Count">
-  <img src="https://img.shields.io/badge/tests-183%20pass-brightgreen" alt="Tests">
+  <img src="https://img.shields.io/badge/tests-195%20pass-brightgreen" alt="Tests">
   <img src="https://img.shields.io/badge/TPC--H-22%2F22%20pass-brightgreen" alt="TPC-H">
   <img src="https://img.shields.io/badge/build-passing-brightgreen" alt="Build Status">
 </p>
@@ -74,7 +74,7 @@ RustLake is the only platform where SQL, Python, Rust, and Spark SQL run in the 
 
 | Language | Execution | Cold Start | Best For |
 |----------|-----------|------------|----------|
-| **SQL** | DataFusion (in-process) | 0ms | Queries, joins, aggregations |
+| **SQL** | DataFusion (in-process), or DuckDB-WASM (browser) with `-- @wasm` prefix | 0ms | Queries, joins, aggregations |
 | **Rust** | Compiled by `rustc`, binary cached | 2ms (cached) / 300ms (cold) | Algorithms, ML inference, custom logic |
 | **Python** | Pyodide WASM (browser-side) | 0ms (loaded) | Pandas, matplotlib, data science |
 | **Spark SQL** | Auto-translated to DataFusion | 0ms | Migration from Databricks (zero rewrite) |
@@ -88,9 +88,11 @@ RustLake loads compute engines directly into the browser via WebAssembly:
 | Engine | What It Does | No Other Platform Offers This |
 |--------|-------------|------------------------------|
 | **Pyodide** | Full Python + pandas + numpy + matplotlib in the browser | Databricks/Snowflake need server-side kernels |
-| **DuckDB-WASM** | Offline SQL analytics on local/S3 Parquet files | Query data when the server is down |
+| **DuckDB-WASM** | Full SQL analytics in-browser via `@duckdb/duckdb-wasm` v1.29.0 — drag & drop CSV/Parquet/JSON, query via `queryLocalFile()` | Query data when the server is down, works offline |
 | **SQLite-WASM** | Persistent local storage for notebooks and settings | Work survives browser clears |
 | **Arrow-WASM** | Zero-copy data transfer between WASM engines | 10x faster than JSON between engines |
+
+DuckDB-WASM is fully integrated: the SQL Editor offers "DuckDB-WASM (browser)" as an engine option, and Notebook SQL cells prefixed with `-- @wasm` route to browser-side DuckDB. The `queryLocalFile()` API lets users drag & drop local files and query them without any server round-trip.
 
 This means RustLake works at full capability in three modes: connected (server-side power), degraded (server down, WASM available), and offline (airplane mode, sensitive data stays local).
 
@@ -216,7 +218,8 @@ All subsystems — SQL engine, vector search, scheduler, streaming, transforms, 
 ### Notebooks & WASM
 - **Interactive Notebooks** — SQL, Python, Markdown, and Rust cells with Monaco editor. Results render inline as tables, charts, and matplotlib plots.
 - **Pyodide WASM** — Full Python runtime (pandas, numpy, matplotlib, scipy) executes in the browser. SQL cell results automatically become DataFrames (`_result_1`, `_result_2`).
-- **Browser-Side Compute** — No server round-trips needed for Python data science. Works offline, zero compute cost, instant startup.
+- **DuckDB-WASM** — `@duckdb/duckdb-wasm` v1.29.0 for browser-side SQL. "DuckDB-WASM (browser)" engine in SQL Editor, `-- @wasm` prefix in Notebook SQL cells. Drag & drop local files via `queryLocalFile()`.
+- **Browser-Side Compute** — No server round-trips needed for Python data science or SQL analytics. Works offline, zero compute cost, instant startup.
 - **Graph Visualization** — Force-directed Canvas 2D renderer for Neo4j Cypher results with drag, zoom, pan, and tooltips.
 
 ### Data Engineering
@@ -241,9 +244,9 @@ RustLake ships with a 20-page React dashboard built on Vite, Tailwind CSS, and M
 | Page | Path | Description |
 |------|------|-------------|
 | **Home** | `/` | Platform overview — search, quick actions, recent queries, connections |
-| **Catalog** | `/catalog` | Source-grouped table browser (PostgreSQL, MongoDB, S3/MinIO, etc.) with 7 tabs: Schema, Preview, Statistics, Lineage, History, Maintenance, Metadata |
-| **SQL Editor** | `/sql` | Multi-tab Monaco editor with catalog sidebar, engine selector, cost estimation, compare all engines |
-| **Notebooks** | `/notebooks` | Interactive notebook with SQL/Python/Markdown/Rust cells, WASM engine status panel |
+| **Catalog** | `/catalog` | Source-grouped left panel (PostgreSQL, MongoDB, S3/MinIO, Other) with S3 Bucket/Schema/Table tree, format badges (iceberg=violet, parquet=amber, glacier=cyan), S3 Storage Info panel, 7 tabs: Schema, Preview, Statistics, Lineage, History, Maintenance, Metadata |
+| **SQL Editor** | `/sql` | Multi-tab Monaco editor with catalog sidebar, engine selector (DataFusion/DuckDB/Polars/DuckDB-WASM), cost estimation, compare all engines |
+| **Notebooks** | `/notebooks` | Interactive notebook with SQL/Python/Markdown/Rust cells, WASM engine status panel, `-- @wasm` prefix routes SQL to browser-side DuckDB, inline cron picker for "Schedule as Job" |
 | **Query History** | `/history` | Full audit log with duration, engine, status, and query replay |
 | **Data Sources** | `/sources` | Connection management — Postgres, MySQL, MongoDB, Trino, Neo4j, S3/MinIO |
 | **Streaming / CDC** | `/streaming` | CDC pipeline creation, monitoring, live event stream, S3 sink configuration |
@@ -256,7 +259,7 @@ RustLake ships with a 20-page React dashboard built on Vite, Tailwind CSS, and M
 | **Workflow Viz** | `/workflow` | Real-time memory distribution, query pipeline flow, active job monitor |
 | **Benchmarks** | `/benchmarks` | TPC-H benchmark runner with multi-engine comparison |
 | **Settings** | `/settings` | System info, query router config, WASM engines, data providers, Flight/cluster config |
-| **Glaciers** | `/glaciers` | Versioned transforms — 6-tab detail view (Versions, Diff, History, Compare, Contracts, Lineage), quality gates, cascade replay |
+| **Glaciers** | `/glaciers` | Versioned transforms — 6-tab detail view (Versions, Diff, History, Compare, Contracts, Lineage), quality gates, cascade replay, "Templates" button |
 | **Data Products** | `/data-products` | Compliance audit dashboard — freshness SLA, quality score, provenance chain, certification status |
 | **About** | `/about` | Platform version, architecture, credits |
 
@@ -267,7 +270,7 @@ RustLake uses WebAssembly to run compute engines directly in the browser — a c
 | Engine | Size | Status | What It Does |
 |--------|------|--------|-------------|
 | **Pyodide** | ~10 MB | Available | Full Python runtime — pandas, numpy, matplotlib, scipy, scikit-learn |
-| **DuckDB-WASM** | ~8 MB | Available | Offline SQL analytics — query Parquet files without any server |
+| **DuckDB-WASM** | ~8 MB | Available (v1.29.0) | Offline SQL analytics — query local CSV/Parquet/JSON files in-browser, "DuckDB-WASM (browser)" engine in SQL Editor, `-- @wasm` prefix in Notebooks |
 | **SQLite-WASM** | ~1 MB | Planned | Local persistence — notebooks, settings survive offline |
 | **Arrow-WASM** | ~2 MB | Planned | Zero-copy data exchange between WASM engines |
 
@@ -297,7 +300,7 @@ Measured on Apple M2, 8 cores, 16GB RAM:
 
 Rust binary caching delivers **2ms execution** on re-runs — faster than most SQL queries. The binary persists to S3 for cross-node sharing.
 
-### Executable Table Execution Model
+### Glacier (Executable Table) Execution Model
 
 RustLake compiles Rust transforms to ~470KB native binaries, cached by content hash (FNV-1a). SQL transforms execute through DataFusion in-process with no compilation step.
 
@@ -456,7 +459,7 @@ Failed quality gates prevent the Iceberg snapshot from committing — bad data n
 | **Executable Pipelines** | Named chain of tables — execution stops on gate/contract failure | `POST /api/v1/executable-pipelines/{id}/run` |
 | **Time-Travel Debug** | Compare bad vs good executions — code diff, data diff, upstream changes | `POST /api/v1/executable-tables/{name}/debug` |
 | **Cost-Aware Scheduling** | Skip unchanged, incremental for small deltas, full for large changes | Built into scheduler tick |
-| **Self-Healing** | Auto-rollback to last known-good version on quality gate failure | Built into scheduler tick |
+| **Self-Healing** | Auto-rollback to last known-good version on quality gate failure (`created_by: "auto-heal"`), health set to "warning", resets to "healthy" when gates pass | Built into scheduler tick |
 | **Data Products** | SLA-bound, certified datasets with provenance chain and compliance audit | `GET /api/v1/data-products/{name}/audit` |
 
 **The compliance audit demo:** A regulator asks "prove the risk score for customer X on March 15th was computed correctly." RustLake assembles: time-travel snapshot → code version → cascade replay → A/B verification → gate results → contract validation → full audit JSON. Seconds, not weeks.
@@ -549,17 +552,27 @@ cargo build --bin rustlake-api --no-default-features
 | `clickhouse` | no | ClickHouse federation |
 | `flight-sql-client` | no | Flight SQL client for remote engines |
 
-### 2. Start the API server
+### 2. Start the platform
 
 ```bash
-# Development (debug build)
-cargo run --bin rustlake-api
+# Install from crates.io (gives you the `rustlake` binary)
+cargo install rustlake-api
+
+# Start the full platform (API server + scheduler + all engines)
+rustlake serve
 # Server starts at http://127.0.0.1:3000
 # Includes: sample data, 20 pre-indexed vector docs, 6 transform models
 
-# Release
+# Custom port/host
+rustlake serve --port 8080 --host 0.0.0.0
+
+# Or run from source (development)
+cargo run --bin rustlake-api
+# Release build
 cargo run --release --bin rustlake-api
 ```
+
+Running `rustlake` with no arguments defaults to `serve` (starts the server).
 
 #### Environment variables
 
@@ -725,18 +738,23 @@ cargo fmt --check
 ### 7. CLI usage
 
 ```bash
-# Run SQL from the command line
-cargo run --bin rustlake -- query "SELECT count(*) FROM 'sample-data/sales.csv'"
+# Install the binary
+cargo install rustlake-api
 
-# Start the API server via CLI
+# Start the full platform (default command — runs if no args given)
+rustlake serve
+rustlake serve --port 8080 --host 0.0.0.0
+rustlake serve --port 8080 --flight  # with Flight SQL
+
+# Show help
+rustlake --help
+
+# Run SQL from the command line (lightweight query-only tool)
+rustlake-query "SELECT count(*) FROM 'sample-data/sales.csv'"
+
+# Or run from source during development
 cargo run --bin rustlake -- serve
-cargo run --bin rustlake -- serve --port 8080 --flight  # with Flight SQL
-
-# List registered tables
-cargo run --bin rustlake -- tables list
-
-# Register a file as a table
-cargo run --bin rustlake -- tables register --path /path/to/data.parquet --name my_table
+cargo run --bin rustlake -- serve --port 8080 --flight
 ```
 
 ## Crate Map
@@ -763,10 +781,12 @@ crates/
 ### Single Node (Development / Small Team)
 
 ```bash
-# Build release binary (~100ms cold start)
-cargo build --release --bin rustlake-api
+# Option 1: Install from crates.io
+cargo install rustlake-api
+RUSTLAKE_SECRET_KEY=your-secret-key rustlake serve
 
-# Run with all engines enabled
+# Option 2: Build from source (~100ms cold start)
+cargo build --release --bin rustlake-api
 RUSTLAKE_SECRET_KEY=your-secret-key \
 RUSTLAKE_DUCKDB__ENABLED=true \
 RUSTLAKE_POLARS__ENABLED=true \
@@ -836,14 +856,14 @@ RUSTLAKE_CLUSTER__NODE_ROLE=coordinator \
 RUSTLAKE_FLIGHT__ENABLED=true \
 RUSTLAKE_FLIGHT__HOST=0.0.0.0 \
 RUSTLAKE_FLIGHT__PORT=50051 \
-./target/release/rustlake-api
+rustlake serve
 
 # Start workers (on different machines/containers)
 RUSTLAKE_CLUSTER__NODE_ROLE=worker \
 RUSTLAKE_CLUSTER__COORDINATOR_HOST=coordinator-host \
 RUSTLAKE_CLUSTER__COORDINATOR_PORT=50051 \
 RUSTLAKE_FLIGHT__ENABLED=true \
-./target/release/rustlake-api
+rustlake serve
 ```
 
 ### Distribution Strategies
@@ -940,6 +960,7 @@ The **Workflow Viz** page (`/workflow`) shows real-time memory distribution acro
 | `POST` | `/api/v1/notebook/execute-rust` | Compile and run Rust code (with binary cache) |
 | `GET` | `/api/v1/spark/compat` | Spark SQL compatibility matrix |
 | `POST` | `/api/v1/spark/translate` | Translate Spark SQL to DataFusion SQL |
+| `POST` | `/api/v1/executable-tables/convert-sql` | Convert SQL to glacier with auto-generated quality gates |
 
 ## Tech Stack
 

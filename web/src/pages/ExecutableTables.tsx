@@ -28,6 +28,7 @@ const transformColors: Record<string, string> = {
   rust: 'text-orange-400 bg-orange-400/10 border-orange-400/20',
   notebook: 'text-violet-400 bg-violet-400/10 border-violet-400/20',
   python: 'text-cyan-400 bg-cyan-400/10 border-cyan-400/20',
+  streaming_cdc: 'text-emerald-400 bg-emerald-400/10 border-emerald-400/20',
 }
 
 const eventColors: Record<string, string> = {
@@ -394,6 +395,12 @@ function CreateFormModal({ onCreated, onClose, initialSql, initialType }: {
         </div>
 
         <div className="p-6 space-y-4">
+          {/* What you get banner */}
+          <div className="rounded-lg border border-cyan-400/20 bg-cyan-400/[0.03] p-3">
+            <p className="text-xs text-cyan-300 font-medium mb-1">What a Glacier gives you</p>
+            <p className="text-2xs text-zinc-400">Versioned transforms with quality gates, column lineage, self-healing auto-rollback, compliance audit, and Iceberg v2 output. Every change is tracked. Every execution is validated.</p>
+          </div>
+
           <div className="grid grid-cols-2 gap-4">
             <Input label="Glacier name" placeholder="orders_daily" value={name} onChange={e => setName(e.target.value)} />
             <div className="flex flex-col gap-1.5">
@@ -403,14 +410,19 @@ function CreateFormModal({ onCreated, onClose, initialSql, initialType }: {
                 onChange={e => setTransformType(e.target.value)}
                 className="px-3 py-2 text-sm rounded-lg bg-navy-900/60 border border-white/[0.06] text-zinc-100 focus:outline-none focus:ring-1 focus:ring-amber-400/25"
               >
-                <option value="sql">SQL</option>
-                <option value="rust">Rust</option>
+                <option value="sql">SQL — runs via DataFusion (instant, no compilation)</option>
+                <option value="rust">Rust — compiles to native binary (~470KB, cached on S3)</option>
               </select>
+              <p className="text-2xs text-zinc-600">
+                {transformType === 'sql'
+                  ? 'SQL transforms execute in-process via DataFusion. Fastest option for most workflows.'
+                  : 'Rust transforms compile once (~300ms), then run at native speed (2-7ms cached). Self-contained binary is deployable to Lambda, edge, or CI/CD.'}
+              </p>
             </div>
           </div>
 
           <Textarea
-            label="SQL / Rust source"
+            label={transformType === 'sql' ? 'SQL query' : 'Rust source code'}
             rows={6}
             placeholder={transformType === 'sql' ? 'SELECT * FROM raw_orders WHERE ...' : 'fn main() { ... }'}
             value={source}

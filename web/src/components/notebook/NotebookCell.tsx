@@ -4,6 +4,7 @@ import Editor from '@monaco-editor/react'
 import { useNotebookStore } from '../../stores/notebook'
 import { executeSql } from '../../api/client'
 import { executePython } from '../../lib/pyodide'
+import { executeDuckDBWasm } from '../../lib/duckdb-wasm'
 import { CellOutput } from './CellOutput'
 import type { NotebookCell as CellType } from '../../types'
 
@@ -38,12 +39,26 @@ export function NotebookCell({ notebookId, cell, index, totalCells }: Props) {
     const order = setCellExecutionOrder(notebookId, cell.id)
 
     if (cell.type === 'sql') {
+      const useWasm = cell.source.trimStart().startsWith('-- @wasm')
       try {
-        const result = await executeSql(cell.source)
-        setCellOutput(notebookId, cell.id, {
-          type: 'table',
-          data: { columns: result.columns, rows: result.rows, row_count: result.row_count, duration_ms: result.duration_ms },
-        })
+        if (useWasm) {
+          const sql = cell.source.replace(/^--\s*@wasm\s*/m, '').trim()
+          const result = await executeDuckDBWasm(sql)
+          if (result.error) {
+            setCellOutput(notebookId, cell.id, { type: 'error', data: result.error })
+          } else {
+            setCellOutput(notebookId, cell.id, {
+              type: 'table',
+              data: { columns: result.columns, rows: result.rows, row_count: result.rowCount, duration_ms: result.durationMs },
+            })
+          }
+        } else {
+          const result = await executeSql(cell.source)
+          setCellOutput(notebookId, cell.id, {
+            type: 'table',
+            data: { columns: result.columns, rows: result.rows, row_count: result.row_count, duration_ms: result.duration_ms },
+          })
+        }
       } catch (err) {
         setCellOutput(notebookId, cell.id, { type: 'error', data: String(err) })
       }

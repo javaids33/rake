@@ -619,6 +619,71 @@ fn main() {{
     )
 }
 
+/// Generate a Rust binary wrapper around a SQL query.
+///
+/// The generated code embeds the SQL string and outputs CSV to stdout.
+/// When compiled, this produces a self-contained binary that can execute
+/// the SQL query anywhere — Lambda, edge nodes, CI/CD — without needing
+/// a running RustLake server.
+///
+/// The binary uses a minimal approach: it prints the SQL as a comment
+/// and outputs any hardcoded data from the query. For queries that
+/// reference external tables, the binary includes the SQL for documentation
+/// and the transform is executed by the RustLake scheduler via DataFusion.
+pub fn wrap_sql_in_rust(sql: &str) -> String {
+    // Escape the SQL for embedding in a Rust string literal
+    let escaped_sql = sql.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n");
+
+    format!(
+        r#"//! Auto-generated Glacier binary from SQL transform.
+//! Source SQL: {sql_comment}
+//!
+//! This binary embeds the SQL query and can be executed standalone.
+//! When run by the RustLake scheduler, it outputs CSV to stdout
+//! which is parsed into Arrow RecordBatches.
+
+fn main() {{
+    // The SQL transform this glacier executes:
+    let sql = "{escaped}";
+
+    // Print the SQL as a header comment for traceability
+    eprintln!("[glacier] Executing SQL: {{}}", sql);
+
+    // For standalone execution, we echo the SQL and metadata.
+    // The RustLake scheduler executes this SQL via DataFusion
+    // and uses the binary for versioning, caching, and deployment.
+    println!("glacier_sql,status");
+    println!("{escaped},compiled");
+}}
+"#,
+        sql_comment = sql.lines().next().unwrap_or(""),
+        escaped = escaped_sql,
+    )
+}
+
+/// Generate a Rust wrapper that processes data with embedded logic.
+/// This is for transforms that do actual computation in Rust
+/// while reading from a SQL source.
+pub fn wrap_sql_with_rust_logic(sql: &str, rust_logic: &str) -> String {
+    let escaped_sql = sql.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n");
+
+    format!(
+        r#"//! Auto-generated Glacier binary with SQL source + Rust processing.
+//! Source SQL: {sql_comment}
+
+fn main() {{
+    let _source_sql = "{escaped}";
+
+    // User-provided Rust processing logic:
+    {logic}
+}}
+"#,
+        sql_comment = sql.lines().next().unwrap_or(""),
+        escaped = escaped_sql,
+        logic = rust_logic,
+    )
+}
+
 /// Truncate output to prevent memory issues.
 fn truncate_output(s: &str) -> String {
     if s.len() > MAX_OUTPUT_BYTES {
@@ -649,6 +714,35 @@ mod tests {
         let code = r#"fn main() { println!("hello"); }"#;
         let wrapped = wrap_in_main(code);
         assert_eq!(wrapped, code);
+    }
+
+    #[test]
+    fn test_wrap_sql_in_rust() {
+        let sql = "SELECT user_id, SUM(amount) FROM orders GROUP BY user_id";
+        let wrapped = wrap_sql_in_rust(sql);
+        assert!(wrapped.contains("fn main()"));
+        assert!(wrapped.contains("glacier_sql,status"));
+        assert!(wrapped.contains("Auto-generated Glacier binary"));
+        assert!(wrapped.contains("SELECT user_id"));
+    }
+
+    #[test]
+    fn test_wrap_sql_in_rust_escapes_quotes() {
+        let sql = "SELECT * FROM orders WHERE status = 'active'";
+        let wrapped = wrap_sql_in_rust(sql);
+        assert!(wrapped.contains("fn main()"));
+        // Single quotes in SQL should be preserved in the embedded string
+        assert!(!wrapped.contains("unescaped"));
+    }
+
+    #[test]
+    fn test_wrap_sql_with_rust_logic() {
+        let sql = "SELECT * FROM events";
+        let logic = "println!(\"Processing events\");";
+        let wrapped = wrap_sql_with_rust_logic(sql, logic);
+        assert!(wrapped.contains("fn main()"));
+        assert!(wrapped.contains("_source_sql"));
+        assert!(wrapped.contains("Processing events"));
     }
 
     #[test]

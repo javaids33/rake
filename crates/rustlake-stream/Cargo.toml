@@ -3,6 +3,10 @@ name = "rustlake-stream"
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = ["kafka"]
+kafka = ["dep:rdkafka", "dep:apache-avro"]
+
 [dependencies]
 rustlake-core = { workspace = true }
 rustlake-format = { workspace = true }
@@ -20,3 +24,6 @@ chrono = { workspace = true }
 uuid = { workspace = true }
 bytes = { workspace = true }
 rand = { workspace = true }
+reqwest = { workspace = true }
+rdkafka = { workspace = true, optional = true }
+apache-avro = { workspace = true, optional = true }

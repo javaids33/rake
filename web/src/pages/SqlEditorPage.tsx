@@ -14,6 +14,7 @@ import { Modal } from '../components/ui/Modal'
 import { Input } from '../components/ui/Input'
 import { cn, formatDuration, QUERY_TYPE_COLORS } from '../lib/utils'
 import { executeSql, explainSql, estimateQuery, compareSql, profileSql, getTables, getTableSchema, getConnections, getS3Configs, trinoBrowse, trinoColumns, trinoRefresh } from '../api/client'
+import { executeDuckDBWasm } from '../lib/duckdb-wasm'
 import type { SqlProfileResponse } from '../api/client'
 import { useWebSocket } from '../hooks/useWebSocket'
 import { useServerEvents } from '../components/layout/Shell'
@@ -346,6 +347,34 @@ export function SqlEditorPage() {
             store.setLoading(tabId, false)
           },
         })
+        return
+      }
+
+      // DuckDB-WASM (browser-side) execution
+      if (engineChoice === 'wasm') {
+        try {
+          const wasmResult = await executeDuckDBWasm(singleSql)
+          if (wasmResult.error) {
+            store.setError(tabId, wasmResult.error)
+            store.setResult(tabId, null)
+          } else {
+            store.setResult(tabId, {
+              query_id: crypto.randomUUID(),
+              columns: wasmResult.columns,
+              rows: wasmResult.rows,
+              row_count: wasmResult.rowCount,
+              duration_ms: wasmResult.durationMs,
+              query_type: 'SELECT',
+              engine: 'duckdb-wasm',
+              execution_mode: 'browser',
+            })
+          }
+        } catch (e) {
+          store.setError(tabId, (e as Error).message)
+          store.setResult(tabId, null)
+        } finally {
+          store.setLoading(tabId, false)
+        }
         return
       }
 
@@ -708,6 +737,7 @@ export function SqlEditorPage() {
             <option value="datafusion">DataFusion</option>
             <option value="duckdb">DuckDB</option>
             <option value="polars">Polars</option>
+            <option value="wasm">DuckDB-WASM (browser)</option>
           </select>
           {wsConnected && (
             <Tooltip content="WebSocket connected — streaming results enabled">
@@ -731,14 +761,27 @@ export function SqlEditorPage() {
           <Button variant="ghost" size="sm" icon={<Gauge className="w-3.5 h-3.5 text-violet-400" />} onClick={handleProfile} loading={profiling}>
             <span className="text-violet-400">Audit</span>
           </Button>
-          <Tooltip content="Save as Glacier" position="bottom">
+          <Tooltip content="Convert SQL to Glacier — auto-creates quality gates and versioning" position="bottom">
             <button
-              onClick={() => {
+              onClick={async () => {
                 const sql = activeTab.sql.trim()
                 if (!sql) { toast.error('Write a query first'); return }
-                navigate(`/glaciers?create=true&type=sql&sql=${encodeURIComponent(sql)}`)
+                try {
+                  const res = await fetch('/api/v1/executable-tables/convert-sql', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ sql }),
+                  })
+                  if (res.ok) {
+                    const data = await res.json()
+                    toast.success(`Glacier "${data.glacier}" created with ${data.quality_gates} quality gates`)
+                    navigate('/glaciers')
+                  } else {
+                    toast.error('Failed to convert')
+                  }
+                } catch { toast.error('Failed to convert') }
               }}
-              className="flex items-center gap-1 px-2 py-1 rounded-md text-2xs text-amber-400/80 border border-amber-500/20 bg-amber-500/5 hover:bg-amber-500/10 hover:text-amber-400 transition-colors"
+              className="flex items-center gap-1 px-2 py-1 rounded-md text-2xs text-cyan-400/80 border border-cyan-500/20 bg-cyan-500/5 hover:bg-cyan-500/10 hover:text-cyan-400 transition-colors"
             >
               <Zap className="w-3 h-3" />
               <span>Glacier</span>

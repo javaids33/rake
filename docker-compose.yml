@@ -327,6 +327,29 @@ services:
     profiles:
       - streaming
 
+  # Confluent Schema Registry — Avro/JSON/Protobuf schema management
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.6.0
+    container_name: rustlake-schema-registry
+    ports:
+      - "8081:8081"
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: kafka:29092
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+    depends_on:
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8081/subjects || exit 1"]
+      interval: 15s
+      timeout: 10s
+      start_period: 20s
+      retries: 5
+    restart: unless-stopped
+    profiles:
+      - streaming
+
   # Creates default Kafka topics for demos
   kafka-init:
     image: confluentinc/cp-kafka:7.6.0

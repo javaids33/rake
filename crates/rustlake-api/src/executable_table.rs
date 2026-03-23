@@ -1489,4 +1489,180 @@ mod tests {
         assert!(!result.has_regression);
         assert_eq!(result.severity, "none");
     }
+
+    #[test]
+    fn test_build_dependency_dag() {
+        let tables = vec![
+            make_test_table("raw_events", vec![]),
+            make_test_table("user_metrics", vec!["raw_events"]),
+            make_test_table("risk_scores", vec!["user_metrics"]),
+        ];
+        let dag = build_dependency_dag(&tables);
+        assert_eq!(dag.len(), 3);
+        assert!(dag["raw_events"].is_empty());
+        assert_eq!(dag["user_metrics"], vec!["raw_events"]);
+        assert_eq!(dag["risk_scores"], vec!["user_metrics"]);
+    }
+
+    #[test]
+    fn test_topological_sort_upstream_linear() {
+        let tables = vec![
+            make_test_table("a", vec![]),
+            make_test_table("b", vec!["a"]),
+            make_test_table("c", vec!["b"]),
+        ];
+        let dag = build_dependency_dag(&tables);
+        let order = topological_sort_upstream(&dag, "c");
+        assert_eq!(order, vec!["a", "b", "c"]);
+    }
+
+    #[test]
+    fn test_topological_sort_upstream_diamond() {
+        let tables = vec![
+            make_test_table("root", vec![]),
+            make_test_table("left", vec!["root"]),
+            make_test_table("right", vec!["root"]),
+            make_test_table("leaf", vec!["left", "right"]),
+        ];
+        let dag = build_dependency_dag(&tables);
+        let order = topological_sort_upstream(&dag, "leaf");
+        // root must come before left and right, both before leaf
+        let root_pos = order.iter().position(|x| x == "root").unwrap();
+        let left_pos = order.iter().position(|x| x == "left").unwrap();
+        let right_pos = order.iter().position(|x| x == "right").unwrap();
+        let leaf_pos = order.iter().position(|x| x == "leaf").unwrap();
+        assert!(root_pos < left_pos);
+        assert!(root_pos < right_pos);
+        assert!(left_pos < leaf_pos);
+        assert!(right_pos < leaf_pos);
+    }
+
+    #[test]
+    fn test_topological_sort_single_node() {
+        let tables = vec![make_test_table("solo", vec![])];
+        let dag = build_dependency_dag(&tables);
+        let order = topological_sort_upstream(&dag, "solo");
+        assert_eq!(order, vec!["solo"]);
+    }
+
+    #[test]
+    fn test_parse_sql_column_lineage_simple() {
+        let sql = "SELECT user_id, SUM(amount) as total FROM orders GROUP BY user_id";
+        let lineage = parse_sql_column_lineage(sql, &["orders".to_string()]);
+        assert!(lineage.len() >= 2);
+
+        let user_id_entry = lineage.iter().find(|e| e.output_column == "user_id");
+        assert!(user_id_entry.is_some());
+        assert_eq!(user_id_entry.unwrap().source_table.as_deref(), Some("orders"));
+
+        let total_entry = lineage.iter().find(|e| e.output_column == "total");
+        assert!(total_entry.is_some());
+        assert!(total_entry.unwrap().transform_expression.contains("SUM"));
+    }
+
+    #[test]
+    fn test_parse_sql_column_lineage_star() {
+        let sql = "SELECT * FROM events";
+        let lineage = parse_sql_column_lineage(sql, &["events".to_string()]);
+        assert_eq!(lineage.len(), 1);
+        assert_eq!(lineage[0].output_column, "*");
+        assert_eq!(lineage[0].source_table.as_deref(), Some("events"));
+    }
+
+    #[test]
+    fn test_parse_sql_column_lineage_case_expression() {
+        let sql = "SELECT user_id, CASE WHEN value < 0 THEN 'high' ELSE 'low' END as risk FROM scores";
+        let lineage = parse_sql_column_lineage(sql, &["scores".to_string()]);
+        let risk_entry = lineage.iter().find(|e| e.output_column == "risk");
+        assert!(risk_entry.is_some());
+        assert!(risk_entry.unwrap().transform_expression.contains("CASE"));
+    }
+
+    #[test]
+    fn test_validate_gates_not_null_pass() {
+        use arrow::array::{Int32Array, StringArray};
+        use arrow::datatypes::{Field, Schema};
+        let schema = Schema::new(vec![
+            Field::new("id", arrow::datatypes::DataType::Int32, false),
+            Field::new("name", arrow::datatypes::DataType::Utf8, false),
+        ]);
+        let batch = RecordBatch::try_new(
+            std::sync::Arc::new(schema),
+            vec![
+                std::sync::Arc::new(Int32Array::from(vec![1, 2, 3])),
+                std::sync::Arc::new(StringArray::from(vec!["a", "b", "c"])),
+            ],
+        ).unwrap();
+
+        let gates = vec![
+            QualityGateRef { gate_type: "not_null".into(), column: Some("id".into()), threshold: None, description: "ID required".into() },
+            QualityGateRef { gate_type: "row_count".into(), column: None, threshold: None, description: "Must have rows".into() },
+        ];
+        let results = validate_gates(&gates, &[batch]);
+        assert!(results.iter().all(|g| g.passed), "All gates should pass");
+    }
+
+    #[test]
+    fn test_validate_gates_not_null_fail() {
+        use arrow::array::Int32Array;
+        use arrow::datatypes::{Field, Schema};
+        let schema = Schema::new(vec![
+            Field::new("id", arrow::datatypes::DataType::Int32, true),
+        ]);
+        let batch = RecordBatch::try_new(
+            std::sync::Arc::new(schema),
+            vec![
+                std::sync::Arc::new(Int32Array::from(vec![Some(1), None, Some(3)])),
+            ],
+        ).unwrap();
+
+        let gates = vec![
+            QualityGateRef { gate_type: "not_null".into(), column: Some("id".into()), threshold: None, description: "ID required".into() },
+        ];
+        let results = validate_gates(&gates, &[batch]);
+        assert!(!results[0].passed, "Gate should fail — null present");
+    }
+
+    // Helper to build test tables
+    fn make_test_table(name: &str, inputs: Vec<&str>) -> ExecutableTable {
+        ExecutableTable {
+            table_name: name.to_string(),
+            table_location: format!("s3://test/{}", name),
+            transform: TableTransform {
+                transform_type: "sql".into(),
+                source_code: format!("SELECT * FROM {}", name),
+                source_hash: "test".into(),
+                binary_path: None,
+                binary_size: None,
+                binary_cached: false,
+                compiler_version: None,
+                target_arch: None,
+            },
+            schedule: None,
+            quality_gates: vec![],
+            input_tables: inputs.into_iter().map(String::from).collect(),
+            status: ExecutableTableStatus {
+                state: "active".into(),
+                health: "healthy".into(),
+                last_error: None,
+                staleness_hours: 0.0,
+                data_freshness: "unknown".into(),
+            },
+            history: vec![],
+            versions: vec![],
+            created_at: "2026-01-01T00:00:00Z".into(),
+            last_refresh: None,
+            next_refresh: None,
+            estimated_cost_usd: 0.001,
+            total_executions: 0,
+            total_cost_usd: 0.0,
+            incremental: false,
+            watermark_column: None,
+            last_watermark: None,
+            executions_skipped: 0,
+            cost_saved_usd: 0.0,
+            auto_refresh: false,
+            refresh_interval_seconds: 0,
+        }
+    }
 }
