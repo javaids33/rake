@@ -5,7 +5,7 @@ edition.workspace = true
 
 [features]
 default = []
-kafka = ["dep:rdkafka"]
+# kafka = ["dep:rdkafka"]
 
 [dependencies]
 rustlake-core = { workspace = true }
@@ -25,5 +25,5 @@ uuid = { workspace = true }
 bytes = { workspace = true }
 rand = { workspace = true }
 reqwest = { workspace = true }
-rdkafka = { workspace = true, optional = true }
+# rdkafka = { workspace = true, optional = true }  # temporarily disabled
 # apache-avro = { workspace = true, optional = true }  # temporarily disabled

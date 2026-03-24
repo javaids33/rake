@@ -13,7 +13,7 @@ path = "src/main.rs"
 
 [features]
 default = ["duckdb", "postgres", "mysql", "sqlite", "polars"]
-kafka = ["rustlake-stream/kafka"]
+# kafka = ["rustlake-stream/kafka"]  # temporarily disabled
 duckdb = ["rustlake-engine/duckdb", "dep:duckdb"]
 polars = ["rustlake-engine/polars"]
 postgres = ["datafusion-table-providers/postgres-federation"]
