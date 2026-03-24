@@ -12,7 +12,7 @@ name = "rustlake"
 path = "src/main.rs"
 
 [features]
-default = ["duckdb", "postgres", "mysql", "sqlite", "polars", "kafka"]
+default = ["duckdb", "postgres", "mysql", "sqlite", "polars"]
 kafka = ["rustlake-stream/kafka"]
 duckdb = ["rustlake-engine/duckdb", "dep:duckdb"]
 polars = ["rustlake-engine/polars"]

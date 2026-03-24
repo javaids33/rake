@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "rustlake": {
+      "command": "cargo",
+      "args": ["run", "--bin", "rustlake-mcp", "--quiet"],
+      "env": {
+        "RUSTLAKE_API_URL": "http://localhost:3000"
+      }
+    }
+  }
+}

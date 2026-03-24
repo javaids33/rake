@@ -1,0 +1,21 @@
+[package]
+name = "rustlake-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "MCP server for RustLake — gives Claude Code direct access to query, debug, and inspect the platform"
+
+[[bin]]
+name = "rustlake-mcp"
+path = "src/main.rs"
+
+[dependencies]
+rmcp = { version = "1.2", features = ["server", "macros", "transport-io"] }
+tokio = { version = "1", features = ["full", "io-std"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+schemars = "1.0"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
