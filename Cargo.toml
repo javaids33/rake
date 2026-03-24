@@ -110,9 +110,9 @@ sha2 = "0.10"
 # System
 hostname = "0.4"
 
-# Kafka / Avro / Schema Registry
+# Kafka / Avro / Schema Registry (kafka disabled — re-enable with `cargo build --features kafka`)
 rdkafka = { version = "0.36", features = ["cmake-build", "ssl-vendored"] }
-apache-avro = "0.17"
+# apache-avro = "0.17"  # temporarily disabled
 
 # gRPC (for Arrow Flight — must match arrow-flight's tonic version)
 tonic = "0.14"
